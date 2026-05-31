@@ -22,6 +22,7 @@ ENV/
 notebooks/.ipynb_checkpoints/
 
 # Local DREAMT data and derived data products
+data/raw
 data/raw/
 data/interim/
 data/processed/
