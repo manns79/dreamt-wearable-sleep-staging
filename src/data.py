@@ -25,6 +25,7 @@ DEFAULT_INTERIM_DATA_DIR = Path("data/interim")
 DEFAULT_PARTICIPANT_PATTERN = "S*_whole_df.csv"
 DEFAULT_PARTICIPANT_SUMMARY_PATH = DEFAULT_INTERIM_DATA_DIR / "participant_summary.csv"
 DEFAULT_SPLIT_ASSIGNMENTS_PATH = DEFAULT_INTERIM_DATA_DIR / "split_assignments.csv"
+DEFAULT_EPOCH_INDEX_PATH = DEFAULT_INTERIM_DATA_DIR / "epoch_index.csv"
 
 TIME_COLUMN = "TIMESTAMP"
 LABEL_COLUMN = "Sleep_Stage"
@@ -85,6 +86,24 @@ TARGET_LABEL_COLUMN_MAP = {
     "Non_REM": "Non_REM",
     "REM": "REM",
 }
+
+EPOCH_INDEX_COLUMNS = [
+    "participant_id",
+    "split",
+    "epoch_id",
+    "start_row",
+    "end_row",
+    "n_rows",
+    "expected_n_rows",
+    "start_time",
+    "end_time",
+    "raw_label",
+    "mapped_label",
+    "is_valid_label",
+    "is_valid_epoch",
+    "exclusion_reason",
+    *[f"missingness_{column}" for column in EXPECTED_SIGNAL_COLUMNS],
+]
 
 
 def _json_dumps(value: object) -> str:
@@ -338,6 +357,110 @@ def load_participant_csv(file_path: str | Path) -> pd.DataFrame:
         return pd.read_csv(csv_path)
     except Exception as exc:
         raise ValueError(f"Could not read participant CSV {csv_path}: {exc}") from exc
+
+
+def build_epoch_index(
+    raw_dir: str | Path,
+    split_assignments_path: str | Path = DEFAULT_SPLIT_ASSIGNMENTS_PATH,
+    output_path: str | Path = DEFAULT_EPOCH_INDEX_PATH,
+    sampling_rate_hz: int = 64,
+    epoch_length_seconds: int = 30,
+    missingness_threshold: float = 0.20,
+    pattern: str = DEFAULT_PARTICIPANT_PATTERN,
+) -> pd.DataFrame:
+    """Build and save a participant-level split-aware sleep epoch index.
+
+    The raw DREAMT files are processed one participant at a time. No scaling,
+    feature extraction, context-window construction, or model training occurs in
+    this function. Participants present in ``raw_dir`` must have an assignment
+    in ``split_assignments_path`` so downstream work cannot silently create
+    epochs without train/validation/test membership.
+    """
+    from src.preprocessing import (
+        apply_epoch_inclusion_rules,
+        segment_participant_into_epochs,
+    )
+
+    split_df = load_split_assignments(split_assignments_path)
+    split_lookup = dict(
+        zip(
+            split_df["participant_id"].astype(str).str.strip().str.upper(),
+            split_df["split"].astype(str).str.strip(),
+            strict=True,
+        )
+    )
+    participant_files = list_participant_csvs(raw_dir, pattern=pattern)
+
+    epoch_frames: list[pd.DataFrame] = []
+    participants_without_split: list[str] = []
+
+    for file_path in participant_files:
+        participant_id = extract_participant_id(file_path)
+        split = split_lookup.get(participant_id)
+        if split is None:
+            participants_without_split.append(participant_id)
+            continue
+
+        participant_df = load_participant_csv(file_path)
+        participant_epochs = segment_participant_into_epochs(
+            participant_df,
+            participant_id=participant_id,
+            sampling_rate_hz=sampling_rate_hz,
+            epoch_length_seconds=epoch_length_seconds,
+            signal_columns=EXPECTED_SIGNAL_COLUMNS,
+        )
+        participant_epochs.insert(1, "split", split)
+        participant_epochs = apply_epoch_inclusion_rules(
+            participant_epochs,
+            missingness_threshold=missingness_threshold,
+        )
+        epoch_frames.append(participant_epochs)
+
+    if participants_without_split:
+        raise ValueError(
+            "Participant CSV file(s) missing from split assignments: "
+            f"{sorted(participants_without_split)}"
+        )
+
+    if epoch_frames:
+        epoch_index = pd.concat(epoch_frames, ignore_index=True)
+    else:
+        epoch_index = pd.DataFrame(columns=EPOCH_INDEX_COLUMNS)
+
+    missingness_columns = [
+        column for column in epoch_index.columns if column.startswith("missingness_")
+    ]
+    ordered_columns = [
+        *EPOCH_INDEX_COLUMNS,
+        *[
+            column
+            for column in [
+                "standardized_label",
+                "label_issue",
+                "has_timestamp_discontinuity",
+            ]
+            if column in epoch_index.columns
+        ],
+        *[
+            column
+            for column in missingness_columns
+            if column not in EPOCH_INDEX_COLUMNS
+        ],
+    ]
+    epoch_index = epoch_index[
+        [column for column in ordered_columns if column in epoch_index.columns]
+    ]
+
+    output_csv = Path(output_path)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    epoch_index.to_csv(output_csv, index=False)
+    print(
+        f"Saved {len(epoch_index)} epoch row(s) for "
+        f"{epoch_index['participant_id'].nunique() if not epoch_index.empty else 0} "
+        f"participant(s) to {output_csv}."
+    )
+
+    return epoch_index
 
 
 def identify_label_columns(

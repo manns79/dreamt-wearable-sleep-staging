@@ -55,6 +55,27 @@ DREAMT `data_100Hz` convention where `P` is treated as Wake. Missing, unknown,
 artifact, movement, unscored, and ambiguous labels are excluded rather than
 silently forced into one of the three target classes.
 
+## Epoch Preprocessing
+
+Stage 4 uses one PSG sleep epoch as the modeling unit. Reusable epoch utilities
+live in `src/preprocessing.py`, and the split-aware index builder lives in
+`src/data.py`. DREAMT participant CSVs are assumed to use a 64 Hz grid, so each
+30-second epoch should contain `30 * 64 = 1920` rows. Row ranges in the epoch
+index are half-open: `start_row` is inclusive and `end_row` is exclusive.
+
+Each epoch is assigned exactly one mapped target label from `Sleep_Stage` when
+all rows in the epoch map consistently to `Wake`, `Non-REM`, or `REM`. Epochs
+are excluded when labels are missing, unknown, ambiguous, or change within the
+epoch. Epochs are also excluded when the row count differs from the expected
+epoch size, when `TIMESTAMP` shows an obvious discontinuity, or when any known
+wearable signal has more than 20% missingness by default.
+
+Epoch construction uses `data/interim/split_assignments.csv`, which is a
+participant-level split. The builder refuses to create epoch rows for a raw
+participant file that is missing from the split assignments, preventing silent
+train/validation/test leakage. Scaling and normalization are not fit at this
+stage; any later scaler must be fit using training participants only.
+
 ## Methods
 
 Planned methods include:
@@ -121,6 +142,22 @@ participant files are available:
 - `data/interim/label_mapping_summary.csv`
 - `data/interim/label_mapping_summary_p_as_wake.csv`
 - `data/interim/split_assignments.csv`
+- `data/interim/epoch_index.csv`
+
+Generate the epoch index locally after placing DREAMT participant files under
+`data/raw/` and creating `data/interim/split_assignments.csv`:
+
+```python
+from src.data import build_epoch_index
+from src.preprocessing import summarize_epoch_index
+
+epoch_index = build_epoch_index(
+    raw_dir="data/raw",
+    split_assignments_path="data/interim/split_assignments.csv",
+    output_path="data/interim/epoch_index.csv",
+)
+summary = summarize_epoch_index(epoch_index)
+```
 
 As implementation develops, this section will include concrete commands for preprocessing, training, evaluation, and report generation.
 

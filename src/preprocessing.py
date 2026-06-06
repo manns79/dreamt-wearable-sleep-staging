@@ -1,7 +1,7 @@
 """Preprocessing utilities for wearable sleep staging signals.
 
-This module currently contains Stage 2 label utilities for standardizing raw
-DREAMT/PSG sleep-stage labels before epoch construction or modeling.
+This module contains label utilities and Stage 4 epoch-construction rules for
+standardizing DREAMT/PSG sleep-stage labels before modeling.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ from typing import Any
 import pandas as pd
 
 from src.data import (
+    EXPECTED_SIGNAL_COLUMNS,
     LABEL_COLUMN,
+    TIME_COLUMN,
     extract_participant_id,
     identify_label_columns,
     load_participant_csv,
@@ -27,6 +29,12 @@ from src.data import (
 # dataset is acceptable here because these labels define the target vocabulary;
 # this module does not train models or engineer predictive features.
 TARGET_SLEEP_STAGE_LABELS = ("Wake", "Non-REM", "REM")
+DEFAULT_SAMPLING_RATE_HZ = 64
+DEFAULT_EPOCH_LENGTH_SECONDS = 30
+DEFAULT_EXPECTED_ROWS_PER_EPOCH = (
+    DEFAULT_SAMPLING_RATE_HZ * DEFAULT_EPOCH_LENGTH_SECONDS
+)
+DEFAULT_MISSINGNESS_THRESHOLD = 0.20
 PRIMARY_LABEL_MAPPING_NOTE = (
     "Primary mapping excludes DREAMT data_64Hz preparation-stage P labels."
 )
@@ -120,6 +128,21 @@ OTHER_INVALID_LABEL_TOKENS = {
     "UNKNOWN",
     "UNK",
 }
+EPOCH_INDEX_BASE_COLUMNS = [
+    "participant_id",
+    "epoch_id",
+    "start_row",
+    "end_row",
+    "n_rows",
+    "expected_n_rows",
+    "start_time",
+    "end_time",
+    "raw_label",
+    "mapped_label",
+    "is_valid_label",
+    "is_valid_epoch",
+    "exclusion_reason",
+]
 
 
 def _compact_label(raw_label: Any) -> str | None:
@@ -223,6 +246,355 @@ def map_sleep_stage(raw_label: Any, p_as_wake: bool = False) -> str | None:
     if standardized_label == "P" and p_as_wake:
         return "Wake"
     return None
+
+
+def _pipe_join(values: Iterable[Any]) -> str:
+    """Return deterministic pipe-delimited values for audit columns."""
+    display_values = sorted({_display_raw_label(value) for value in values})
+    return "|".join(display_values)
+
+
+def _empty_epoch_summary_columns(signal_columns: Iterable[str]) -> list[str]:
+    """Return the expected epoch-summary columns for an empty result."""
+    missingness_columns = [f"missingness_{column}" for column in signal_columns]
+    return [
+        *EPOCH_INDEX_BASE_COLUMNS,
+        "standardized_label",
+        "label_issue",
+        "has_timestamp_discontinuity",
+        *missingness_columns,
+    ]
+
+
+def validate_epoch_labels(epoch_df: pd.DataFrame) -> dict[str, object]:
+    """Validate that an epoch has one consistent three-class sleep-stage label.
+
+    Returns raw labels present, standardized labels present, the mapped target
+    label when exactly one valid target is present, and a concise issue string
+    when the epoch should be excluded.
+    """
+    if LABEL_COLUMN not in epoch_df.columns:
+        return {
+            "raw_label": "<MISSING_COLUMN>",
+            "standardized_label": None,
+            "mapped_label": None,
+            "is_valid_label": False,
+            "label_issue": "missing_label_column",
+        }
+
+    labels = epoch_df[LABEL_COLUMN]
+    raw_label = _pipe_join(labels)
+    standardized_labels = sorted(
+        {
+            label
+            for label in labels.map(standardize_label_names).tolist()
+            if label is not None
+        }
+    )
+    mapped_labels = sorted(
+        {
+            label
+            for label in labels.map(map_sleep_stage).tolist()
+            if label in TARGET_SLEEP_STAGE_LABELS
+        }
+    )
+    has_missing_or_invalid = labels.map(map_sleep_stage).isna().any()
+
+    if not standardized_labels:
+        return {
+            "raw_label": raw_label,
+            "standardized_label": None,
+            "mapped_label": None,
+            "is_valid_label": False,
+            "label_issue": "missing_or_invalid_label",
+        }
+    if len(standardized_labels) > 1 or len(mapped_labels) > 1:
+        return {
+            "raw_label": raw_label,
+            "standardized_label": "|".join(standardized_labels),
+            "mapped_label": "|".join(mapped_labels) if mapped_labels else None,
+            "is_valid_label": False,
+            "label_issue": "label_changed_within_epoch",
+        }
+    if has_missing_or_invalid or not mapped_labels:
+        return {
+            "raw_label": raw_label,
+            "standardized_label": "|".join(standardized_labels),
+            "mapped_label": None,
+            "is_valid_label": False,
+            "label_issue": "missing_or_invalid_label",
+        }
+
+    return {
+        "raw_label": raw_label,
+        "standardized_label": standardized_labels[0],
+        "mapped_label": mapped_labels[0],
+        "is_valid_label": True,
+        "label_issue": None,
+    }
+
+
+def compute_epoch_missingness(
+    epoch_df: pd.DataFrame,
+    signal_columns: Iterable[str],
+) -> dict[str, float]:
+    """Compute per-signal missingness fractions for one epoch.
+
+    Missing signal columns are assigned a missingness fraction of ``1.0`` so
+    inclusion rules can invalidate the epoch without special-case handling.
+    """
+    missingness: dict[str, float] = {}
+    n_rows = len(epoch_df)
+    for column in signal_columns:
+        output_column = f"missingness_{column}"
+        if column not in epoch_df.columns:
+            missingness[output_column] = 1.0
+        elif n_rows == 0:
+            missingness[output_column] = 1.0
+        else:
+            missingness[output_column] = float(epoch_df[column].isna().mean())
+    return missingness
+
+
+def _timestamp_discontinuity(
+    epoch_df: pd.DataFrame,
+    sampling_rate_hz: int,
+    tolerance_multiplier: float = 1.5,
+) -> bool:
+    """Detect obvious timestamp gaps or non-monotonic timestamps within an epoch."""
+    if TIME_COLUMN not in epoch_df.columns or len(epoch_df) < 2:
+        return False
+
+    timestamps = epoch_df[TIME_COLUMN].dropna()
+    if len(timestamps) < 2:
+        return False
+
+    numeric_timestamps = pd.to_numeric(timestamps, errors="coerce")
+    if numeric_timestamps.notna().sum() >= 2:
+        diffs = numeric_timestamps.dropna().diff().dropna()
+        positive_diffs = diffs[diffs > 0]
+        if positive_diffs.empty:
+            return True
+        base_interval = 1 / sampling_rate_hz
+        candidate_intervals = [
+            base_interval,
+            base_interval * 1_000,
+            base_interval * 1_000_000,
+            base_interval * 1_000_000_000,
+        ]
+        median_diff = float(positive_diffs.median())
+        expected_interval = min(
+            candidate_intervals,
+            key=lambda candidate: abs(candidate - median_diff),
+        )
+    else:
+        datetime_timestamps = pd.to_datetime(timestamps, errors="coerce")
+        if datetime_timestamps.notna().sum() < 2:
+            return False
+        diffs = (
+            datetime_timestamps.dropna()
+            .sort_index()
+            .diff()
+            .dropna()
+            .dt.total_seconds()
+        )
+        expected_interval = 1 / sampling_rate_hz
+
+    if diffs.empty:
+        return False
+    return bool(
+        (diffs <= 0).any()
+        or (diffs > expected_interval * tolerance_multiplier).any()
+    )
+
+
+def segment_participant_into_epochs(
+    df: pd.DataFrame,
+    participant_id: str,
+    sampling_rate_hz: int = DEFAULT_SAMPLING_RATE_HZ,
+    epoch_length_seconds: int = DEFAULT_EPOCH_LENGTH_SECONDS,
+    signal_columns: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+) -> pd.DataFrame:
+    """Segment one participant DataFrame into fixed-length epoch summaries.
+
+    Row ranges are half-open intervals: ``start_row`` is inclusive and
+    ``end_row`` is exclusive. The final partial epoch is retained in the summary
+    and later invalidated by inclusion rules unless it has the expected row
+    count.
+    """
+    if sampling_rate_hz <= 0:
+        raise ValueError("sampling_rate_hz must be positive.")
+    if epoch_length_seconds <= 0:
+        raise ValueError("epoch_length_seconds must be positive.")
+
+    signal_columns = list(signal_columns)
+    expected_n_rows = sampling_rate_hz * epoch_length_seconds
+    if df.empty:
+        return pd.DataFrame(columns=_empty_epoch_summary_columns(signal_columns))
+
+    rows: list[dict[str, object]] = []
+    n_rows_total = len(df)
+    for epoch_id, start_row in enumerate(range(0, n_rows_total, expected_n_rows)):
+        end_row = min(start_row + expected_n_rows, n_rows_total)
+        epoch_df = df.iloc[start_row:end_row]
+        label_info = validate_epoch_labels(epoch_df)
+        missingness = compute_epoch_missingness(epoch_df, signal_columns)
+        has_timestamp_discontinuity = _timestamp_discontinuity(
+            epoch_df,
+            sampling_rate_hz=sampling_rate_hz,
+        )
+
+        if TIME_COLUMN in epoch_df.columns and not epoch_df.empty:
+            start_time = epoch_df[TIME_COLUMN].iloc[0]
+            end_time = epoch_df[TIME_COLUMN].iloc[-1]
+        else:
+            start_time = None
+            end_time = None
+
+        rows.append(
+            {
+                "participant_id": str(participant_id),
+                "epoch_id": int(epoch_id),
+                "start_row": int(start_row),
+                "end_row": int(end_row),
+                "n_rows": int(len(epoch_df)),
+                "expected_n_rows": int(expected_n_rows),
+                "start_time": start_time,
+                "end_time": end_time,
+                **label_info,
+                "has_timestamp_discontinuity": has_timestamp_discontinuity,
+                **missingness,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def apply_epoch_inclusion_rules(
+    epoch_summary_df: pd.DataFrame,
+    missingness_threshold: float = DEFAULT_MISSINGNESS_THRESHOLD,
+) -> pd.DataFrame:
+    """Apply label, row-count, timestamp, and missingness exclusion rules."""
+    if not 0 <= missingness_threshold <= 1:
+        raise ValueError("missingness_threshold must be between 0 and 1.")
+
+    output = epoch_summary_df.copy()
+    if output.empty:
+        output["is_valid_epoch"] = pd.Series(dtype=bool)
+        output["exclusion_reason"] = pd.Series(dtype=object)
+        return output
+
+    missingness_columns = [
+        column for column in output.columns if column.startswith("missingness_")
+    ]
+    missing_required_columns = [
+        column
+        for column in ["is_valid_label", "n_rows", "expected_n_rows"]
+        if column not in output.columns
+    ]
+    if missing_required_columns:
+        raise ValueError(
+            "epoch_summary_df is missing required column(s): "
+            f"{missing_required_columns}"
+        )
+
+    reasons: list[str | None] = []
+    for _, row in output.iterrows():
+        row_reasons: list[str] = []
+        if not bool(row["is_valid_label"]):
+            label_issue = row.get("label_issue")
+            row_reasons.append(
+                str(label_issue) if pd.notna(label_issue) else "invalid_label"
+            )
+        if int(row["n_rows"]) != int(row["expected_n_rows"]):
+            row_reasons.append("unexpected_row_count")
+        if bool(row.get("has_timestamp_discontinuity", False)):
+            row_reasons.append("timestamp_discontinuity")
+
+        high_missingness_columns = [
+            column
+            for column in missingness_columns
+            if pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+            > missingness_threshold
+        ]
+        if high_missingness_columns:
+            signals = ",".join(
+                column.removeprefix("missingness_")
+                for column in high_missingness_columns
+            )
+            row_reasons.append(f"severe_missingness:{signals}")
+
+        reasons.append("|".join(row_reasons) if row_reasons else None)
+
+    output["exclusion_reason"] = reasons
+    output["is_valid_epoch"] = output["exclusion_reason"].isna()
+    return output
+
+
+def summarize_epoch_index(epoch_index_df: pd.DataFrame) -> dict[str, object]:
+    """Return compact EDA counts for a generated epoch index."""
+    if epoch_index_df.empty:
+        return {
+            "total_participants_processed": 0,
+            "total_epochs": 0,
+            "valid_epochs": 0,
+            "excluded_epochs": 0,
+            "exclusion_counts": {},
+            "valid_epoch_counts_by_split": {},
+            "valid_epoch_counts_by_mapped_label": {},
+            "valid_epoch_counts_by_participant": {},
+            "missingness_summary_by_signal": {},
+        }
+
+    valid = epoch_index_df[epoch_index_df["is_valid_epoch"].astype(bool)].copy()
+    missingness_columns = [
+        column
+        for column in epoch_index_df.columns
+        if column.startswith("missingness_")
+    ]
+    missingness_summary = {}
+    for column in missingness_columns:
+        values = pd.to_numeric(epoch_index_df[column], errors="coerce")
+        missingness_summary[column.removeprefix("missingness_")] = {
+            "mean": float(values.mean()) if values.notna().any() else None,
+            "median": float(values.median()) if values.notna().any() else None,
+            "max": float(values.max()) if values.notna().any() else None,
+        }
+
+    exclusion_counts = (
+        epoch_index_df.loc[~epoch_index_df["is_valid_epoch"].astype(bool)]
+        .assign(
+            exclusion_reason=lambda frame: frame["exclusion_reason"].fillna(
+                "unspecified"
+            )
+        )["exclusion_reason"]
+        .str.split("|")
+        .explode()
+        .value_counts()
+        .to_dict()
+    )
+
+    split_counts = (
+        valid["split"].value_counts().to_dict() if "split" in valid.columns else {}
+    )
+    return {
+        "total_participants_processed": int(epoch_index_df["participant_id"].nunique()),
+        "total_epochs": int(len(epoch_index_df)),
+        "valid_epochs": int(len(valid)),
+        "excluded_epochs": int(len(epoch_index_df) - len(valid)),
+        "exclusion_counts": {str(k): int(v) for k, v in exclusion_counts.items()},
+        "valid_epoch_counts_by_split": {
+            str(k): int(v) for k, v in split_counts.items()
+        },
+        "valid_epoch_counts_by_mapped_label": {
+            str(k): int(v) for k, v in valid["mapped_label"].value_counts().items()
+        },
+        "valid_epoch_counts_by_participant": {
+            str(k): int(v)
+            for k, v in valid["participant_id"].value_counts().sort_index().items()
+        },
+        "missingness_summary_by_signal": missingness_summary,
+    }
 
 
 def _invalid_label_reason(raw_label: Any, p_as_wake: bool = False) -> str | None:

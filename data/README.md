@@ -16,6 +16,7 @@ data/
     label_mapping_summary.csv
     label_mapping_summary_p_as_wake.csv
     split_assignments.csv
+    epoch_index.csv
 ```
 
 Use `data/raw/` for local copies of real DREAMT participant CSV files. Use
@@ -151,3 +152,49 @@ split_label_summary = summarize_split_label_distribution(label_summary, split_df
   but no modeling or feature engineering is performed in this stage.
 - Event annotation columns are documented during inventory only:
   `Obstructive_Apnea`, `Central_Apnea`, `Hypopnea`, and `Multiple_Events`.
+
+## Epoch Index
+
+`data/interim/epoch_index.csv` is generated locally by the Stage 4 preprocessing
+workflow when raw DREAMT files are available. The raw files are not stored in
+the repository, so this CSV is not expected to exist after cloning the repo.
+
+The epoch index uses one fixed-length PSG sleep epoch as the modeling unit:
+
+- sampling rate assumption: 64 Hz
+- epoch length: 30 seconds
+- expected rows per epoch: 1920
+- target label column: `Sleep_Stage`
+- target classes: `Wake`, `Non-REM`, and `REM`
+- row ranges: `start_row` inclusive, `end_row` exclusive
+
+Each participant CSV is processed independently and joined to
+`data/interim/split_assignments.csv`. The split is participant-level, so epochs
+from one participant stay entirely in train, validation, or test. The builder
+raises an error if a raw participant file has no split assignment.
+
+Epochs are invalidated when labels are missing, unknown, ambiguous, or change
+within an epoch; when the row count differs from 1920; when `TIMESTAMP` shows an
+obvious discontinuity; or when any expected wearable signal has more than 20%
+missingness by default. Missingness fractions are retained as
+`missingness_<SIGNAL>` columns for later EDA and feature extraction. This stage
+does not fit scalers, normalize signals, build temporal context windows, train
+models, or create PyTorch datasets.
+
+From Python at the repo root:
+
+```python
+from src.data import build_epoch_index
+from src.preprocessing import summarize_epoch_index
+
+epoch_index = build_epoch_index(
+    raw_dir="data/raw",
+    split_assignments_path="data/interim/split_assignments.csv",
+    output_path="data/interim/epoch_index.csv",
+)
+summary = summarize_epoch_index(epoch_index)
+```
+
+The summary reports total participants processed, total and valid epochs,
+excluded epochs, exclusion counts, valid epoch counts by split, label, and
+participant, plus per-signal missingness summaries.
