@@ -22,6 +22,24 @@ The target task will likely be three-class sleep staging:
 
 Participant-level train, validation, and test splits will be used wherever possible to reduce data leakage risk. The project will avoid using validation or test information during exploratory analysis, feature engineering, preprocessing decisions, and model selection.
 
+## Label Mapping
+
+Reusable label-standardization utilities live in `src/preprocessing.py`. The
+primary target mapping is:
+
+- `W` and Wake variants -> `Wake`
+- `N1`, `N2`, and `N3` -> `Non-REM`
+- `R` and REM variants -> `REM`
+
+Downloaded DREAMT `data_64Hz` files may include `P`, which denotes preparation
+before PSG recording starts. The primary analysis excludes `P` because it is not
+a PSG-scored Wake epoch in the same sense as `W`; treating it as Wake could add
+setup-period physiology and motion artifacts to the Wake class. A secondary
+sensitivity-analysis option is available with `p_as_wake=True`, matching the
+DREAMT `data_100Hz` convention where `P` is treated as Wake. Missing, unknown,
+artifact, movement, unscored, and ambiguous labels are excluded rather than
+silently forced into one of the three target classes.
+
 ## Methods
 
 Planned methods include:
@@ -76,9 +94,16 @@ pip install -e ".[dev]"
 This project is not fully implemented yet. The expected workflow will be:
 
 1. Place local DREAMT files under `data/raw/`.
-2. Use notebooks in order for dataset overview, training-set EDA, baselines, deep learning experiments, and error analysis.
+2. Run `notebooks/01_dataset_overview.ipynb` to build the participant inventory and label-mapping summaries.
 3. Move reusable logic from notebooks into `src/`.
 4. Save generated metrics and figures under `results/`.
+
+The dataset overview notebook writes these local intermediate summaries when raw
+participant files are available:
+
+- `data/interim/participant_summary.csv`
+- `data/interim/label_mapping_summary.csv`
+- `data/interim/label_mapping_summary_p_as_wake.csv`
 
 As implementation develops, this section will include concrete commands for preprocessing, training, evaluation, and report generation.
 
@@ -93,4 +118,4 @@ Results are not available yet. Placeholder files are included under `results/` t
 
 ## Limitations
 
-This scaffold does not yet include data, trained models, preprocessing logic, or experimental results. Future work must carefully address participant-level splitting, class imbalance, missing data, wearable signal quality, and privacy requirements.
+This scaffold does not include raw data, trained models, or experimental results. Future work must carefully address participant-level splitting, class imbalance, missing data, wearable signal quality, and privacy requirements.
