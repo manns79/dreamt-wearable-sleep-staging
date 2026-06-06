@@ -76,6 +76,30 @@ participant file that is missing from the split assignments, preventing silent
 train/validation/test leakage. Scaling and normalization are not fit at this
 stage; any later scaler must be fit using training participants only.
 
+## Training-Set EDA
+
+Stage 5 is implemented in `notebooks/02_train_set_eda.ipynb`. The notebook uses
+only participants assigned to the `train` split and only valid Stage 4 epochs
+for predictive EDA. It loads `data/interim/split_assignments.csv` and
+`data/interim/epoch_index.csv`, filters to training epochs, and keeps
+validation/test epochs unused.
+
+The EDA covers:
+
+- training class balance and metric implications
+- participant-level class distributions
+- missingness by signal, participant, and sleep stage
+- simple raw-signal epoch summaries by sleep stage
+- representative raw multichannel epochs
+- within-participant sleep-stage transition matrices
+- optional hypnogram-like plots for a few training participants
+
+Reusable EDA and plotting helpers live in `src/plots.py`. Key figures are saved
+under `results/figures/` when the notebook is run with local DREAMT artifacts.
+Raw signal summaries and representative raw epoch plots require local
+participant CSVs under `data/raw/`; the notebook skips those cells cleanly when
+raw data are unavailable.
+
 ## Methods
 
 Planned methods include:
@@ -132,8 +156,10 @@ This project is not fully implemented yet. The expected workflow will be:
 1. Place local DREAMT files under `data/raw/`.
 2. Run `notebooks/01_dataset_overview.ipynb` to build the participant inventory and label-mapping summaries.
 3. Create or load the participant split at `data/interim/split_assignments.csv`.
-4. Move reusable logic from notebooks into `src/`.
-5. Save generated metrics and figures under `results/`.
+4. Generate the Stage 4 epoch index at `data/interim/epoch_index.csv`.
+5. Run `notebooks/02_train_set_eda.ipynb` for training-set-only EDA.
+6. Move reusable logic from notebooks into `src/`.
+7. Save generated metrics and figures under `results/`.
 
 The dataset overview notebook writes these local intermediate summaries when raw
 participant files are available:

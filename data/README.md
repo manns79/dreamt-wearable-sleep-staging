@@ -198,3 +198,21 @@ summary = summarize_epoch_index(epoch_index)
 The summary reports total participants processed, total and valid epochs,
 excluded epochs, exclusion counts, valid epoch counts by split, label, and
 participant, plus per-signal missingness summaries.
+
+## Training-Set EDA Artifacts
+
+`notebooks/02_train_set_eda.ipynb` implements Stage 5 exploratory analysis. It
+loads `data/interim/split_assignments.csv` and `data/interim/epoch_index.csv`,
+filters to valid `train` epochs, and avoids validation/test data for predictive
+EDA.
+
+When local raw DREAMT files are available under `data/raw/`, the notebook also
+slices the raw participant CSVs for simple epoch-level signal summaries and a
+small deterministic set of representative raw epoch plots. These raw files are
+not committed, and the notebook skips raw-signal sections cleanly when they are
+absent.
+
+Key figures are written under `results/figures/`, including training class
+balance, participant-level class distributions, missingness by signal,
+signal-summary-by-stage plots, representative raw epochs, transition matrices,
+and optional hypnogram-like plots.
