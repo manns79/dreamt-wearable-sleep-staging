@@ -22,6 +22,21 @@ The target task will likely be three-class sleep staging:
 
 Participant-level train, validation, and test splits will be used wherever possible to reduce data leakage risk. The project will avoid using validation or test information during exploratory analysis, feature engineering, preprocessing decisions, and model selection.
 
+## Participant Split
+
+The project uses a fixed participant-level split so temporally correlated rows
+or epochs from the same participant never appear in more than one modeling set.
+The default split is 70 participants for training, 15 for validation, and 15 for
+testing, created with `random_state=42`.
+
+Reusable split utilities live in `src/data.py`. The saved assignment file is:
+
+- `data/interim/split_assignments.csv`
+
+Downstream preprocessing, EDA, feature extraction, model training, and
+evaluation should load this file rather than creating a fresh split. Validation
+or test performance should not be used to revise the split.
+
 ## Label Mapping
 
 Reusable label-standardization utilities live in `src/preprocessing.py`. The
@@ -95,8 +110,9 @@ This project is not fully implemented yet. The expected workflow will be:
 
 1. Place local DREAMT files under `data/raw/`.
 2. Run `notebooks/01_dataset_overview.ipynb` to build the participant inventory and label-mapping summaries.
-3. Move reusable logic from notebooks into `src/`.
-4. Save generated metrics and figures under `results/`.
+3. Create or load the participant split at `data/interim/split_assignments.csv`.
+4. Move reusable logic from notebooks into `src/`.
+5. Save generated metrics and figures under `results/`.
 
 The dataset overview notebook writes these local intermediate summaries when raw
 participant files are available:
@@ -104,6 +120,7 @@ participant files are available:
 - `data/interim/participant_summary.csv`
 - `data/interim/label_mapping_summary.csv`
 - `data/interim/label_mapping_summary_p_as_wake.csv`
+- `data/interim/split_assignments.csv`
 
 As implementation develops, this section will include concrete commands for preprocessing, training, evaluation, and report generation.
 
