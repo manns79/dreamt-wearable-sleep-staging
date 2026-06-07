@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
@@ -26,6 +27,7 @@ DEFAULT_PARTICIPANT_PATTERN = "S*_whole_df.csv"
 DEFAULT_PARTICIPANT_SUMMARY_PATH = DEFAULT_INTERIM_DATA_DIR / "participant_summary.csv"
 DEFAULT_SPLIT_ASSIGNMENTS_PATH = DEFAULT_INTERIM_DATA_DIR / "split_assignments.csv"
 DEFAULT_EPOCH_INDEX_PATH = DEFAULT_INTERIM_DATA_DIR / "epoch_index.csv"
+DEFAULT_INVENTORY_CHUNKSIZE = 500_000
 
 TIME_COLUMN = "TIMESTAMP"
 LABEL_COLUMN = "Sleep_Stage"
@@ -558,6 +560,235 @@ def _value_counts(
     return counts
 
 
+def _empty_participant_summary(
+    csv_path: Path,
+    participant_id: str | None,
+    error: str,
+) -> dict[str, object]:
+    """Return the sparse participant inventory row used for unreadable files."""
+    return {
+        "participant_id": participant_id,
+        "file_path": str(csv_path),
+        "n_rows": None,
+        "n_columns": None,
+        "available_columns": _json_dumps([]),
+        "has_expected_schema": False,
+        "has_all_expected_columns": False,
+        "missing_expected_columns": _json_dumps(EXPECTED_DREAMT_COLUMNS),
+        "extra_columns": _json_dumps([]),
+        "missing_expected_signal_columns": _json_dumps(EXPECTED_SIGNAL_COLUMNS),
+        "recording_duration_seconds": None,
+        "label_column": None,
+        "label_column_candidates": _json_dumps([]),
+        "unique_label_values": _json_dumps([]),
+        "label_counts": _json_dumps({}),
+        "missing_value_counts_by_signal": _json_dumps({}),
+        "missing_value_percentages_by_signal": _json_dumps({}),
+        "signal_summary_stats": _json_dumps({}),
+        "event_annotation_value_counts": _json_dumps({}),
+        "event_annotation_unique_values": _json_dumps({}),
+        "error": error,
+        **{f"has_{column}": False for column in EXPECTED_SIGNAL_COLUMNS},
+        **{f"has_{column}": False for column in EVENT_ANNOTATION_COLUMNS},
+    }
+
+
+def _read_csv_header(file_path: Path) -> list[str]:
+    """Read only a CSV header while preserving participant-loader errors."""
+    if not file_path.exists():
+        raise FileNotFoundError(f"Participant CSV does not exist: {file_path}")
+    if not file_path.is_file():
+        raise ValueError(f"Participant CSV path is not a file: {file_path}")
+
+    try:
+        return list(pd.read_csv(file_path, nrows=0).columns)
+    except Exception as exc:
+        raise ValueError(f"Could not read participant CSV {file_path}: {exc}") from exc
+
+
+def _ordered_count_dict(counts: Counter[str]) -> dict[str, int]:
+    """Return count dictionaries in a stable value-count-like order."""
+    return {
+        key: int(count)
+        for key, count in sorted(
+            counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    }
+
+
+def _update_string_counts(counts: Counter[str], values: pd.Series) -> None:
+    """Accumulate pandas-style value counts as JSON-safe string keys."""
+    for value, count in values.value_counts(dropna=False).items():
+        counts[str(value)] += int(count)
+
+
+def _new_numeric_accumulator() -> dict[str, float | int | None]:
+    return {
+        "count": 0,
+        "sum": 0.0,
+        "sum_sq": 0.0,
+        "min": None,
+        "max": None,
+    }
+
+
+def _update_numeric_accumulator(
+    accumulator: dict[str, float | int | None],
+    values: pd.Series,
+) -> None:
+    numeric_values = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric_values.empty:
+        return
+
+    array = numeric_values.to_numpy(dtype=float)
+    count = int(array.size)
+    accumulator["count"] = int(accumulator["count"]) + count
+    accumulator["sum"] = float(accumulator["sum"]) + float(array.sum())
+    accumulator["sum_sq"] = float(accumulator["sum_sq"]) + float(
+        np.square(array).sum()
+    )
+
+    chunk_min = float(array.min())
+    chunk_max = float(array.max())
+    accumulator["min"] = (
+        chunk_min
+        if accumulator["min"] is None
+        else min(float(accumulator["min"]), chunk_min)
+    )
+    accumulator["max"] = (
+        chunk_max
+        if accumulator["max"] is None
+        else max(float(accumulator["max"]), chunk_max)
+    )
+
+
+def _finalize_numeric_accumulator(
+    accumulator: dict[str, float | int | None],
+) -> dict[str, float | None]:
+    count = int(accumulator["count"])
+    if count == 0:
+        return {
+            "min": None,
+            "mean": None,
+            "std": None,
+            "max": None,
+        }
+
+    total = float(accumulator["sum"])
+    mean = total / count
+    if count > 1:
+        variance = (float(accumulator["sum_sq"]) - (total * total / count)) / (
+            count - 1
+        )
+        std = float(np.sqrt(max(variance, 0.0)))
+    else:
+        std = float("nan")
+
+    return {
+        "min": float(accumulator["min"]),
+        "mean": float(mean),
+        "std": std,
+        "max": float(accumulator["max"]),
+    }
+
+
+def _new_timestamp_accumulator() -> dict[str, object]:
+    return {
+        "numeric_count": 0,
+        "numeric_min": None,
+        "numeric_max": None,
+        "datetime_count": 0,
+        "datetime_min": None,
+        "datetime_max": None,
+    }
+
+
+def _update_timestamp_accumulator(
+    accumulator: dict[str, object],
+    values: pd.Series,
+) -> None:
+    timestamps = values.dropna()
+    if timestamps.empty:
+        return
+
+    numeric_values = pd.to_numeric(timestamps, errors="coerce").dropna()
+    if not numeric_values.empty:
+        numeric_array = numeric_values.to_numpy(dtype=float)
+        accumulator["numeric_count"] = (
+            int(accumulator["numeric_count"]) + numeric_array.size
+        )
+        numeric_min = float(numeric_array.min())
+        numeric_max = float(numeric_array.max())
+        accumulator["numeric_min"] = (
+            numeric_min
+            if accumulator["numeric_min"] is None
+            else min(float(accumulator["numeric_min"]), numeric_min)
+        )
+        accumulator["numeric_max"] = (
+            numeric_max
+            if accumulator["numeric_max"] is None
+            else max(float(accumulator["numeric_max"]), numeric_max)
+        )
+
+    datetime_values = pd.to_datetime(timestamps, errors="coerce").dropna()
+    if datetime_values.empty:
+        return
+
+    accumulator["datetime_count"] = (
+        int(accumulator["datetime_count"]) + len(datetime_values)
+    )
+    datetime_min = datetime_values.min()
+    datetime_max = datetime_values.max()
+    accumulator["datetime_min"] = (
+        datetime_min
+        if accumulator["datetime_min"] is None
+        else min(accumulator["datetime_min"], datetime_min)
+    )
+    accumulator["datetime_max"] = (
+        datetime_max
+        if accumulator["datetime_max"] is None
+        else max(accumulator["datetime_max"], datetime_max)
+    )
+
+
+def _finalize_timestamp_duration(accumulator: dict[str, object]) -> float | None:
+    if int(accumulator["numeric_count"]) >= 2:
+        duration = float(accumulator["numeric_max"]) - float(
+            accumulator["numeric_min"]
+        )
+        if pd.notna(duration):
+            return float(duration)
+
+    if int(accumulator["datetime_count"]) >= 2:
+        duration = accumulator["datetime_max"] - accumulator["datetime_min"]
+        if pd.notna(duration):
+            return float(duration.total_seconds())
+
+    return None
+
+
+def _iter_inventory_chunks(
+    csv_path: Path,
+    columns: list[str],
+    requested_columns: Iterable[str],
+    chunksize: int | None,
+) -> Iterable[pd.DataFrame]:
+    """Yield only columns needed for inventory summaries."""
+    use_columns = [column for column in columns if column in set(requested_columns)]
+    read_columns = use_columns if use_columns else columns[:1]
+    read_kwargs = {"usecols": read_columns}
+
+    try:
+        if chunksize is None:
+            yield pd.read_csv(csv_path, **read_kwargs)
+        else:
+            for chunk in pd.read_csv(csv_path, chunksize=chunksize, **read_kwargs):
+                yield chunk
+    except Exception as exc:
+        raise ValueError(f"Could not read participant CSV {csv_path}: {exc}") from exc
+
+
 def _target_count_column(label: str) -> str:
     """Return the summary column name for a target sleep-stage label."""
     return f"{TARGET_LABEL_COLUMN_MAP[label]}_count"
@@ -868,12 +1099,20 @@ def summarize_split_label_distribution(
     return summary[ordered_columns]
 
 
-def summarize_participant_file(file_path: str | Path) -> dict[str, object]:
+def summarize_participant_file(
+    file_path: str | Path,
+    chunksize: int | None = DEFAULT_INVENTORY_CHUNKSIZE,
+) -> dict[str, object]:
     """Create a non-modeling inventory summary for one DREAMT participant CSV.
 
     Unreadable files return a sparse row with an ``error`` message so the full
     dataset inventory can document corrupted files without stopping early.
     """
+    if chunksize is not None and (
+        not isinstance(chunksize, int) or chunksize <= 0
+    ):
+        raise ValueError("chunksize must be a positive integer or None.")
+
     csv_path = Path(file_path)
     try:
         participant_id = extract_participant_id(csv_path)
@@ -881,35 +1120,10 @@ def summarize_participant_file(file_path: str | Path) -> dict[str, object]:
         participant_id = None
 
     try:
-        df = load_participant_csv(csv_path)
+        columns = _read_csv_header(csv_path)
     except (FileNotFoundError, ValueError) as exc:
-        return {
-            "participant_id": participant_id,
-            "file_path": str(csv_path),
-            "n_rows": None,
-            "n_columns": None,
-            "available_columns": _json_dumps([]),
-            "has_expected_schema": False,
-            "has_all_expected_columns": False,
-            "missing_expected_columns": _json_dumps(EXPECTED_DREAMT_COLUMNS),
-            "extra_columns": _json_dumps([]),
-            "missing_expected_signal_columns": _json_dumps(EXPECTED_SIGNAL_COLUMNS),
-            "recording_duration_seconds": None,
-            "label_column": None,
-            "label_column_candidates": _json_dumps([]),
-            "unique_label_values": _json_dumps([]),
-            "label_counts": _json_dumps({}),
-            "missing_value_counts_by_signal": _json_dumps({}),
-            "missing_value_percentages_by_signal": _json_dumps({}),
-            "signal_summary_stats": _json_dumps({}),
-            "event_annotation_value_counts": _json_dumps({}),
-            "event_annotation_unique_values": _json_dumps({}),
-            "error": str(exc),
-            **{f"has_{column}": False for column in EXPECTED_SIGNAL_COLUMNS},
-            **{f"has_{column}": False for column in EVENT_ANNOTATION_COLUMNS},
-        }
+        return _empty_participant_summary(csv_path, participant_id, str(exc))
 
-    columns = list(df.columns)
     columns_set = set(columns)
     missing_signal_columns = [
         column for column in EXPECTED_SIGNAL_COLUMNS if column not in columns_set
@@ -928,28 +1142,74 @@ def summarize_participant_file(file_path: str | Path) -> dict[str, object]:
         if isinstance(label_match, list)
         else ([label_match] if label_match is not None else [])
     )
-    label_counts = (
-        {
-            str(value): int(count)
-            for value, count in df[label_column].value_counts(dropna=False).items()
-        }
-        if label_column is not None and label_column in df.columns
-        else {}
-    )
-    unique_label_values = list(label_counts)
 
     present_signal_columns = [
         column for column in EXPECTED_SIGNAL_COLUMNS if column in columns_set
     ]
-    missing_counts = {
-        column: int(df[column].isna().sum()) for column in present_signal_columns
+    present_event_columns = [
+        column for column in EVENT_ANNOTATION_COLUMNS if column in columns_set
+    ]
+    requested_columns = {
+        TIME_COLUMN,
+        *present_signal_columns,
+        *present_event_columns,
     }
+    if label_column is not None:
+        requested_columns.add(label_column)
+
+    n_rows = 0
+    label_counter: Counter[str] = Counter()
+    missing_counts = {column: 0 for column in present_signal_columns}
+    signal_accumulators = {
+        column: _new_numeric_accumulator() for column in present_signal_columns
+    }
+    event_counters = {column: Counter() for column in present_event_columns}
+    timestamp_accumulator = _new_timestamp_accumulator()
+
+    try:
+        for chunk in _iter_inventory_chunks(
+            csv_path,
+            columns=columns,
+            requested_columns=requested_columns,
+            chunksize=chunksize,
+        ):
+            n_rows += len(chunk)
+
+            if label_column is not None and label_column in chunk.columns:
+                _update_string_counts(label_counter, chunk[label_column])
+
+            if TIME_COLUMN in chunk.columns:
+                _update_timestamp_accumulator(
+                    timestamp_accumulator,
+                    chunk[TIME_COLUMN],
+                )
+
+            for column in present_signal_columns:
+                if column not in chunk.columns:
+                    continue
+                missing_counts[column] += int(chunk[column].isna().sum())
+                _update_numeric_accumulator(
+                    signal_accumulators[column],
+                    chunk[column],
+                )
+
+            for column in present_event_columns:
+                if column in chunk.columns:
+                    _update_string_counts(event_counters[column], chunk[column])
+    except ValueError as exc:
+        return _empty_participant_summary(csv_path, participant_id, str(exc))
+
+    label_counts = _ordered_count_dict(label_counter)
+    unique_label_values = list(label_counts)
     missing_percentages = {
-        column: (float(df[column].isna().mean() * 100) if len(df) else None)
+        column: (float(missing_counts[column] / n_rows * 100) if n_rows else None)
         for column in present_signal_columns
     }
 
-    event_counts = _value_counts(df, EVENT_ANNOTATION_COLUMNS)
+    event_counts = {
+        column: _ordered_count_dict(event_counters[column])
+        for column in present_event_columns
+    }
     event_unique_values = {
         column: list(counts) for column, counts in event_counts.items()
     }
@@ -957,7 +1217,7 @@ def summarize_participant_file(file_path: str | Path) -> dict[str, object]:
     summary: dict[str, object] = {
         "participant_id": participant_id,
         "file_path": str(csv_path),
-        "n_rows": int(len(df)),
+        "n_rows": int(n_rows),
         "n_columns": int(len(columns)),
         "available_columns": _json_dumps(columns),
         "has_expected_schema": columns == EXPECTED_DREAMT_COLUMNS,
@@ -965,7 +1225,9 @@ def summarize_participant_file(file_path: str | Path) -> dict[str, object]:
         "missing_expected_columns": _json_dumps(missing_expected_columns),
         "extra_columns": _json_dumps(extra_columns),
         "missing_expected_signal_columns": _json_dumps(missing_signal_columns),
-        "recording_duration_seconds": _recording_duration_seconds(df),
+        "recording_duration_seconds": _finalize_timestamp_duration(
+            timestamp_accumulator
+        ),
         "label_column": label_column,
         "label_column_candidates": _json_dumps(label_candidates),
         "unique_label_values": _json_dumps(unique_label_values),
@@ -973,7 +1235,10 @@ def summarize_participant_file(file_path: str | Path) -> dict[str, object]:
         "missing_value_counts_by_signal": _json_dumps(missing_counts),
         "missing_value_percentages_by_signal": _json_dumps(missing_percentages),
         "signal_summary_stats": _json_dumps(
-            _numeric_summary(df, EXPECTED_SIGNAL_COLUMNS)
+            {
+                column: _finalize_numeric_accumulator(signal_accumulators[column])
+                for column in present_signal_columns
+            }
         ),
         "event_annotation_value_counts": _json_dumps(event_counts),
         "event_annotation_unique_values": _json_dumps(event_unique_values),
@@ -992,6 +1257,7 @@ def summarize_dataset(
     raw_data_dir: str | Path = DEFAULT_RAW_DATA_DIR,
     output_path: str | Path = DEFAULT_PARTICIPANT_SUMMARY_PATH,
     pattern: str = DEFAULT_PARTICIPANT_PATTERN,
+    chunksize: int | None = DEFAULT_INVENTORY_CHUNKSIZE,
 ) -> pd.DataFrame:
     """Summarize all participant CSV files and save the summary CSV.
 
@@ -1001,7 +1267,10 @@ def summarize_dataset(
     participant_files = list_participant_csvs(raw_data_dir, pattern=pattern)
     print(f"Found {len(participant_files)} participant CSV file(s) in {raw_data_dir}.")
 
-    summaries = [summarize_participant_file(path) for path in participant_files]
+    summaries = [
+        summarize_participant_file(path, chunksize=chunksize)
+        for path in participant_files
+    ]
     summary_df = pd.DataFrame(summaries, columns=PARTICIPANT_SUMMARY_COLUMNS)
 
     output_csv = Path(output_path)
