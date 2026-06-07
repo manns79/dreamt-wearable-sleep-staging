@@ -802,9 +802,17 @@ def _label_counts_to_summary_frame(
         [
             {
                 "raw_label": raw_label,
-                "standardized_label": standardized_label,
-                "mapped_label": mapped_label,
-                "invalid_reason": invalid_reason,
+                "standardized_label": (
+                    standardized_label
+                    if standardized_label is not None
+                    else float("nan")
+                ),
+                "mapped_label": (
+                    mapped_label if mapped_label is not None else float("nan")
+                ),
+                "invalid_reason": (
+                    invalid_reason if invalid_reason is not None else float("nan")
+                ),
                 "count": int(count),
             }
             for (
