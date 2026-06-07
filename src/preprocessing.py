@@ -7,6 +7,7 @@ standardizing DREAMT/PSG sleep-stage labels before modeling.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,6 @@ from src.data import (
     TIME_COLUMN,
     extract_participant_id,
     identify_label_columns,
-    load_participant_csv,
 )
 
 
@@ -42,6 +42,14 @@ P_AS_WAKE_LABEL_MAPPING_NOTE = (
     "Sensitivity mapping treats P as Wake to match the DREAMT data_100Hz "
     "convention; it should not be used for the main analysis."
 )
+DEFAULT_LABEL_MAPPING_CHUNKSIZE = 500_000
+LABEL_MAPPING_SUMMARY_COLUMNS = [
+    "raw_label",
+    "standardized_label",
+    "mapped_label",
+    "invalid_reason",
+    "count",
+]
 
 MISSING_LABEL_TOKENS = {
     "",
@@ -646,49 +654,106 @@ def _summarize_label_series(
     p_as_wake: bool,
 ) -> pd.DataFrame:
     """Summarize one label series by raw value and mapping result."""
-    if labels.empty:
-        return pd.DataFrame(
-            columns=[
-                "raw_label",
-                "standardized_label",
-                "mapped_label",
-                "invalid_reason",
-                "count",
-            ]
-        )
+    counts: Counter[tuple[str, str | None, str | None, str | None]] = Counter()
+    _accumulate_label_counts(counts, labels, p_as_wake=p_as_wake)
+    return _label_counts_to_summary_frame(counts)
 
-    audit = pd.DataFrame(
-        {
-            "raw_label": labels.map(_display_raw_label),
-            "standardized_label": labels.map(standardize_label_names),
-            "mapped_label": labels.map(
-                lambda value: map_sleep_stage(value, p_as_wake=p_as_wake)
-            ),
-            "invalid_reason": labels.map(
-                lambda value: _invalid_label_reason(value, p_as_wake=p_as_wake)
-            ),
-        }
+
+def _label_summary_key(
+    raw_label: Any,
+    p_as_wake: bool,
+) -> tuple[str, str | None, str | None, str | None]:
+    """Return the compact summary key for one raw label value."""
+    return (
+        _display_raw_label(raw_label),
+        standardize_label_names(raw_label),
+        map_sleep_stage(raw_label, p_as_wake=p_as_wake),
+        _invalid_label_reason(raw_label, p_as_wake=p_as_wake),
     )
-    grouped = (
-        audit.groupby(
-            ["raw_label", "standardized_label", "mapped_label", "invalid_reason"],
-            dropna=False,
-        )
-        .size()
-        .reset_index(name="count")
-        .sort_values(["raw_label", "standardized_label"], na_position="first")
-        .reset_index(drop=True)
+
+
+def _accumulate_label_counts(
+    counts: Counter[tuple[str, str | None, str | None, str | None]],
+    labels: pd.Series,
+    p_as_wake: bool,
+) -> None:
+    """Add label value counts to an existing compact summary counter."""
+    if labels.empty:
+        return
+
+    for raw_label, count in labels.value_counts(dropna=False).items():
+        counts[_label_summary_key(raw_label, p_as_wake=p_as_wake)] += int(count)
+
+
+def _label_counts_to_summary_frame(
+    counts: Counter[tuple[str, str | None, str | None, str | None]],
+) -> pd.DataFrame:
+    """Convert compact label counts into the public Stage 2 summary schema."""
+    if not counts:
+        return pd.DataFrame(columns=LABEL_MAPPING_SUMMARY_COLUMNS)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "raw_label": raw_label,
+                "standardized_label": standardized_label,
+                "mapped_label": mapped_label,
+                "invalid_reason": invalid_reason,
+                "count": int(count),
+            }
+            for (
+                raw_label,
+                standardized_label,
+                mapped_label,
+                invalid_reason,
+            ), count in counts.items()
+        ],
+        columns=LABEL_MAPPING_SUMMARY_COLUMNS,
     )
-    grouped["standardized_label"] = grouped["standardized_label"].where(
-        grouped["standardized_label"].notna(), None
+    summary = summary.sort_values(
+        ["raw_label", "standardized_label"],
+        na_position="first",
+    ).reset_index(drop=True)
+    summary["standardized_label"] = summary["standardized_label"].where(
+        summary["standardized_label"].notna(), None
     )
-    grouped["mapped_label"] = grouped["mapped_label"].where(
-        grouped["mapped_label"].notna(), None
+    summary["mapped_label"] = summary["mapped_label"].where(
+        summary["mapped_label"].notna(), None
     )
-    grouped["invalid_reason"] = grouped["invalid_reason"].where(
-        grouped["invalid_reason"].notna(), None
+    summary["invalid_reason"] = summary["invalid_reason"].where(
+        summary["invalid_reason"].notna(), None
     )
-    return grouped
+    return summary
+
+
+def _read_csv_header(file_path: Path) -> pd.DataFrame:
+    """Read only CSV headers while preserving the previous error style."""
+    if not file_path.exists():
+        raise FileNotFoundError(f"Participant CSV does not exist: {file_path}")
+    if not file_path.is_file():
+        raise ValueError(f"Participant CSV path is not a file: {file_path}")
+
+    try:
+        return pd.read_csv(file_path, nrows=0)
+    except Exception as exc:
+        raise ValueError(f"Could not read participant CSV {file_path}: {exc}") from exc
+
+
+def _iter_label_chunks(
+    file_path: Path,
+    label_column: str,
+    chunksize: int | None,
+) -> Iterable[pd.Series]:
+    """Yield one label column from a CSV without materializing all signals."""
+    read_kwargs = {"usecols": [label_column]}
+    try:
+        if chunksize is None:
+            yield pd.read_csv(file_path, **read_kwargs)[label_column]
+        else:
+            for chunk in pd.read_csv(file_path, chunksize=chunksize, **read_kwargs):
+                yield chunk[label_column]
+    except Exception as exc:
+        raise ValueError(f"Could not read participant CSV {file_path}: {exc}") from exc
 
 
 def summarize_label_mapping(
@@ -696,6 +761,7 @@ def summarize_label_mapping(
     p_as_wake: bool = False,
     output_path: str | Path | None = None,
     label_column: str | None = None,
+    chunksize: int | None = DEFAULT_LABEL_MAPPING_CHUNKSIZE,
 ) -> pd.DataFrame:
     """Summarize raw and mapped sleep-stage labels across participant files.
 
@@ -712,6 +778,9 @@ def summarize_label_mapping(
         Optional explicit label column. If omitted, ``Sleep_Stage`` is used
         when present, with the same conservative fallback detection as
         ``src.data``.
+    chunksize:
+        Number of CSV rows to read at a time. The default keeps memory bounded
+        for full DREAMT runs. Set to ``None`` to read each label column at once.
 
     Returns
     -------
@@ -721,22 +790,45 @@ def summarize_label_mapping(
         and mapping mode. ``P`` and other invalid labels remain explicit rather
         than being forced into a target class.
     """
+    if chunksize is not None and (
+        not isinstance(chunksize, int) or chunksize <= 0
+    ):
+        raise ValueError("chunksize must be a positive integer or None.")
+
     file_paths = [Path(file_path) for file_path in files]
     participant_rows: list[pd.DataFrame] = []
-    all_label_frames: list[pd.Series] = []
+    dataset_counts: Counter[tuple[str, str | None, str | None, str | None]] = (
+        Counter()
+    )
 
     for file_path in file_paths:
-        df = load_participant_csv(file_path)
-        resolved_label_column = _resolve_label_column(df, label_column=label_column)
-        labels = df[resolved_label_column]
-        all_label_frames.append(labels)
+        header = _read_csv_header(file_path)
+        resolved_label_column = _resolve_label_column(
+            header,
+            label_column=label_column,
+        )
 
         try:
             participant_id = extract_participant_id(file_path)
         except ValueError:
             participant_id = file_path.stem
 
-        participant_summary = _summarize_label_series(labels, p_as_wake=p_as_wake)
+        participant_counts: Counter[
+            tuple[str, str | None, str | None, str | None]
+        ] = Counter()
+        for labels in _iter_label_chunks(
+            file_path,
+            label_column=resolved_label_column,
+            chunksize=chunksize,
+        ):
+            _accumulate_label_counts(
+                participant_counts,
+                labels,
+                p_as_wake=p_as_wake,
+            )
+
+        dataset_counts.update(participant_counts)
+        participant_summary = _label_counts_to_summary_frame(participant_counts)
         participant_summary.insert(0, "scope", "participant")
         participant_summary.insert(1, "participant_id", participant_id)
         participant_summary.insert(2, "file_path", str(file_path))
@@ -749,12 +841,7 @@ def summarize_label_mapping(
         )
         participant_rows.append(participant_summary)
 
-    if all_label_frames:
-        all_labels = pd.concat(all_label_frames, ignore_index=True)
-        dataset_summary = _summarize_label_series(all_labels, p_as_wake=p_as_wake)
-    else:
-        dataset_summary = _summarize_label_series(pd.Series(dtype=object), p_as_wake)
-
+    dataset_summary = _label_counts_to_summary_frame(dataset_counts)
     dataset_summary.insert(0, "scope", "dataset")
     dataset_summary.insert(1, "participant_id", "ALL")
     dataset_summary.insert(2, "file_path", "")
