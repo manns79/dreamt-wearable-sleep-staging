@@ -142,6 +142,50 @@ def test_collect_epoch_signal_summaries_reads_raw_files():
     assert summary["ACC_MAG_mean"].item() == 1.0
 
 
+def test_collect_epoch_signal_summaries_requests_expected_signal_columns(monkeypatch):
+    requested_usecols = []
+
+    def fake_load_participant_csv(file_path, usecols=None):
+        requested_usecols.append(usecols)
+        return pd.DataFrame(
+            {
+                "BVP": [1, 2, 3, 4],
+                "ACC_X": [1, 1, 1, 1],
+                "ACC_Y": [0, 0, 0, 0],
+                "ACC_Z": [0, 0, 0, 0],
+            }
+        )
+
+    raw_dir = Path("outputs/test-stage5-usecols/raw")
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "S001_whole_df.csv").touch()
+    monkeypatch.setattr("src.plots.load_participant_csv", fake_load_participant_csv)
+    epochs = pd.DataFrame(
+        {
+            "participant_id": ["S001"],
+            "epoch_id": [0],
+            "start_row": [1],
+            "end_row": [3],
+            "mapped_label": ["Wake"],
+        }
+    )
+
+    collect_epoch_signal_summaries(epochs, raw_dir)
+
+    assert requested_usecols == [
+        [
+            "BVP",
+            "ACC_X",
+            "ACC_Y",
+            "ACC_Z",
+            "TEMP",
+            "EDA",
+            "HR",
+            "IBI",
+        ]
+    ]
+
+
 def test_transition_matrices_stay_within_participant_and_consecutive_epochs():
     train_epochs = valid_training_epochs(_epoch_index())
 

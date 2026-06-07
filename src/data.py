@@ -28,6 +28,7 @@ DEFAULT_PARTICIPANT_SUMMARY_PATH = DEFAULT_INTERIM_DATA_DIR / "participant_summa
 DEFAULT_SPLIT_ASSIGNMENTS_PATH = DEFAULT_INTERIM_DATA_DIR / "split_assignments.csv"
 DEFAULT_EPOCH_INDEX_PATH = DEFAULT_INTERIM_DATA_DIR / "epoch_index.csv"
 DEFAULT_INVENTORY_CHUNKSIZE = 500_000
+DEFAULT_EPOCH_INDEX_CHUNKSIZE = 500_000
 
 TIME_COLUMN = "TIMESTAMP"
 LABEL_COLUMN = "Sleep_Stage"
@@ -344,7 +345,10 @@ def load_split_assignments(path: str | Path) -> pd.DataFrame:
     return split_df
 
 
-def load_participant_csv(file_path: str | Path) -> pd.DataFrame:
+def load_participant_csv(
+    file_path: str | Path,
+    usecols: Iterable[str] | None = None,
+) -> pd.DataFrame:
     """Load a participant CSV without preprocessing.
 
     Raises a clear error for missing files or unreadable CSVs.
@@ -355,8 +359,13 @@ def load_participant_csv(file_path: str | Path) -> pd.DataFrame:
     if not csv_path.is_file():
         raise ValueError(f"Participant CSV path is not a file: {csv_path}")
 
+    read_kwargs = {}
+    if usecols is not None:
+        requested_columns = set(usecols)
+        read_kwargs["usecols"] = lambda column: column in requested_columns
+
     try:
-        return pd.read_csv(csv_path)
+        return pd.read_csv(csv_path, **read_kwargs)
     except Exception as exc:
         raise ValueError(f"Could not read participant CSV {csv_path}: {exc}") from exc
 
@@ -369,6 +378,7 @@ def build_epoch_index(
     epoch_length_seconds: int = 30,
     missingness_threshold: float = 0.20,
     pattern: str = DEFAULT_PARTICIPANT_PATTERN,
+    chunksize: int | None = DEFAULT_EPOCH_INDEX_CHUNKSIZE,
 ) -> pd.DataFrame:
     """Build and save a participant-level split-aware sleep epoch index.
 
@@ -376,12 +386,19 @@ def build_epoch_index(
     feature extraction, context-window construction, or model training occurs in
     this function. Participants present in ``raw_dir`` must have an assignment
     in ``split_assignments_path`` so downstream work cannot silently create
-    epochs without train/validation/test membership.
+    epochs without train/validation/test membership. Raw participant CSVs are
+    streamed in chunks and limited to timestamp, label, and expected signal
+    columns.
     """
     from src.preprocessing import (
         apply_epoch_inclusion_rules,
-        segment_participant_into_epochs,
+        segment_participant_chunks_into_epochs,
     )
+
+    if chunksize is not None and (
+        not isinstance(chunksize, int) or chunksize <= 0
+    ):
+        raise ValueError("chunksize must be a positive integer or None.")
 
     split_df = load_split_assignments(split_assignments_path)
     split_lookup = dict(
@@ -403,9 +420,16 @@ def build_epoch_index(
             participants_without_split.append(participant_id)
             continue
 
-        participant_df = load_participant_csv(file_path)
-        participant_epochs = segment_participant_into_epochs(
-            participant_df,
+        columns = _read_csv_header(file_path)
+        requested_columns = [TIME_COLUMN, LABEL_COLUMN, *EXPECTED_SIGNAL_COLUMNS]
+        chunks = _iter_inventory_chunks(
+            file_path,
+            columns=columns,
+            requested_columns=requested_columns,
+            chunksize=chunksize,
+        )
+        participant_epochs = segment_participant_chunks_into_epochs(
+            chunks,
             participant_id=participant_id,
             sampling_rate_hz=sampling_rate_hz,
             epoch_length_seconds=epoch_length_seconds,

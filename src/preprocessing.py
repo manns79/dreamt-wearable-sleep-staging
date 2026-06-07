@@ -274,6 +274,46 @@ def _empty_epoch_summary_columns(signal_columns: Iterable[str]) -> list[str]:
     ]
 
 
+def _epoch_summary_row(
+    epoch_df: pd.DataFrame,
+    participant_id: str,
+    epoch_id: int,
+    start_row: int,
+    end_row: int,
+    expected_n_rows: int,
+    sampling_rate_hz: int,
+    signal_columns: Iterable[str],
+) -> dict[str, object]:
+    """Summarize one fixed row-range epoch without assuming full-file context."""
+    label_info = validate_epoch_labels(epoch_df)
+    missingness = compute_epoch_missingness(epoch_df, signal_columns)
+    has_timestamp_discontinuity = _timestamp_discontinuity(
+        epoch_df,
+        sampling_rate_hz=sampling_rate_hz,
+    )
+
+    if TIME_COLUMN in epoch_df.columns and not epoch_df.empty:
+        start_time = epoch_df[TIME_COLUMN].iloc[0]
+        end_time = epoch_df[TIME_COLUMN].iloc[-1]
+    else:
+        start_time = None
+        end_time = None
+
+    return {
+        "participant_id": str(participant_id),
+        "epoch_id": int(epoch_id),
+        "start_row": int(start_row),
+        "end_row": int(end_row),
+        "n_rows": int(len(epoch_df)),
+        "expected_n_rows": int(expected_n_rows),
+        "start_time": start_time,
+        "end_time": end_time,
+        **label_info,
+        "has_timestamp_discontinuity": has_timestamp_discontinuity,
+        **missingness,
+    }
+
+
 def validate_epoch_labels(epoch_df: pd.DataFrame) -> dict[str, object]:
     """Validate that an epoch has one consistent three-class sleep-stage label.
 
@@ -445,36 +485,102 @@ def segment_participant_into_epochs(
     for epoch_id, start_row in enumerate(range(0, n_rows_total, expected_n_rows)):
         end_row = min(start_row + expected_n_rows, n_rows_total)
         epoch_df = df.iloc[start_row:end_row]
-        label_info = validate_epoch_labels(epoch_df)
-        missingness = compute_epoch_missingness(epoch_df, signal_columns)
-        has_timestamp_discontinuity = _timestamp_discontinuity(
-            epoch_df,
-            sampling_rate_hz=sampling_rate_hz,
-        )
-
-        if TIME_COLUMN in epoch_df.columns and not epoch_df.empty:
-            start_time = epoch_df[TIME_COLUMN].iloc[0]
-            end_time = epoch_df[TIME_COLUMN].iloc[-1]
-        else:
-            start_time = None
-            end_time = None
-
         rows.append(
-            {
-                "participant_id": str(participant_id),
-                "epoch_id": int(epoch_id),
-                "start_row": int(start_row),
-                "end_row": int(end_row),
-                "n_rows": int(len(epoch_df)),
-                "expected_n_rows": int(expected_n_rows),
-                "start_time": start_time,
-                "end_time": end_time,
-                **label_info,
-                "has_timestamp_discontinuity": has_timestamp_discontinuity,
-                **missingness,
-            }
+            _epoch_summary_row(
+                epoch_df=epoch_df,
+                participant_id=participant_id,
+                epoch_id=epoch_id,
+                start_row=start_row,
+                end_row=end_row,
+                expected_n_rows=expected_n_rows,
+                sampling_rate_hz=sampling_rate_hz,
+                signal_columns=signal_columns,
+            )
         )
 
+    return pd.DataFrame(rows)
+
+
+def segment_participant_chunks_into_epochs(
+    chunks: Iterable[pd.DataFrame],
+    participant_id: str,
+    sampling_rate_hz: int = DEFAULT_SAMPLING_RATE_HZ,
+    epoch_length_seconds: int = DEFAULT_EPOCH_LENGTH_SECONDS,
+    signal_columns: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+) -> pd.DataFrame:
+    """Segment participant CSV chunks into fixed-length epoch summaries.
+
+    This streaming equivalent of ``segment_participant_into_epochs`` carries the
+    final partial epoch from one chunk into the next chunk. Row ranges remain
+    relative to the original participant file and use the same half-open
+    convention as the in-memory segmenter.
+    """
+    if sampling_rate_hz <= 0:
+        raise ValueError("sampling_rate_hz must be positive.")
+    if epoch_length_seconds <= 0:
+        raise ValueError("epoch_length_seconds must be positive.")
+
+    signal_columns = list(signal_columns)
+    expected_n_rows = sampling_rate_hz * epoch_length_seconds
+    rows: list[dict[str, object]] = []
+    pending = pd.DataFrame()
+    pending_start_row = 0
+    rows_seen = 0
+    epoch_id = 0
+
+    for chunk in chunks:
+        if chunk.empty:
+            continue
+
+        chunk = chunk.reset_index(drop=True)
+        if pending.empty:
+            working = chunk
+            working_start_row = rows_seen
+        else:
+            working = pd.concat([pending, chunk], ignore_index=True)
+            working_start_row = pending_start_row
+
+        rows_seen += len(chunk)
+        full_epoch_count = len(working) // expected_n_rows
+        for epoch_offset in range(full_epoch_count):
+            start_offset = epoch_offset * expected_n_rows
+            end_offset = start_offset + expected_n_rows
+            start_row = working_start_row + start_offset
+            end_row = working_start_row + end_offset
+            rows.append(
+                _epoch_summary_row(
+                    epoch_df=working.iloc[start_offset:end_offset],
+                    participant_id=participant_id,
+                    epoch_id=epoch_id,
+                    start_row=start_row,
+                    end_row=end_row,
+                    expected_n_rows=expected_n_rows,
+                    sampling_rate_hz=sampling_rate_hz,
+                    signal_columns=signal_columns,
+                )
+            )
+            epoch_id += 1
+
+        remainder_start = full_epoch_count * expected_n_rows
+        pending = working.iloc[remainder_start:].copy()
+        pending_start_row = working_start_row + remainder_start
+
+    if not pending.empty:
+        rows.append(
+            _epoch_summary_row(
+                epoch_df=pending,
+                participant_id=participant_id,
+                epoch_id=epoch_id,
+                start_row=pending_start_row,
+                end_row=pending_start_row + len(pending),
+                expected_n_rows=expected_n_rows,
+                sampling_rate_hz=sampling_rate_hz,
+                signal_columns=signal_columns,
+            )
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=_empty_epoch_summary_columns(signal_columns))
     return pd.DataFrame(rows)
 
 

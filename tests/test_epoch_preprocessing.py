@@ -7,6 +7,7 @@ from src.data import EXPECTED_SIGNAL_COLUMNS, build_epoch_index
 from src.preprocessing import (
     apply_epoch_inclusion_rules,
     compute_epoch_missingness,
+    segment_participant_chunks_into_epochs,
     segment_participant_into_epochs,
     validate_epoch_labels,
 )
@@ -39,6 +40,29 @@ def test_segment_participant_into_epochs_uses_half_open_row_ranges():
     assert epochs.loc[0, "start_row"] == 0
     assert epochs.loc[0, "end_row"] == 8
     assert epochs.loc[1, "n_rows"] == 2
+
+
+def test_segment_participant_chunks_matches_full_frame_segmentation():
+    df = _participant_frame(["W"] * 8 + ["N2"] * 8 + ["REM"] * 3)
+    chunks = [df.iloc[:5], df.iloc[5:13], df.iloc[13:]]
+
+    full_epochs = segment_participant_into_epochs(
+        df,
+        participant_id="S001",
+        sampling_rate_hz=4,
+        epoch_length_seconds=2,
+    )
+    chunked_epochs = segment_participant_chunks_into_epochs(
+        chunks,
+        participant_id="S001",
+        sampling_rate_hz=4,
+        epoch_length_seconds=2,
+    )
+
+    pd.testing.assert_frame_equal(
+        chunked_epochs.reset_index(drop=True),
+        full_epochs.reset_index(drop=True),
+    )
 
 
 def test_validate_epoch_labels_flags_inconsistent_labels():
@@ -107,6 +131,7 @@ def test_build_epoch_index_respects_split_assignments():
     output_path = output_dir / "epoch_index.csv"
 
     df = _participant_frame(["W"] * 8)
+    df["Irrelevant_Extra_Column"] = range(len(df))
     df.to_csv(raw_dir / "S001_whole_df.csv", index=False)
     pd.DataFrame({"participant_id": ["S001"], "split": ["train"]}).to_csv(
         split_path,
@@ -119,6 +144,7 @@ def test_build_epoch_index_respects_split_assignments():
         output_path=output_path,
         sampling_rate_hz=4,
         epoch_length_seconds=2,
+        chunksize=3,
     )
 
     assert output_path.exists()

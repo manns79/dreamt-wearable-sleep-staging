@@ -306,7 +306,7 @@ def collect_epoch_signal_summaries(
     rows: list[dict[str, object]] = []
     for participant_id, participant_epochs in analysis_epochs.groupby("participant_id"):
         raw_path = _raw_participant_path(raw_data_dir, participant_id)
-        raw_df = load_participant_csv(raw_path)
+        raw_df = load_participant_csv(raw_path, usecols=EXPECTED_SIGNAL_COLUMNS)
         for _, epoch_row in participant_epochs.iterrows():
             start_row = int(epoch_row["start_row"])
             end_row = int(epoch_row["end_row"])
