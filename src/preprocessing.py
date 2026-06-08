@@ -332,21 +332,23 @@ def validate_epoch_labels(epoch_df: pd.DataFrame) -> dict[str, object]:
 
     labels = epoch_df[LABEL_COLUMN]
     raw_label = _pipe_join(labels)
+    standardized_label_series = labels.map(standardize_label_names)
+    mapped_label_series = labels.map(map_sleep_stage)
     standardized_labels = sorted(
         {
             label
-            for label in labels.map(standardize_label_names).tolist()
-            if label is not None
+            for label in standardized_label_series.tolist()
+            if pd.notna(label)
         }
     )
     mapped_labels = sorted(
         {
             label
-            for label in labels.map(map_sleep_stage).tolist()
-            if label in TARGET_SLEEP_STAGE_LABELS
+            for label in mapped_label_series.tolist()
+            if pd.notna(label) and label in TARGET_SLEEP_STAGE_LABELS
         }
     )
-    has_missing_or_invalid = labels.map(map_sleep_stage).isna().any()
+    has_missing_or_invalid = mapped_label_series.isna().any()
 
     if not standardized_labels:
         return {

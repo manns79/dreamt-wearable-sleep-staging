@@ -75,6 +75,18 @@ def test_validate_epoch_labels_flags_inconsistent_labels():
     assert label_info["raw_label"] == "N1|W"
 
 
+def test_validate_epoch_labels_handles_mixed_valid_and_missing_labels():
+    df = _participant_frame(["W", float("nan"), "W"])
+
+    label_info = validate_epoch_labels(df)
+
+    assert label_info["is_valid_label"] is False
+    assert label_info["label_issue"] == "missing_or_invalid_label"
+    assert label_info["standardized_label"] == "W"
+    assert label_info["mapped_label"] is None
+    assert label_info["raw_label"] == "<MISSING>|W"
+
+
 def test_compute_epoch_missingness_handles_known_and_missing_signal_columns():
     df = _participant_frame(["REM"] * 4)
     df.loc[:1, "BVP"] = None
