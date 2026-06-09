@@ -171,15 +171,20 @@ The epoch index uses one fixed-length PSG sleep epoch as the modeling unit:
 Each participant CSV is processed independently and joined to
 `data/interim/split_assignments.csv`. The split is participant-level, so epochs
 from one participant stay entirely in train, validation, or test. The builder
-raises an error if a raw participant file has no split assignment.
+raises an error if a raw participant file has no split assignment. Before
+segmenting each participant, Stage 4 infers a participant-specific PSG epoch
+offset from `Sleep_Stage` transition rows; the selected offset is written to
+`epoch_start_offset_rows` so the row alignment remains auditable.
 
 Epochs are invalidated when labels are missing, unknown, ambiguous, or change
 within an epoch; when the row count differs from 1920; when `TIMESTAMP` shows an
-obvious discontinuity; or when any expected wearable signal has more than 20%
-missingness by default. Missingness fractions are retained as
-`missingness_<SIGNAL>` columns for later EDA and feature extraction. This stage
-does not fit scalers, normalize signals, build temporal context windows, train
-models, or create PyTorch datasets.
+obvious discontinuity; or when any required wearable signal has more than 20%
+missingness by default. `IBI` missingness is retained as `missingness_IBI` but
+does not by itself invalidate an otherwise usable epoch because it is handled
+later during feature construction/modeling. Missingness fractions are retained
+as `missingness_<SIGNAL>` columns for later EDA and feature extraction. This
+stage does not fit scalers, normalize signals, build temporal context windows,
+train models, or create PyTorch datasets.
 
 From Python at the repo root:
 

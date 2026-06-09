@@ -35,6 +35,8 @@ DEFAULT_EXPECTED_ROWS_PER_EPOCH = (
     DEFAULT_SAMPLING_RATE_HZ * DEFAULT_EPOCH_LENGTH_SECONDS
 )
 DEFAULT_MISSINGNESS_THRESHOLD = 0.20
+DEFAULT_MISSINGNESS_EXEMPT_SIGNALS = ("IBI",)
+DEFAULT_EPOCH_OFFSET_MIN_TRANSITION_AGREEMENT = 0.80
 PRIMARY_LABEL_MAPPING_NOTE = (
     "Primary mapping excludes DREAMT data_64Hz preparation-stage P labels."
 )
@@ -145,6 +147,7 @@ EPOCH_INDEX_BASE_COLUMNS = [
     "expected_n_rows",
     "start_time",
     "end_time",
+    "epoch_start_offset_rows",
     "raw_label",
     "mapped_label",
     "is_valid_label",
@@ -262,6 +265,114 @@ def _pipe_join(values: Iterable[Any]) -> str:
     return "|".join(display_values)
 
 
+def _validate_epoch_start_offset(
+    epoch_start_offset_rows: int,
+    expected_n_rows: int,
+) -> int:
+    """Validate a row offset for fixed-length epoch segmentation."""
+    if not isinstance(epoch_start_offset_rows, int):
+        raise TypeError("epoch_start_offset_rows must be an integer.")
+    if epoch_start_offset_rows < 0 or epoch_start_offset_rows >= expected_n_rows:
+        raise ValueError(
+            "epoch_start_offset_rows must be between 0 and "
+            f"{expected_n_rows - 1}."
+        )
+    return epoch_start_offset_rows
+
+
+def _offset_from_transition_remainders(
+    transition_remainders: Counter[int],
+    min_transition_agreement: float,
+) -> int:
+    """Return the dominant transition remainder when it is reliable enough."""
+    if not 0 <= min_transition_agreement <= 1:
+        raise ValueError("min_transition_agreement must be between 0 and 1.")
+    if not transition_remainders:
+        return 0
+
+    offset, count = transition_remainders.most_common(1)[0]
+    total = sum(transition_remainders.values())
+    if offset == 0:
+        return 0
+    if count / total < min_transition_agreement:
+        return 0
+    return int(offset)
+
+
+def infer_epoch_start_offset_from_labels(
+    labels: Iterable[Any],
+    expected_n_rows: int = DEFAULT_EXPECTED_ROWS_PER_EPOCH,
+    min_transition_agreement: float = DEFAULT_EPOCH_OFFSET_MIN_TRANSITION_AGREEMENT,
+) -> int:
+    """Infer a participant-specific PSG epoch row offset from label transitions.
+
+    DREAMT ``data_64Hz`` files can begin before the first PSG 30-second scoring
+    boundary. When label transitions consistently occur at the same row
+    remainder modulo the expected epoch length, that remainder is used as the
+    first complete PSG epoch boundary. If transitions are absent or inconsistent,
+    the conservative row-0 alignment is retained.
+    """
+    if expected_n_rows <= 0:
+        raise ValueError("expected_n_rows must be positive.")
+
+    transition_remainders: Counter[int] = Counter()
+    previous_label: str | None = None
+    has_previous = False
+
+    for row_position, raw_label in enumerate(labels):
+        label = standardize_label_names(raw_label)
+        if (
+            has_previous
+            and previous_label is not None
+            and label is not None
+            and label != previous_label
+        ):
+            transition_remainders[row_position % expected_n_rows] += 1
+        previous_label = label
+        has_previous = True
+
+    return _offset_from_transition_remainders(
+        transition_remainders,
+        min_transition_agreement=min_transition_agreement,
+    )
+
+
+def infer_epoch_start_offset_from_label_chunks(
+    chunks: Iterable[pd.DataFrame],
+    expected_n_rows: int = DEFAULT_EXPECTED_ROWS_PER_EPOCH,
+    min_transition_agreement: float = DEFAULT_EPOCH_OFFSET_MIN_TRANSITION_AGREEMENT,
+) -> int:
+    """Streaming equivalent of ``infer_epoch_start_offset_from_labels``."""
+    if expected_n_rows <= 0:
+        raise ValueError("expected_n_rows must be positive.")
+
+    transition_remainders: Counter[int] = Counter()
+    previous_label: str | None = None
+    has_previous = False
+    row_position = 0
+
+    for chunk in chunks:
+        if LABEL_COLUMN not in chunk.columns:
+            continue
+        for raw_label in chunk[LABEL_COLUMN].tolist():
+            label = standardize_label_names(raw_label)
+            if (
+                has_previous
+                and previous_label is not None
+                and label is not None
+                and label != previous_label
+            ):
+                transition_remainders[row_position % expected_n_rows] += 1
+            previous_label = label
+            has_previous = True
+            row_position += 1
+
+    return _offset_from_transition_remainders(
+        transition_remainders,
+        min_transition_agreement=min_transition_agreement,
+    )
+
+
 def _empty_epoch_summary_columns(signal_columns: Iterable[str]) -> list[str]:
     """Return the expected epoch-summary columns for an empty result."""
     missingness_columns = [f"missingness_{column}" for column in signal_columns]
@@ -281,6 +392,7 @@ def _epoch_summary_row(
     start_row: int,
     end_row: int,
     expected_n_rows: int,
+    epoch_start_offset_rows: int,
     sampling_rate_hz: int,
     signal_columns: Iterable[str],
 ) -> dict[str, object]:
@@ -308,6 +420,7 @@ def _epoch_summary_row(
         "expected_n_rows": int(expected_n_rows),
         "start_time": start_time,
         "end_time": end_time,
+        "epoch_start_offset_rows": int(epoch_start_offset_rows),
         **label_info,
         "has_timestamp_discontinuity": has_timestamp_discontinuity,
         **missingness,
@@ -464,13 +577,15 @@ def segment_participant_into_epochs(
     sampling_rate_hz: int = DEFAULT_SAMPLING_RATE_HZ,
     epoch_length_seconds: int = DEFAULT_EPOCH_LENGTH_SECONDS,
     signal_columns: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+    epoch_start_offset_rows: int | None = None,
 ) -> pd.DataFrame:
     """Segment one participant DataFrame into fixed-length epoch summaries.
 
     Row ranges are half-open intervals: ``start_row`` is inclusive and
-    ``end_row`` is exclusive. The final partial epoch is retained in the summary
-    and later invalidated by inclusion rules unless it has the expected row
-    count.
+    ``end_row`` is exclusive. When ``epoch_start_offset_rows`` is omitted, the
+    first complete PSG epoch boundary is inferred from label transition rows.
+    The final partial epoch is retained in the summary and later invalidated by
+    inclusion rules unless it has the expected row count.
     """
     if sampling_rate_hz <= 0:
         raise ValueError("sampling_rate_hz must be positive.")
@@ -479,12 +594,27 @@ def segment_participant_into_epochs(
 
     signal_columns = list(signal_columns)
     expected_n_rows = sampling_rate_hz * epoch_length_seconds
+    if epoch_start_offset_rows is None:
+        epoch_start_offset_rows = (
+            infer_epoch_start_offset_from_labels(
+                df[LABEL_COLUMN],
+                expected_n_rows=expected_n_rows,
+            )
+            if LABEL_COLUMN in df.columns
+            else 0
+        )
+    epoch_start_offset_rows = _validate_epoch_start_offset(
+        epoch_start_offset_rows,
+        expected_n_rows=expected_n_rows,
+    )
     if df.empty:
         return pd.DataFrame(columns=_empty_epoch_summary_columns(signal_columns))
 
     rows: list[dict[str, object]] = []
     n_rows_total = len(df)
-    for epoch_id, start_row in enumerate(range(0, n_rows_total, expected_n_rows)):
+    for epoch_id, start_row in enumerate(
+        range(epoch_start_offset_rows, n_rows_total, expected_n_rows)
+    ):
         end_row = min(start_row + expected_n_rows, n_rows_total)
         epoch_df = df.iloc[start_row:end_row]
         rows.append(
@@ -495,6 +625,7 @@ def segment_participant_into_epochs(
                 start_row=start_row,
                 end_row=end_row,
                 expected_n_rows=expected_n_rows,
+                epoch_start_offset_rows=epoch_start_offset_rows,
                 sampling_rate_hz=sampling_rate_hz,
                 signal_columns=signal_columns,
             )
@@ -509,13 +640,15 @@ def segment_participant_chunks_into_epochs(
     sampling_rate_hz: int = DEFAULT_SAMPLING_RATE_HZ,
     epoch_length_seconds: int = DEFAULT_EPOCH_LENGTH_SECONDS,
     signal_columns: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+    epoch_start_offset_rows: int = 0,
 ) -> pd.DataFrame:
     """Segment participant CSV chunks into fixed-length epoch summaries.
 
     This streaming equivalent of ``segment_participant_into_epochs`` carries the
-    final partial epoch from one chunk into the next chunk. Row ranges remain
-    relative to the original participant file and use the same half-open
-    convention as the in-memory segmenter.
+    final partial epoch from one chunk into the next chunk. Rows before
+    ``epoch_start_offset_rows`` are treated as a leading non-epoch fragment and
+    skipped. Row ranges remain relative to the original participant file and use
+    the same half-open convention as the in-memory segmenter.
     """
     if sampling_rate_hz <= 0:
         raise ValueError("sampling_rate_hz must be positive.")
@@ -524,6 +657,10 @@ def segment_participant_chunks_into_epochs(
 
     signal_columns = list(signal_columns)
     expected_n_rows = sampling_rate_hz * epoch_length_seconds
+    epoch_start_offset_rows = _validate_epoch_start_offset(
+        epoch_start_offset_rows,
+        expected_n_rows=expected_n_rows,
+    )
     rows: list[dict[str, object]] = []
     pending = pd.DataFrame()
     pending_start_row = 0
@@ -534,15 +671,23 @@ def segment_participant_chunks_into_epochs(
         if chunk.empty:
             continue
 
+        chunk_start_row = rows_seen
+        rows_seen += len(chunk)
+        if chunk_start_row < epoch_start_offset_rows:
+            skip_rows = min(epoch_start_offset_rows - chunk_start_row, len(chunk))
+            chunk = chunk.iloc[skip_rows:].copy()
+            chunk_start_row += skip_rows
+            if chunk.empty:
+                continue
+
         chunk = chunk.reset_index(drop=True)
         if pending.empty:
             working = chunk
-            working_start_row = rows_seen
+            working_start_row = chunk_start_row
         else:
             working = pd.concat([pending, chunk], ignore_index=True)
             working_start_row = pending_start_row
 
-        rows_seen += len(chunk)
         full_epoch_count = len(working) // expected_n_rows
         for epoch_offset in range(full_epoch_count):
             start_offset = epoch_offset * expected_n_rows
@@ -557,6 +702,7 @@ def segment_participant_chunks_into_epochs(
                     start_row=start_row,
                     end_row=end_row,
                     expected_n_rows=expected_n_rows,
+                    epoch_start_offset_rows=epoch_start_offset_rows,
                     sampling_rate_hz=sampling_rate_hz,
                     signal_columns=signal_columns,
                 )
@@ -576,6 +722,7 @@ def segment_participant_chunks_into_epochs(
                 start_row=pending_start_row,
                 end_row=pending_start_row + len(pending),
                 expected_n_rows=expected_n_rows,
+                epoch_start_offset_rows=epoch_start_offset_rows,
                 sampling_rate_hz=sampling_rate_hz,
                 signal_columns=signal_columns,
             )
@@ -589,6 +736,7 @@ def segment_participant_chunks_into_epochs(
 def apply_epoch_inclusion_rules(
     epoch_summary_df: pd.DataFrame,
     missingness_threshold: float = DEFAULT_MISSINGNESS_THRESHOLD,
+    missingness_exempt_signals: Iterable[str] = DEFAULT_MISSINGNESS_EXEMPT_SIGNALS,
 ) -> pd.DataFrame:
     """Apply label, row-count, timestamp, and missingness exclusion rules."""
     if not 0 <= missingness_threshold <= 1:
@@ -603,6 +751,9 @@ def apply_epoch_inclusion_rules(
     missingness_columns = [
         column for column in output.columns if column.startswith("missingness_")
     ]
+    exempt_missingness_columns = {
+        f"missingness_{signal}" for signal in missingness_exempt_signals
+    }
     missing_required_columns = [
         column
         for column in ["is_valid_label", "n_rows", "expected_n_rows"]
@@ -630,7 +781,8 @@ def apply_epoch_inclusion_rules(
         high_missingness_columns = [
             column
             for column in missingness_columns
-            if pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+            if column not in exempt_missingness_columns
+            and pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
             > missingness_threshold
         ]
         if high_missingness_columns:

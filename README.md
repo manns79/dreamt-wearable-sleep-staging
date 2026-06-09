@@ -61,14 +61,19 @@ Stage 4 uses one PSG sleep epoch as the modeling unit. Reusable epoch utilities
 live in `src/preprocessing.py`, and the split-aware index builder lives in
 `src/data.py`. DREAMT participant CSVs are assumed to use a 64 Hz grid, so each
 30-second epoch should contain `30 * 64 = 1920` rows. Row ranges in the epoch
-index are half-open: `start_row` is inclusive and `end_row` is exclusive.
+index are half-open: `start_row` is inclusive and `end_row` is exclusive. Before
+segmenting each participant, Stage 4 infers a participant-specific PSG epoch
+offset from `Sleep_Stage` transition rows so files that start before the first
+30-second scoring boundary are not split on the wrong row alignment.
 
 Each epoch is assigned exactly one mapped target label from `Sleep_Stage` when
 all rows in the epoch map consistently to `Wake`, `Non-REM`, or `REM`. Epochs
 are excluded when labels are missing, unknown, ambiguous, or change within the
 epoch. Epochs are also excluded when the row count differs from the expected
 epoch size, when `TIMESTAMP` shows an obvious discontinuity, or when any known
-wearable signal has more than 20% missingness by default.
+required wearable signal has more than 20% missingness by default. `IBI`
+missingness is retained in `missingness_IBI` for later feature handling but does
+not by itself exclude an otherwise valid epoch at this stage.
 
 Epoch construction uses `data/interim/split_assignments.csv`, which is a
 participant-level split. The builder refuses to create epoch rows for a raw

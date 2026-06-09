@@ -100,6 +100,7 @@ EPOCH_INDEX_COLUMNS = [
     "expected_n_rows",
     "start_time",
     "end_time",
+    "epoch_start_offset_rows",
     "raw_label",
     "mapped_label",
     "is_valid_label",
@@ -392,6 +393,7 @@ def build_epoch_index(
     """
     from src.preprocessing import (
         apply_epoch_inclusion_rules,
+        infer_epoch_start_offset_from_label_chunks,
         segment_participant_chunks_into_epochs,
     )
 
@@ -422,6 +424,17 @@ def build_epoch_index(
 
         columns = _read_csv_header(file_path)
         requested_columns = [TIME_COLUMN, LABEL_COLUMN, *EXPECTED_SIGNAL_COLUMNS]
+        expected_n_rows = sampling_rate_hz * epoch_length_seconds
+        label_chunks = _iter_inventory_chunks(
+            file_path,
+            columns=columns,
+            requested_columns=[LABEL_COLUMN],
+            chunksize=chunksize,
+        )
+        epoch_start_offset_rows = infer_epoch_start_offset_from_label_chunks(
+            label_chunks,
+            expected_n_rows=expected_n_rows,
+        )
         chunks = _iter_inventory_chunks(
             file_path,
             columns=columns,
@@ -434,6 +447,7 @@ def build_epoch_index(
             sampling_rate_hz=sampling_rate_hz,
             epoch_length_seconds=epoch_length_seconds,
             signal_columns=EXPECTED_SIGNAL_COLUMNS,
+            epoch_start_offset_rows=epoch_start_offset_rows,
         )
         participant_epochs.insert(1, "split", split)
         participant_epochs = apply_epoch_inclusion_rules(

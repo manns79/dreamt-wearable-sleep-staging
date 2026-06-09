@@ -7,6 +7,7 @@ from src.data import EXPECTED_SIGNAL_COLUMNS, build_epoch_index
 from src.preprocessing import (
     apply_epoch_inclusion_rules,
     compute_epoch_missingness,
+    infer_epoch_start_offset_from_labels,
     segment_participant_chunks_into_epochs,
     segment_participant_into_epochs,
     validate_epoch_labels,
@@ -65,6 +66,51 @@ def test_segment_participant_chunks_matches_full_frame_segmentation():
     )
 
 
+def test_infer_epoch_start_offset_from_consistent_label_transitions():
+    labels = ["P"] * 3 + ["W"] * 8 + ["N2"] * 8 + ["REM"] * 8
+
+    offset = infer_epoch_start_offset_from_labels(
+        labels,
+        expected_n_rows=8,
+    )
+
+    assert offset == 3
+
+
+def test_segment_participant_into_epochs_uses_inferred_label_offset():
+    df = _participant_frame(["P"] * 3 + ["W"] * 8 + ["N2"] * 8 + ["REM"] * 8)
+
+    epochs = segment_participant_into_epochs(
+        df,
+        participant_id="S001",
+        sampling_rate_hz=4,
+        epoch_length_seconds=2,
+    )
+
+    assert list(epochs["start_row"]) == [3, 11, 19]
+    assert set(epochs["epoch_start_offset_rows"]) == {3}
+    assert list(epochs["raw_label"]) == ["W", "N2", "REM"]
+    assert epochs["is_valid_label"].all()
+
+
+def test_segment_participant_chunks_uses_supplied_label_offset():
+    df = _participant_frame(["P"] * 3 + ["W"] * 8 + ["N2"] * 8 + ["REM"] * 8)
+    chunks = [df.iloc[:5], df.iloc[5:14], df.iloc[14:]]
+
+    epochs = segment_participant_chunks_into_epochs(
+        chunks,
+        participant_id="S001",
+        sampling_rate_hz=4,
+        epoch_length_seconds=2,
+        epoch_start_offset_rows=3,
+    )
+
+    assert list(epochs["start_row"]) == [3, 11, 19]
+    assert set(epochs["epoch_start_offset_rows"]) == {3}
+    assert list(epochs["raw_label"]) == ["W", "N2", "REM"]
+    assert epochs["is_valid_label"].all()
+
+
 def test_validate_epoch_labels_flags_inconsistent_labels():
     df = _participant_frame(["W", "W", "N1", "N1"])
 
@@ -115,6 +161,23 @@ def test_apply_epoch_inclusion_rules_invalidates_severe_missingness():
     assert "severe_missingness:EDA" in included.loc[0, "exclusion_reason"]
 
 
+def test_apply_epoch_inclusion_rules_keeps_epochs_with_only_ibi_missingness():
+    df = _participant_frame(["REM"] * 8)
+    df["IBI"] = None
+    epochs = segment_participant_into_epochs(
+        df,
+        participant_id="S001",
+        sampling_rate_hz=4,
+        epoch_length_seconds=2,
+    )
+
+    included = apply_epoch_inclusion_rules(epochs, missingness_threshold=0.20)
+
+    assert included.loc[0, "missingness_IBI"] == 1.0
+    assert bool(included.loc[0, "is_valid_epoch"]) is True
+    assert included.loc[0, "exclusion_reason"] is None
+
+
 def test_apply_epoch_inclusion_rules_valid_epochs_have_target_labels():
     df = _participant_frame(["N2"] * 8)
     epochs = segment_participant_into_epochs(
@@ -163,6 +226,37 @@ def test_build_epoch_index_respects_split_assignments():
     assert list(epoch_index["split"]) == ["train"]
     assert epoch_index["split"].isna().sum() == 0
     assert bool(epoch_index.loc[0, "is_valid_epoch"]) is True
+
+
+def test_build_epoch_index_infers_label_offset_across_chunks():
+    output_dir = _test_output_dir("test-epoch-index-offset")
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    split_path = output_dir / "split_assignments.csv"
+    output_path = output_dir / "epoch_index.csv"
+
+    _participant_frame(["P"] * 3 + ["W"] * 8 + ["N2"] * 8 + ["REM"] * 8).to_csv(
+        raw_dir / "S001_whole_df.csv",
+        index=False,
+    )
+    pd.DataFrame({"participant_id": ["S001"], "split": ["train"]}).to_csv(
+        split_path,
+        index=False,
+    )
+
+    epoch_index = build_epoch_index(
+        raw_dir=raw_dir,
+        split_assignments_path=split_path,
+        output_path=output_path,
+        sampling_rate_hz=4,
+        epoch_length_seconds=2,
+        chunksize=5,
+    )
+
+    assert list(epoch_index["start_row"]) == [3, 11, 19]
+    assert set(epoch_index["epoch_start_offset_rows"]) == {3}
+    assert list(epoch_index["raw_label"]) == ["W", "N2", "REM"]
+    assert epoch_index["is_valid_epoch"].all()
 
 
 def test_build_epoch_index_requires_split_for_raw_participants():
