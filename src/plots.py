@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.data import EXPECTED_SIGNAL_COLUMNS, load_participant_csv
-from src.preprocessing import TARGET_SLEEP_STAGE_LABELS
+from src.preprocessing import DEFAULT_EPOCH_LENGTH_SECONDS, TARGET_SLEEP_STAGE_LABELS
 
 
 ACC_MAG_COLUMN = "ACC_MAG"
@@ -533,8 +533,9 @@ def plot_hypnogram(
     epochs: pd.DataFrame,
     participant_id: str,
     save_path: str | Path | None = None,
+    epoch_length_seconds: int = DEFAULT_EPOCH_LENGTH_SECONDS,
 ):
-    """Plot sleep stage over epoch order for one participant."""
+    """Plot sleep stage over elapsed hours for one participant."""
     import matplotlib.pyplot as plt
 
     stage_to_y = {"Wake": 2, "REM": 1, "Non-REM": 0}
@@ -544,16 +545,22 @@ def plot_hypnogram(
         .copy()
     )
     participant_epochs["stage_y"] = participant_epochs["mapped_label"].map(stage_to_y)
+    first_epoch_id = participant_epochs["epoch_id"].min()
+    elapsed_hours = (
+        (participant_epochs["epoch_id"] - first_epoch_id)
+        * epoch_length_seconds
+        / 3600
+    )
 
     fig, ax = plt.subplots(figsize=(10, 3))
     ax.step(
-        participant_epochs["epoch_id"],
+        elapsed_hours,
         participant_epochs["stage_y"],
         where="post",
         linewidth=1.5,
     )
     ax.set_yticks([0, 1, 2], ["Non-REM", "REM", "Wake"])
-    ax.set_xlabel("Epoch")
+    ax.set_xlabel("Hours since first valid epoch")
     ax.set_ylabel("Sleep stage")
     ax.set_title(f"Hypnogram-Like Stage Sequence: {participant_id}")
     save_figure(fig, save_path)
