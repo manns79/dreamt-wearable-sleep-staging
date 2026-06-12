@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "pandas",
-    "scikit-learn",
+    "scikit-learn>=1.8",
     "matplotlib",
     "seaborn",
     "jupyter",
