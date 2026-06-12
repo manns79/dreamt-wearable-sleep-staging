@@ -17,11 +17,16 @@ data/
     label_mapping_summary_p_as_wake.csv
     split_assignments.csv
     epoch_index.csv
+  processed/
+    features_train.csv
+    features_val.csv
+    features_test.csv
 ```
 
 Use `data/raw/` for local copies of real DREAMT participant CSV files. Use
-`data/interim/` for generated intermediate inventory summaries. These locations
-are ignored by Git so raw data and derived local data products remain local.
+`data/interim/` for generated intermediate inventory summaries and
+`data/processed/` for modeling-ready derived tables. These locations are
+ignored by Git so raw data and derived local data products remain local.
 
 ## Participant Summary
 
@@ -221,3 +226,23 @@ Key figures are written under `results/figures/`, including training class
 balance, participant-level class distributions, missingness by signal,
 signal-summary-by-stage plots, representative raw epochs, transition matrices,
 and optional hypnogram-like plots.
+
+## Engineered Feature Tables
+
+`notebooks/03_feature_baselines.ipynb` implements Stage 6 feature-table
+construction for traditional ML baselines. It uses valid epochs from
+`data/interim/epoch_index.csv`, respects the participant split in
+`data/interim/split_assignments.csv`, and slices local raw CSVs under
+`data/raw/`.
+
+The generated files are:
+
+- `data/processed/features_train.csv`
+- `data/processed/features_val.csv`
+- `data/processed/features_test.csv`
+
+Each row represents one valid epoch and includes `participant_id`, `epoch_id`,
+`split`, `label`, and simple summary features for the wearable signals plus
+derived `ACC_MAG`. The test feature table is saved for later final evaluation
+only; Stage 6 validation metrics, tuning, and permutation importance should not
+use the test split.

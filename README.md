@@ -105,19 +105,50 @@ Raw signal summaries and representative raw epoch plots require local
 participant CSVs under `data/raw/`; the notebook skips those cells cleanly when
 raw data are unavailable.
 
+## Engineered Feature Baselines
+
+Stage 6 is implemented in `notebooks/03_feature_baselines.ipynb`, with reusable
+feature extraction in `src/features.py` and shared metric helpers in
+`src/evaluate.py`. The notebook builds compact epoch-level feature tables for
+traditional ML baselines using simple signal summaries for `BVP`, `ACC_X`,
+`ACC_Y`, `ACC_Z`, `TEMP`, `EDA`, `HR`, `IBI`, and derived `ACC_MAG`.
+
+Feature rows retain `participant_id`, `epoch_id`, `split`, and `label` so split
+integrity and group-level evaluation remain auditable. When local DREAMT files
+are available, the notebook writes:
+
+- `data/processed/features_train.csv`
+- `data/processed/features_val.csv`
+- `data/processed/features_test.csv`
+
+The test feature table is saved for later final evaluation only. Stage 6 model
+selection uses participant-level cross-validation within the training split.
+The validation split is used for interim evaluation and XGBoost permutation
+importance; the test split is not used for tuning, feature selection,
+permutation importance, or interim conclusions.
+
+Current baseline models in the notebook are:
+
+- majority-class classifier as a sanity check
+- balanced elastic-net multinomial logistic regression in a scikit-learn
+  imputation/scaling/model pipeline
+- XGBoost trained on all engineered features with modest training-CV tuning
+
 ## Methods
 
-Planned methods include:
+Implemented and planned methods include:
 
 - Dataset inspection and integrity checks
 - Training-set-only exploratory data analysis
 - Signal preprocessing and label mapping
-- Traditional machine learning baselines using engineered features
+- Traditional machine learning baselines using engineered epoch-level features
 - PyTorch deep learning models, likely starting with a 1D CNN
 - Possible sequence models such as CNN-GRU architectures
 - Evaluation using accuracy, balanced accuracy, macro F1, class-specific F1 scores, and confusion matrices
 
-These methods are placeholders for the planned workflow. The final implementation will be filled in iteratively as the project matures.
+The traditional baseline workflow is now implemented as an interim validation
+stage. Deep learning models and final held-out test comparisons remain future
+work.
 
 ## Repository Structure
 
@@ -163,8 +194,11 @@ This project is not fully implemented yet. The expected workflow will be:
 3. Create or load the participant split at `data/interim/split_assignments.csv`.
 4. Generate the Stage 4 epoch index at `data/interim/epoch_index.csv`.
 5. Run `notebooks/02_train_set_eda.ipynb` for training-set-only EDA.
-6. Move reusable logic from notebooks into `src/`.
-7. Save generated metrics and figures under `results/`.
+6. Run `notebooks/03_feature_baselines.ipynb` to build engineered feature CSVs
+   and evaluate traditional baselines on the validation split.
+7. Continue moving reusable logic from notebooks into `src/` as new modeling
+   stages mature.
+8. Save generated metrics and figures under `results/`.
 
 The dataset overview notebook writes these local intermediate summaries when raw
 participant files are available:
@@ -174,6 +208,13 @@ participant files are available:
 - `data/interim/label_mapping_summary_p_as_wake.csv`
 - `data/interim/split_assignments.csv`
 - `data/interim/epoch_index.csv`
+
+The feature-baseline notebook writes these local processed feature tables when
+the raw files and epoch index are available:
+
+- `data/processed/features_train.csv`
+- `data/processed/features_val.csv`
+- `data/processed/features_test.csv`
 
 Generate the epoch index locally after placing DREAMT participant files under
 `data/raw/` and creating `data/interim/split_assignments.csv`:
@@ -194,13 +235,22 @@ As implementation develops, this section will include concrete commands for prep
 
 ## Results
 
-Results are not available yet. Placeholder files are included under `results/` to show the intended outputs:
+Final held-out test results are not available yet. Placeholder files are
+included under `results/` to show intended outputs, and Stage 6 can additionally
+write interim validation diagnostics:
 
 - `results/metrics.csv`
 - `results/ablation_results.csv`
 - `results/confusion_matrix.png`
 - `results/figures/`
+- `results/stage6_validation_metrics.csv`
+- `results/stage6_xgboost_validation_permutation_importance.csv`
 
 ## Limitations
 
-This scaffold does not include raw data, trained models, or experimental results. Future work must carefully address participant-level splitting, class imbalance, missing data, wearable signal quality, and privacy requirements.
+This scaffold does not include raw data, trained models, or final experimental
+results. Stage 6 reports validation diagnostics only; final comparisons should
+wait until the modeling pipeline is mature and each selected model class is
+evaluated once on the held-out test split. Future work must carefully address
+participant-level splitting, class imbalance, missing data, wearable signal
+quality, and privacy requirements.
