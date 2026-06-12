@@ -21,6 +21,7 @@ data/
     features_train.csv
     features_val.csv
     features_test.csv
+    preprocessing_metadata.json
 ```
 
 Use `data/raw/` for local copies of real DREAMT participant CSV files. Use
@@ -246,3 +247,30 @@ Each row represents one valid epoch and includes `participant_id`, `epoch_id`,
 derived `ACC_MAG`. The test feature table is saved for later final evaluation
 only; Stage 6 validation metrics, tuning, and permutation importance should not
 use the test split.
+
+## Deep Learning Tensor Preparation
+
+Stage 7 reusable PyTorch dataset utilities live in `src/data.py`. They use
+valid rows from `data/interim/epoch_index.csv` and slice local raw participant
+CSVs on demand rather than materializing every epoch, temporal-context window,
+or sequence window up front.
+
+Available dataset classes:
+
+- `DreamtEpochDataset` returns single epochs shaped `(channels, timepoints)`.
+- `DreamtContextDataset` returns neighboring epochs concatenated along time,
+  for example `(channels, 5 * 1920)` for previous 2, current, next 2.
+- `DreamtSequenceDataset` returns CNN-GRU inputs shaped
+  `(sequence_length, channels, timepoints)` and supports both many-to-one and
+  many-to-many labels.
+
+Normalization statistics are fit from training participants only with
+`fit_normalization_stats` and saved to:
+
+- `data/processed/preprocessing_metadata.json`
+
+The first version uses median imputation for missing values and per-channel
+standardization. Validation and test datasets should load and apply the saved
+training metadata, never fit their own normalization parameters. Test loaders
+may be created for shape and leakage checks, but final test metrics should be
+deferred until selected model variants are ready for final evaluation.

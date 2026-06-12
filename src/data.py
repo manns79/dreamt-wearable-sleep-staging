@@ -11,12 +11,12 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 import numpy as np
 import pandas as pd
-
 
 # Participant-level splitting should be used to reduce leakage risk. Epochs from
 # the same participant should not be split across training, validation, and test
@@ -27,6 +27,10 @@ DEFAULT_PARTICIPANT_PATTERN = "S*_whole_df.csv"
 DEFAULT_PARTICIPANT_SUMMARY_PATH = DEFAULT_INTERIM_DATA_DIR / "participant_summary.csv"
 DEFAULT_SPLIT_ASSIGNMENTS_PATH = DEFAULT_INTERIM_DATA_DIR / "split_assignments.csv"
 DEFAULT_EPOCH_INDEX_PATH = DEFAULT_INTERIM_DATA_DIR / "epoch_index.csv"
+DEFAULT_PROCESSED_DATA_DIR = Path("data/processed")
+DEFAULT_PREPROCESSING_METADATA_PATH = (
+    DEFAULT_PROCESSED_DATA_DIR / "preprocessing_metadata.json"
+)
 DEFAULT_INVENTORY_CHUNKSIZE = 500_000
 DEFAULT_EPOCH_INDEX_CHUNKSIZE = 500_000
 
@@ -83,6 +87,8 @@ PARTICIPANT_SUMMARY_COLUMNS = [
 SPLIT_ASSIGNMENT_COLUMNS = ["participant_id", "split"]
 SPLIT_LABEL_ORDER = ["train", "validation", "test"]
 TARGET_LABELS = ["Wake", "Non-REM", "REM"]
+LABEL_TO_ID = {label: index for index, label in enumerate(TARGET_LABELS)}
+ID_TO_LABEL = {index: label for label, index in LABEL_TO_ID.items()}
 TARGET_LABEL_COLUMN_MAP = {
     "Wake": "Wake",
     "Non-REM": "Non_REM",
@@ -369,6 +375,521 @@ def load_participant_csv(
         return pd.read_csv(csv_path, **read_kwargs)
     except Exception as exc:
         raise ValueError(f"Could not read participant CSV {csv_path}: {exc}") from exc
+
+
+def _participant_file_lookup(raw_dir: str | Path) -> dict[str, Path]:
+    """Map participant IDs to raw CSV paths using the shared inventory rules."""
+    return {
+        extract_participant_id(path): path for path in list_participant_csvs(raw_dir)
+    }
+
+
+def _load_valid_epoch_index(
+    epoch_index: str | Path | pd.DataFrame = DEFAULT_EPOCH_INDEX_PATH,
+) -> pd.DataFrame:
+    """Load valid three-class epochs from a path or DataFrame."""
+    if isinstance(epoch_index, pd.DataFrame):
+        epoch_df = epoch_index.copy()
+    else:
+        epoch_path = Path(epoch_index)
+        if not epoch_path.exists():
+            raise FileNotFoundError(f"Epoch index CSV does not exist: {epoch_path}")
+        epoch_df = pd.read_csv(epoch_path, dtype={"participant_id": str})
+
+    required_columns = {
+        "participant_id",
+        "epoch_id",
+        "start_row",
+        "end_row",
+        "split",
+        "mapped_label",
+        "is_valid_epoch",
+    }
+    missing_columns = sorted(required_columns - set(epoch_df.columns))
+    if missing_columns:
+        raise ValueError(f"epoch_index is missing column(s): {missing_columns}")
+
+    valid_epochs = epoch_df[epoch_df["is_valid_epoch"].astype(bool)].copy()
+    valid_epochs = valid_epochs[valid_epochs["mapped_label"].isin(TARGET_LABELS)]
+    valid_epochs["participant_id"] = (
+        valid_epochs["participant_id"].astype(str).str.strip()
+    )
+    valid_epochs["epoch_id"] = pd.to_numeric(
+        valid_epochs["epoch_id"], errors="raise"
+    ).astype(int)
+    valid_epochs["start_row"] = pd.to_numeric(
+        valid_epochs["start_row"], errors="raise"
+    ).astype(int)
+    valid_epochs["end_row"] = pd.to_numeric(
+        valid_epochs["end_row"], errors="raise"
+    ).astype(int)
+    return valid_epochs.reset_index(drop=True)
+
+
+def _filter_epoch_index_for_split(
+    epoch_index: pd.DataFrame,
+    split: str | None = None,
+    participant_ids: Iterable[str] | None = None,
+    max_participants: int | None = None,
+) -> pd.DataFrame:
+    """Filter epochs by split and optional participant debug subset."""
+    output = epoch_index.copy()
+    if split is not None:
+        output = output[output["split"] == split].copy()
+
+    if participant_ids is not None:
+        participant_set = {
+            str(participant_id).strip() for participant_id in participant_ids
+        }
+        output = output[output["participant_id"].isin(participant_set)].copy()
+
+    if max_participants is not None:
+        if max_participants <= 0:
+            raise ValueError("max_participants must be positive when provided.")
+        selected_ids = sorted(output["participant_id"].unique())[:max_participants]
+        output = output[output["participant_id"].isin(selected_ids)].copy()
+
+    return output.sort_values(["participant_id", "epoch_id"]).reset_index(drop=True)
+
+
+def check_epoch_split_leakage(epoch_index: pd.DataFrame) -> bool:
+    """Confirm that no participant appears in more than one split."""
+    required_columns = {"participant_id", "split"}
+    missing_columns = sorted(required_columns - set(epoch_index.columns))
+    if missing_columns:
+        raise ValueError(f"epoch_index is missing column(s): {missing_columns}")
+
+    participant_splits = (
+        epoch_index[["participant_id", "split"]]
+        .dropna()
+        .assign(
+            participant_id=lambda df: df["participant_id"].astype(str).str.strip(),
+            split=lambda df: df["split"].astype(str).str.strip(),
+        )
+        .drop_duplicates()
+    )
+    split_counts = participant_splits.groupby("participant_id")["split"].nunique()
+    overlapping_ids = sorted(split_counts[split_counts > 1].index.tolist())
+    if overlapping_ids:
+        raise ValueError(f"Participant(s) appear in multiple splits: {overlapping_ids}")
+    return True
+
+
+def _raw_columns_for_channels(channels: Iterable[str]) -> list[str]:
+    """Return raw CSV columns needed to build requested model channels."""
+    required: list[str] = []
+    for channel in channels:
+        if channel == "ACC_MAG":
+            for axis in ["ACC_X", "ACC_Y", "ACC_Z"]:
+                if axis not in required:
+                    required.append(axis)
+        elif channel not in required:
+            required.append(channel)
+    return required
+
+
+def _add_derived_channels(df: pd.DataFrame, channels: Iterable[str]) -> pd.DataFrame:
+    """Add simple derived signal channels needed by deep learning datasets."""
+    output = df.copy()
+    if "ACC_MAG" in channels and "ACC_MAG" not in output.columns:
+        missing_axes = [
+            column for column in ["ACC_X", "ACC_Y", "ACC_Z"] if column not in output
+        ]
+        if missing_axes:
+            raise ValueError(
+                "Cannot compute ACC_MAG; missing raw column(s): "
+                f"{missing_axes}"
+            )
+        axes = output[["ACC_X", "ACC_Y", "ACC_Z"]].apply(pd.to_numeric, errors="coerce")
+        output["ACC_MAG"] = np.sqrt((axes**2).sum(axis=1, min_count=3))
+    return output
+
+
+class _ParticipantSignalCache:
+    """Lazy participant-level raw signal cache for epoch/window slicing."""
+
+    def __init__(self, raw_dir: str | Path, channels: Iterable[str]):
+        self.raw_dir = Path(raw_dir)
+        self.channels = list(channels)
+        self.raw_columns = _raw_columns_for_channels(self.channels)
+        self.file_lookup = _participant_file_lookup(self.raw_dir)
+        self._cache: dict[str, pd.DataFrame] = {}
+
+    def require_participants(self, participant_ids: Iterable[str]) -> None:
+        missing_ids = sorted(set(participant_ids) - set(self.file_lookup))
+        if missing_ids:
+            raise FileNotFoundError(
+                "Raw CSV file(s) were not found for participant(s): "
+                f"{missing_ids}"
+            )
+
+    def get(self, participant_id: str) -> pd.DataFrame:
+        if participant_id not in self._cache:
+            raw_df = load_participant_csv(
+                self.file_lookup[participant_id],
+                usecols=self.raw_columns,
+            )
+            raw_df = _add_derived_channels(raw_df, self.channels)
+            self._cache[participant_id] = raw_df[self.channels].copy()
+        return self._cache[participant_id]
+
+
+def _epoch_row_to_array(
+    epoch_row: pd.Series,
+    signal_cache: _ParticipantSignalCache,
+    channels: list[str],
+) -> np.ndarray:
+    participant_id = str(epoch_row["participant_id"])
+    start_row = int(epoch_row["start_row"])
+    end_row = int(epoch_row["end_row"])
+    raw_df = signal_cache.get(participant_id)
+    epoch_df = raw_df.iloc[start_row:end_row]
+    if epoch_df.empty:
+        raise ValueError(
+            f"Epoch slice is empty for participant {participant_id}, "
+            f"epoch {epoch_row['epoch_id']}."
+        )
+    return (
+        epoch_df[channels]
+        .apply(pd.to_numeric, errors="coerce")
+        .to_numpy(dtype=np.float64)
+        .T
+    )
+
+
+def _label_to_id(label: object) -> int:
+    label_text = str(label)
+    if label_text not in LABEL_TO_ID:
+        raise ValueError(f"Unexpected target label: {label_text}")
+    return LABEL_TO_ID[label_text]
+
+
+class DreamtEpochDataset:
+    """PyTorch dataset for single DREAMT sleep epochs.
+
+    Items are returned as ``(x, y)`` where ``x`` has shape
+    ``(channels, timepoints)`` and dtype ``torch.float64``. Labels are integer
+    class IDs using ``LABEL_TO_ID``.
+    """
+
+    def __init__(
+        self,
+        raw_dir: str | Path = DEFAULT_RAW_DATA_DIR,
+        epoch_index: str | Path | pd.DataFrame = DEFAULT_EPOCH_INDEX_PATH,
+        split: str | None = None,
+        channels: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+        preprocessing_stats: dict[str, object] | None = None,
+        participant_ids: Iterable[str] | None = None,
+        max_participants: int | None = None,
+    ):
+        self.channels = list(channels)
+        self.preprocessing_stats = preprocessing_stats
+        valid_epochs = _load_valid_epoch_index(epoch_index)
+        check_epoch_split_leakage(valid_epochs)
+        self.epoch_index = _filter_epoch_index_for_split(
+            valid_epochs,
+            split=split,
+            participant_ids=participant_ids,
+            max_participants=max_participants,
+        )
+        self.signal_cache = _ParticipantSignalCache(raw_dir, self.channels)
+        self.signal_cache.require_participants(self.epoch_index["participant_id"])
+
+    def __len__(self) -> int:
+        return len(self.epoch_index)
+
+    @property
+    def participants(self) -> set[str]:
+        return set(self.epoch_index["participant_id"].astype(str))
+
+    def get_epoch_array(self, position: int) -> np.ndarray:
+        row = self.epoch_index.iloc[position]
+        x = _epoch_row_to_array(row, self.signal_cache, self.channels)
+        if self.preprocessing_stats is not None:
+            from src.preprocessing import apply_normalization
+
+            x = apply_normalization(x, self.preprocessing_stats)
+        return x.astype(np.float64, copy=False)
+
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
+        import torch
+
+        row = self.epoch_index.iloc[index]
+        x = self.get_epoch_array(index)
+        y = _label_to_id(row["mapped_label"])
+        return (
+            torch.as_tensor(x, dtype=torch.float64),
+            torch.tensor(y, dtype=torch.long),
+        )
+
+
+class DreamtContextDataset(DreamtEpochDataset):
+    """PyTorch dataset for CNN temporal-context windows.
+
+    Context is concatenated along the time axis. For ``context_radius=2``,
+    each item has shape ``(channels, 5 * timepoints)``. Edge epochs are dropped
+    and windows never cross participant boundaries.
+    """
+
+    def __init__(
+        self,
+        raw_dir: str | Path = DEFAULT_RAW_DATA_DIR,
+        epoch_index: str | Path | pd.DataFrame = DEFAULT_EPOCH_INDEX_PATH,
+        split: str | None = None,
+        channels: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+        preprocessing_stats: dict[str, object] | None = None,
+        context_radius: int = 2,
+        participant_ids: Iterable[str] | None = None,
+        max_participants: int | None = None,
+    ):
+        if context_radius < 0:
+            raise ValueError("context_radius must be non-negative.")
+        self.context_radius = int(context_radius)
+        super().__init__(
+            raw_dir=raw_dir,
+            epoch_index=epoch_index,
+            split=split,
+            channels=channels,
+            preprocessing_stats=preprocessing_stats,
+            participant_ids=participant_ids,
+            max_participants=max_participants,
+        )
+        self.window_positions = self._build_window_positions()
+
+    def _build_window_positions(self) -> list[list[int]]:
+        if self.context_radius == 0:
+            return [[index] for index in range(len(self.epoch_index))]
+
+        windows: list[list[int]] = []
+        for _, group in self.epoch_index.groupby("participant_id", sort=False):
+            positions = list(group.index)
+            epoch_ids = group["epoch_id"].to_numpy(dtype=int)
+            stop = len(group) - self.context_radius
+            for local_index in range(self.context_radius, stop):
+                local_window = range(
+                    local_index - self.context_radius,
+                    local_index + self.context_radius + 1,
+                )
+                window_epoch_ids = epoch_ids[list(local_window)]
+                expected_ids = np.arange(
+                    epoch_ids[local_index] - self.context_radius,
+                    epoch_ids[local_index] + self.context_radius + 1,
+                )
+                if np.array_equal(window_epoch_ids, expected_ids):
+                    windows.append([positions[i] for i in local_window])
+        return windows
+
+    def __len__(self) -> int:
+        return len(self.window_positions)
+
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
+        import torch
+
+        positions = self.window_positions[index]
+        arrays = [self.get_epoch_array(position) for position in positions]
+        x = np.concatenate(arrays, axis=1).astype(np.float64, copy=False)
+        center_position = positions[self.context_radius]
+        y = _label_to_id(self.epoch_index.iloc[center_position]["mapped_label"])
+        return (
+            torch.as_tensor(x, dtype=torch.float64),
+            torch.tensor(y, dtype=torch.long),
+        )
+
+
+class DreamtSequenceDataset(DreamtEpochDataset):
+    """PyTorch dataset for CNN-GRU epoch sequences.
+
+    Items have shape ``(sequence_length, channels, timepoints)``. With
+    ``label_mode="many_to_one"``, the target is the final epoch label by
+    default. With ``label_mode="many_to_many"``, the target is a vector of
+    labels for every epoch in the sequence.
+    """
+
+    def __init__(
+        self,
+        raw_dir: str | Path = DEFAULT_RAW_DATA_DIR,
+        epoch_index: str | Path | pd.DataFrame = DEFAULT_EPOCH_INDEX_PATH,
+        split: str | None = None,
+        channels: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+        preprocessing_stats: dict[str, object] | None = None,
+        sequence_length: int = 5,
+        stride: int = 1,
+        label_mode: str = "many_to_one",
+        target_position: str = "last",
+        participant_ids: Iterable[str] | None = None,
+        max_participants: int | None = None,
+    ):
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive.")
+        if stride <= 0:
+            raise ValueError("stride must be positive.")
+        if label_mode not in {"many_to_one", "many_to_many"}:
+            raise ValueError("label_mode must be 'many_to_one' or 'many_to_many'.")
+        if target_position not in {"first", "center", "last"}:
+            raise ValueError("target_position must be 'first', 'center', or 'last'.")
+
+        self.sequence_length = int(sequence_length)
+        self.stride = int(stride)
+        self.label_mode = label_mode
+        self.target_position = target_position
+        super().__init__(
+            raw_dir=raw_dir,
+            epoch_index=epoch_index,
+            split=split,
+            channels=channels,
+            preprocessing_stats=preprocessing_stats,
+            participant_ids=participant_ids,
+            max_participants=max_participants,
+        )
+        self.sequence_positions = self._build_sequence_positions()
+
+    def _build_sequence_positions(self) -> list[list[int]]:
+        sequences: list[list[int]] = []
+        for _, group in self.epoch_index.groupby("participant_id", sort=False):
+            positions = list(group.index)
+            epoch_ids = group["epoch_id"].to_numpy(dtype=int)
+            for start in range(0, len(group) - self.sequence_length + 1, self.stride):
+                stop = start + self.sequence_length
+                window_epoch_ids = epoch_ids[start:stop]
+                expected_ids = np.arange(
+                    window_epoch_ids[0],
+                    window_epoch_ids[0] + self.sequence_length,
+                )
+                if np.array_equal(window_epoch_ids, expected_ids):
+                    sequences.append(positions[start:stop])
+        return sequences
+
+    def __len__(self) -> int:
+        return len(self.sequence_positions)
+
+    def _target_index(self) -> int:
+        if self.target_position == "first":
+            return 0
+        if self.target_position == "center":
+            return self.sequence_length // 2
+        return self.sequence_length - 1
+
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
+        import torch
+
+        positions = self.sequence_positions[index]
+        arrays = [self.get_epoch_array(position) for position in positions]
+        x = np.stack(arrays, axis=0).astype(np.float64, copy=False)
+        labels = [
+            _label_to_id(self.epoch_index.iloc[position]["mapped_label"])
+            for position in positions
+        ]
+        if self.label_mode == "many_to_many":
+            y: Any = torch.as_tensor(labels, dtype=torch.long)
+        else:
+            y = torch.tensor(labels[self._target_index()], dtype=torch.long)
+        return torch.as_tensor(x, dtype=torch.float64), y
+
+
+def fit_normalization_stats(
+    train_dataset_or_files: DreamtEpochDataset | Iterable[str | Path],
+    channels: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+    raw_dir: str | Path = DEFAULT_RAW_DATA_DIR,
+    epoch_index: str | Path | pd.DataFrame = DEFAULT_EPOCH_INDEX_PATH,
+    split: str = "train",
+    max_participants: int | None = None,
+) -> dict[str, object]:
+    """Fit train-only imputation and standardization metadata for CNN tensors."""
+    from src.preprocessing import fit_channel_preprocessing_stats
+
+    channels = list(channels)
+    values_by_channel: dict[str, list[float]] = {channel: [] for channel in channels}
+
+    if isinstance(train_dataset_or_files, DreamtEpochDataset):
+        dataset = train_dataset_or_files
+    else:
+        participant_ids = [
+            extract_participant_id(path) for path in train_dataset_or_files
+        ]
+        dataset = DreamtEpochDataset(
+            raw_dir=raw_dir,
+            epoch_index=epoch_index,
+            split=split,
+            channels=channels,
+            participant_ids=participant_ids,
+            max_participants=max_participants,
+        )
+
+    if len(dataset) == 0:
+        raise ValueError("Cannot fit normalization stats on an empty training dataset.")
+
+    for position in range(len(dataset)):
+        x = dataset.get_epoch_array(position)
+        for channel_index, channel in enumerate(dataset.channels):
+            if channel in values_by_channel:
+                values_by_channel[channel].extend(x[channel_index].tolist())
+
+    stats = fit_channel_preprocessing_stats(values_by_channel)
+    stats["source_participants"] = sorted(dataset.participants)
+    stats["n_epochs_fit"] = int(len(dataset))
+    return stats
+
+
+def apply_normalization(x: Any, stats: dict[str, object]) -> Any:
+    """Compatibility wrapper for preprocessing.apply_normalization."""
+    from src.preprocessing import apply_normalization as _apply_normalization
+
+    return _apply_normalization(x, stats)
+
+
+def save_preprocessing_metadata(
+    stats: dict[str, object],
+    path: str | Path = DEFAULT_PREPROCESSING_METADATA_PATH,
+) -> None:
+    """Compatibility wrapper for preprocessing.save_preprocessing_metadata."""
+    from src.preprocessing import save_preprocessing_metadata as _save
+
+    _save(stats, path)
+
+
+def load_preprocessing_metadata(
+    path: str | Path = DEFAULT_PREPROCESSING_METADATA_PATH,
+) -> dict[str, object]:
+    """Compatibility wrapper for preprocessing.load_preprocessing_metadata."""
+    from src.preprocessing import load_preprocessing_metadata as _load
+
+    return _load(path)
+
+
+def create_dataloaders(
+    train_dataset: Any,
+    val_dataset: Any,
+    test_dataset: Any,
+    batch_size: int,
+    shuffle_train: bool = True,
+    num_workers: int = 0,
+) -> dict[str, Any]:
+    """Create PyTorch DataLoaders for train/validation/test datasets."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+
+    from torch.utils.data import DataLoader
+
+    return {
+        "train": DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle_train,
+            num_workers=num_workers,
+        ),
+        "validation": DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+        ),
+        "test": DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+        ),
+    }
 
 
 def build_epoch_index(
@@ -821,8 +1342,7 @@ def _iter_inventory_chunks(
         if chunksize is None:
             yield pd.read_csv(csv_path, **read_kwargs)
         else:
-            for chunk in pd.read_csv(csv_path, chunksize=chunksize, **read_kwargs):
-                yield chunk
+            yield from pd.read_csv(csv_path, chunksize=chunksize, **read_kwargs)
     except Exception as exc:
         raise ValueError(f"Could not read participant CSV {csv_path}: {exc}") from exc
 

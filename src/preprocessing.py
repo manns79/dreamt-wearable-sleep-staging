@@ -6,6 +6,7 @@ standardizing DREAMT/PSG sleep-stage labels before modeling.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from collections.abc import Iterable
@@ -13,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-
 from src.data import (
     EXPECTED_SIGNAL_COLUMNS,
     LABEL_COLUMN,
@@ -21,7 +21,6 @@ from src.data import (
     extract_participant_id,
     identify_label_columns,
 )
-
 
 # Preprocessing decisions should be fit on training data only when they learn
 # statistics, thresholds, or mappings that could otherwise leak validation/test
@@ -45,6 +44,8 @@ P_AS_WAKE_LABEL_MAPPING_NOTE = (
     "convention; it should not be used for the main analysis."
 )
 DEFAULT_LABEL_MAPPING_CHUNKSIZE = 500_000
+DEFAULT_IMPUTATION_STRATEGY = "median"
+DEFAULT_NORMALIZATION_EPSILON = 1e-8
 LABEL_MAPPING_SUMMARY_COLUMNS = [
     "raw_label",
     "standardized_label",
@@ -1141,3 +1142,139 @@ def summarize_label_mapping(
         summary_df.to_csv(output_csv, index=False)
 
     return summary_df
+
+
+def fit_channel_preprocessing_stats(
+    values_by_channel: dict[str, Iterable[object]],
+    imputation_strategy: str = DEFAULT_IMPUTATION_STRATEGY,
+    epsilon: float = DEFAULT_NORMALIZATION_EPSILON,
+) -> dict[str, object]:
+    """Fit per-channel imputation and standardization stats from training data.
+
+    Parameters
+    ----------
+    values_by_channel:
+        Mapping from channel name to training-only values. Missing and
+        non-numeric values are ignored while fitting statistics.
+    imputation_strategy:
+        Currently only ``"median"`` is supported.
+    epsilon:
+        Minimum standard deviation used to avoid division by zero.
+    """
+    if imputation_strategy != "median":
+        raise ValueError("Only median imputation is currently supported.")
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive.")
+
+    channels = list(values_by_channel)
+    if not channels:
+        raise ValueError("At least one channel is required to fit preprocessing stats.")
+
+    means: dict[str, float] = {}
+    stds: dict[str, float] = {}
+    medians: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    missing_counts: dict[str, int] = {}
+
+    for channel, values in values_by_channel.items():
+        series = pd.to_numeric(pd.Series(list(values)), errors="coerce")
+        valid = series.dropna()
+        if valid.empty:
+            raise ValueError(
+                f"Cannot fit preprocessing stats for {channel}; all values are missing."
+            )
+
+        std = float(valid.std(ddof=0))
+        if not pd.notna(std) or std < epsilon:
+            std = float(epsilon)
+
+        means[channel] = float(valid.mean())
+        stds[channel] = std
+        medians[channel] = float(valid.median())
+        counts[channel] = int(valid.shape[0])
+        missing_counts[channel] = int(series.isna().sum())
+
+    return {
+        "channels": channels,
+        "normalization": "standardization",
+        "imputation_strategy": imputation_strategy,
+        "epsilon": float(epsilon),
+        "mean": means,
+        "std": stds,
+        "median": medians,
+        "valid_count": counts,
+        "missing_count": missing_counts,
+        "fit_scope": "train",
+    }
+
+
+def impute_missing_values(x: Any, stats: dict[str, object]) -> Any:
+    """Fill missing channel values using fitted preprocessing metadata."""
+    import numpy as np
+
+    channels = list(stats.get("channels", []))
+    medians = stats.get("median", {})
+    if not channels or not isinstance(medians, dict):
+        raise ValueError("stats must contain channels and median mappings.")
+
+    arr = np.asarray(x, dtype=np.float64).copy()
+    if arr.ndim < 2:
+        raise ValueError("x must have channel as the second-to-last or first axis.")
+
+    channel_axis = 0 if arr.ndim == 2 else arr.ndim - 2
+    if arr.shape[channel_axis] != len(channels):
+        raise ValueError(
+            "Input channel dimension does not match preprocessing metadata: "
+            f"{arr.shape[channel_axis]} != {len(channels)}."
+        )
+
+    moved = np.moveaxis(arr, channel_axis, 0)
+    for channel_index, channel in enumerate(channels):
+        fill_value = float(medians[channel])
+        channel_values = moved[channel_index]
+        moved[channel_index] = np.where(
+            np.isnan(channel_values),
+            fill_value,
+            channel_values,
+        )
+    return np.moveaxis(moved, 0, channel_axis)
+
+
+def apply_normalization(x: Any, stats: dict[str, object]) -> Any:
+    """Impute and standardize channel-first or sequence channel-first arrays."""
+    import numpy as np
+
+    channels = list(stats.get("channels", []))
+    means = stats.get("mean", {})
+    stds = stats.get("std", {})
+    if not channels or not isinstance(means, dict) or not isinstance(stds, dict):
+        raise ValueError("stats must contain channels, mean, and std mappings.")
+
+    arr = impute_missing_values(x, stats)
+    channel_axis = 0 if arr.ndim == 2 else arr.ndim - 2
+    normalized = np.moveaxis(arr, channel_axis, 0)
+    for channel_index, channel in enumerate(channels):
+        normalized[channel_index] = (
+            normalized[channel_index] - float(means[channel])
+        ) / float(stds[channel])
+    return np.moveaxis(normalized, 0, channel_axis).astype(np.float64, copy=False)
+
+
+def save_preprocessing_metadata(stats: dict[str, object], path: str | Path) -> None:
+    """Save fitted preprocessing metadata as JSON."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as file:
+        json.dump(stats, file, indent=2, sort_keys=True)
+        file.write("\n")
+
+
+def load_preprocessing_metadata(path: str | Path) -> dict[str, object]:
+    """Load fitted preprocessing metadata from JSON."""
+    metadata_path = Path(path)
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Preprocessing metadata JSON does not exist: {metadata_path}"
+        )
+    with metadata_path.open("r", encoding="utf-8") as file:
+        return json.load(file)

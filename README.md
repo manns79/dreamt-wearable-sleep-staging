@@ -134,6 +134,25 @@ Current baseline models in the notebook are:
   imputation/scaling/model pipeline
 - XGBoost trained on all engineered features with modest training-CV tuning
 
+## Deep Learning Tensor Preparation
+
+Stage 7 adds PyTorch-ready dataset utilities in `src/data.py` and an initial
+smoke workflow in `notebooks/04_cnn_training.ipynb`. The basic
+`DreamtEpochDataset` returns tensors shaped `(channels, timepoints)` for 1D CNN
+training. `DreamtContextDataset` creates neighboring-epoch context windows
+without crossing participant boundaries, and `DreamtSequenceDataset` creates
+CNN-GRU-style inputs shaped `(sequence_length, channels, timepoints)` with both
+many-to-one and many-to-many label support.
+
+Preprocessing metadata is fit from training participants only using median
+imputation and per-channel standardization, then saved locally at:
+
+- `data/processed/preprocessing_metadata.json`
+
+Validation and test datasets apply the saved training metadata. Test loaders may
+be built for shape and leakage checks, but final test metrics remain deferred
+until model variants have been selected.
+
 ## Methods
 
 Implemented and planned methods include:
@@ -142,8 +161,9 @@ Implemented and planned methods include:
 - Training-set-only exploratory data analysis
 - Signal preprocessing and label mapping
 - Traditional machine learning baselines using engineered epoch-level features
+- PyTorch tensor datasets for single-epoch CNNs, temporal-context CNNs, and
+  CNN-GRU sequence models
 - PyTorch deep learning models, likely starting with a 1D CNN
-- Possible sequence models such as CNN-GRU architectures
 - Evaluation using accuracy, balanced accuracy, macro F1, class-specific F1 scores, and confusion matrices
 
 The traditional baseline workflow is now implemented as an interim validation
@@ -196,9 +216,12 @@ This project is not fully implemented yet. The expected workflow will be:
 5. Run `notebooks/02_train_set_eda.ipynb` for training-set-only EDA.
 6. Run `notebooks/03_feature_baselines.ipynb` to build engineered feature CSVs
    and evaluate traditional baselines on the validation split.
-7. Continue moving reusable logic from notebooks into `src/` as new modeling
+7. Run `notebooks/04_cnn_training.ipynb` to build PyTorch datasets, save
+   train-only preprocessing metadata, check tensor shapes, and run a tiny CNN
+   overfit smoke test.
+8. Continue moving reusable logic from notebooks into `src/` as new modeling
    stages mature.
-8. Save generated metrics and figures under `results/`.
+9. Save generated metrics and figures under `results/`.
 
 The dataset overview notebook writes these local intermediate summaries when raw
 participant files are available:
@@ -215,6 +238,7 @@ the raw files and epoch index are available:
 - `data/processed/features_train.csv`
 - `data/processed/features_val.csv`
 - `data/processed/features_test.csv`
+- `data/processed/preprocessing_metadata.json`
 
 Generate the epoch index locally after placing DREAMT participant files under
 `data/raw/` and creating `data/interim/split_assignments.csv`:
