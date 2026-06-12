@@ -7,17 +7,15 @@ visible at the call site.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
-
 from src.data import EXPECTED_SIGNAL_COLUMNS, load_participant_csv
+from src.features import ACC_MAG_COLUMN, compute_acc_magnitude
 from src.preprocessing import DEFAULT_EPOCH_LENGTH_SECONDS, TARGET_SLEEP_STAGE_LABELS
 
-
-ACC_MAG_COLUMN = "ACC_MAG"
 MISSINGNESS_PREFIX = "missingness_"
 EPOCH_SUMMARY_STATS = ("mean", "std", "median", "iqr")
 
@@ -40,17 +38,12 @@ def add_acc_magnitude(
 ) -> pd.DataFrame:
     """Return a copy of ``df`` with accelerometer magnitude added."""
     output = df.copy()
-    missing_columns = [
-        column for column in [x_col, y_col, z_col] if column not in output.columns
-    ]
-    if missing_columns:
-        raise ValueError(
-            "Cannot compute accelerometer magnitude; missing column(s): "
-            f"{missing_columns}"
-        )
-
-    components = output[[x_col, y_col, z_col]].apply(pd.to_numeric, errors="coerce")
-    output[output_col] = np.sqrt((components**2).sum(axis=1))
+    output[output_col] = compute_acc_magnitude(
+        output,
+        x_col=x_col,
+        y_col=y_col,
+        z_col=z_col,
+    )
     return output
 
 
