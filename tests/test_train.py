@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -7,11 +8,18 @@ torch = pytest.importorskip("torch")
 from src.models import SleepStageCNN  # noqa: E402
 from src.train import (  # noqa: E402
     TrainConfig,
+    TrainingResult,
+    build_loss_function,
+    build_stage9_screening_configs,
+    class_counts_from_loader,
+    class_weights_from_counts,
     evaluate_model,
     load_checkpoint,
     resolve_device,
+    run_stage9_experiments,
     run_tiny_overfit_test,
     save_checkpoint,
+    stage9_experiment_id,
     train_model,
     train_one_epoch,
 )
@@ -128,3 +136,95 @@ def test_train_model_saves_validation_artifacts(tmp_path):
     assert (Path(tmp_path) / "train_history.csv").exists()
     assert (Path(tmp_path) / "validation_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_confusion_matrix.csv").exists()
+
+
+def test_class_weights_are_inverse_frequency_and_train_only():
+    dataset = SyntheticEpochDataset(n_examples=6)
+    dataset.y = torch.tensor([0, 0, 0, 1, 1, 2])
+    loader = _loader(dataset, batch_size=2, shuffle=False)
+
+    counts = class_counts_from_loader(loader)
+    weights = class_weights_from_counts(counts)
+
+    assert counts == {"Wake": 3, "Non-REM": 2, "REM": 1}
+    assert weights == pytest.approx([6 / 9, 6 / 6, 6 / 3])
+
+
+def test_build_loss_function_adds_weights_when_requested():
+    dataset = SyntheticEpochDataset(n_examples=6)
+    dataset.y = torch.tensor([0, 0, 0, 1, 1, 2])
+    loader = _loader(dataset, batch_size=2, shuffle=False)
+    config = TrainConfig(class_weighting=True)
+
+    criterion = build_loss_function(loader, config, torch.device("cpu"))
+
+    assert criterion.weight.tolist() == pytest.approx([6 / 9, 6 / 6, 6 / 3])
+
+
+def test_stage9_screening_grid_includes_zero_dropout(tmp_path):
+    base_config = TrainConfig(output_dir=tmp_path, epochs=3, patience=2)
+
+    configs = build_stage9_screening_configs(
+        base_config=base_config,
+        output_dir=tmp_path,
+        learning_rates=(1e-3,),
+        dropouts=(0.0, 0.10, 0.25),
+        weight_decays=(1e-4,),
+        class_weighting_options=(False,),
+    )
+
+    assert [config.dropout for config in configs] == [0.0, 0.10, 0.25]
+    assert all(config.epochs == 3 for config in configs)
+
+
+def test_stage9_experiment_id_is_stable_for_same_config(tmp_path):
+    config = TrainConfig(output_dir=tmp_path, learning_rate=1e-3, dropout=0.0)
+
+    assert stage9_experiment_id(config) == stage9_experiment_id(config)
+    assert stage9_experiment_id(config).startswith("cnn_")
+
+
+def test_run_stage9_experiments_writes_ranked_summary(tmp_path, monkeypatch):
+    def fake_run_training_from_config(config):
+        output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            index=["true_Wake", "true_Non-REM", "true_REM"],
+            columns=["pred_Wake", "pred_Non-REM", "pred_REM"],
+        ).to_csv(output_dir / "validation_confusion_matrix.csv")
+        score = 0.8 if config.dropout == 0.0 else 0.6
+        history = pd.DataFrame(
+            {
+                "epoch": [1],
+                "train_loss": [1.0],
+                "validation_loss": [0.5],
+                "macro_f1": [score],
+                "balanced_accuracy": [score],
+            }
+        )
+        return TrainingResult(
+            history=history,
+            best_metrics=history.iloc[0].to_dict(),
+            best_epoch=1,
+            best_checkpoint_path=output_dir / "checkpoints" / "best.pt",
+            last_checkpoint_path=output_dir / "checkpoints" / "last.pt",
+            output_dir=output_dir,
+        )
+
+    monkeypatch.setattr(
+        "src.train.run_training_from_config",
+        fake_run_training_from_config,
+    )
+    configs = [
+        TrainConfig(output_dir=tmp_path, dropout=0.25),
+        TrainConfig(output_dir=tmp_path, dropout=0.0),
+    ]
+
+    summary = run_stage9_experiments(configs, output_dir=tmp_path)
+
+    assert summary.loc[0, "dropout"] == 0.0
+    assert (Path(tmp_path) / "experiment_summary.csv").exists()
+    assert (Path(tmp_path) / "all_history.csv").exists()
+    assert (Path(tmp_path) / "best_config.json").exists()
+    assert (Path(tmp_path) / "best_validation_confusion_matrix.csv").exists()

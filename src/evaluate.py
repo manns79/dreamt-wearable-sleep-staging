@@ -37,6 +37,7 @@ def classification_metrics(
 
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(sum(recall) / len(recall)),
         "macro_f1": float(
             f1_score(
                 y_true,

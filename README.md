@@ -178,6 +178,33 @@ The Stage 8 workflow saves local artifacts under:
 - `results/stage8_single_epoch_cnn/checkpoints/best.pt`
 - `results/stage8_single_epoch_cnn/checkpoints/last.pt`
 
+## Basic Deep-Learning Training Choices
+
+Stage 9 extends the single-epoch 1D CNN workflow in
+`notebooks/04_cnn_training.ipynb` to compare controlled training choices while
+keeping the model family fixed. Reusable tuning utilities live in `src/train.py`.
+The default screening grid varies train-only class-weighted loss, learning
+rate, dropout including no dropout, and weight decay. Validation macro F1 is
+the primary model-selection metric, with balanced accuracy, accuracy,
+per-class precision/recall/F1, validation loss, and confusion matrices used as
+supporting diagnostics.
+
+Stage 9 still evaluates only the validation split. The held-out test split must
+not be used for model prediction, model selection, error analysis, or
+performance reporting until the final project comparison.
+
+When run locally, Stage 9 writes artifacts under:
+
+- `results/stage9_training_choices/experiment_summary.csv`
+- `results/stage9_training_choices/all_history.csv`
+- `results/stage9_training_choices/best_config.json`
+- `results/stage9_training_choices/best_validation_confusion_matrix.csv`
+- `results/stage9_training_choices/runs/<experiment_id>/train_history.csv`
+- `results/stage9_training_choices/runs/<experiment_id>/validation_metrics.csv`
+- `results/stage9_training_choices/runs/<experiment_id>/validation_confusion_matrix.csv`
+- `results/stage9_training_choices/runs/<experiment_id>/checkpoints/best.pt`
+- `results/stage9_training_choices/runs/<experiment_id>/checkpoints/last.pt`
+
 ## Methods
 
 Implemented and planned methods include:
@@ -244,9 +271,11 @@ This project is not fully implemented yet. The expected workflow will be:
 7. Run `notebooks/04_cnn_training.ipynb` to build PyTorch datasets, save
    train-only preprocessing metadata, check tensor shapes, run a tiny CNN
    overfit smoke test, and train the first validation-monitored 1D CNN.
-8. Continue moving reusable logic from notebooks into `src/` as new modeling
+8. In the same notebook, enable the guarded Stage 9 cell to compare basic
+   single-epoch CNN training choices on the validation split only.
+9. Continue moving reusable logic from notebooks into `src/` as new modeling
    stages mature.
-9. Save generated metrics and figures under `results/`.
+10. Save generated metrics and figures under `results/`.
 
 The dataset overview notebook writes these local intermediate summaries when raw
 participant files are available:
@@ -294,6 +323,7 @@ write interim validation diagnostics:
 - `results/figures/`
 - `results/stage6_validation_metrics.csv`
 - `results/stage6_xgboost_validation_permutation_importance.csv`
+- `results/stage9_training_choices/experiment_summary.csv`
 
 ## Limitations
 

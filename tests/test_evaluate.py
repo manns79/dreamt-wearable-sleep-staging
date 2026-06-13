@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 from src.evaluate import (
     classification_metrics,
     confusion_matrix_frame,
@@ -13,6 +14,7 @@ def test_classification_metrics_reports_overall_and_per_class_values():
     metrics = classification_metrics(y_true, y_pred)
 
     assert metrics["accuracy"] == 0.75
+    assert metrics["balanced_accuracy"] == pytest.approx((0.5 + 1.0 + 1.0) / 3)
     assert metrics["Wake_precision"] == 1.0
     assert metrics["Wake_recall"] == 0.5
     assert metrics["Non_REM_f1"] == 1.0
