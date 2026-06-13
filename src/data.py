@@ -682,6 +682,12 @@ class DreamtContextDataset(DreamtEpochDataset):
     def __len__(self) -> int:
         return len(self.window_positions)
 
+    @property
+    def center_positions(self) -> list[int]:
+        """Return epoch-index positions used as context-window targets."""
+
+        return [positions[self.context_radius] for positions in self.window_positions]
+
     def __getitem__(self, index: int) -> tuple[Any, Any]:
         import torch
 

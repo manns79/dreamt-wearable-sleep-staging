@@ -21,6 +21,7 @@ from src.data import (
     ID_TO_LABEL,
     LABEL_TO_ID,
     TARGET_LABELS,
+    DreamtContextDataset,
     DreamtEpochDataset,
     fit_normalization_stats,
     load_preprocessing_metadata,
@@ -30,11 +31,12 @@ from src.evaluate import evaluate_predictions
 
 DEFAULT_STAGE8_OUTPUT_DIR = Path("results/stage8_single_epoch_cnn")
 DEFAULT_STAGE9_OUTPUT_DIR = Path("results/stage9_training_choices")
+DEFAULT_STAGE10_OUTPUT_DIR = Path("results/stage10_temporal_context_cnn")
 
 
 @dataclass(frozen=True)
 class TrainConfig:
-    """Configuration for single-epoch CNN training and tuning."""
+    """Configuration for CNN training and tuning."""
 
     raw_dir: str | Path = DEFAULT_RAW_DATA_DIR
     epoch_index_path: str | Path = DEFAULT_EPOCH_INDEX_PATH
@@ -49,6 +51,8 @@ class TrainConfig:
     filters: Sequence[int] = (16, 32, 64)
     kernel_size: int = 7
     dropout: float = 0.10
+    context_radius: int = 0
+    comparison_context_radius: int | None = None
     class_weighting: bool = False
     max_grad_norm: float | None = None
     patience: int = 5
@@ -143,10 +147,41 @@ def resolve_device(device: str = "auto") -> Any:
     return resolved
 
 
-def build_train_validation_dataloaders(config: TrainConfig) -> dict[str, Any]:
-    """Build train and validation loaders without touching the test split."""
+def _validate_training_config(config: TrainConfig) -> None:
+    """Validate config values shared by all CNN training stages."""
 
-    torch = _require_torch()
+    if config.epochs <= 0:
+        raise ValueError("epochs must be positive.")
+    if config.batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if config.learning_rate <= 0:
+        raise ValueError("learning_rate must be positive.")
+    if config.weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative.")
+    if config.kernel_size <= 0:
+        raise ValueError("kernel_size must be positive.")
+    if not config.filters:
+        raise ValueError("At least one convolutional filter size is required.")
+    if any(int(filter_count) <= 0 for filter_count in config.filters):
+        raise ValueError("All convolutional filter sizes must be positive.")
+    if not 0 <= config.dropout < 1:
+        raise ValueError("dropout must be in [0, 1).")
+    if config.context_radius < 0:
+        raise ValueError("context_radius must be non-negative.")
+    if (
+        config.comparison_context_radius is not None
+        and config.comparison_context_radius < 0
+    ):
+        raise ValueError("comparison_context_radius must be non-negative when set.")
+    if config.max_grad_norm is not None and config.max_grad_norm <= 0:
+        raise ValueError("max_grad_norm must be positive when provided.")
+    if config.patience <= 0:
+        raise ValueError("patience must be positive.")
+
+
+def _load_or_fit_preprocessing_stats(config: TrainConfig) -> dict[str, object]:
+    """Load saved train-only preprocessing stats, fitting them if needed."""
+
     metadata_path = Path(config.preprocessing_metadata_path)
     channels = list(config.channels)
 
@@ -162,22 +197,43 @@ def build_train_validation_dataloaders(config: TrainConfig) -> dict[str, Any]:
     else:
         stats = fit_normalization_stats(train_unscaled)
         save_preprocessing_metadata(stats, metadata_path)
+    return stats
 
-    train_dataset = DreamtEpochDataset(
+
+def _dataset_class_for_config(config: TrainConfig) -> type[DreamtEpochDataset]:
+    if config.context_radius > 0:
+        return DreamtContextDataset
+    return DreamtEpochDataset
+
+
+def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
+    """Build train and validation datasets without touching the test split."""
+
+    _validate_training_config(config)
+    channels = list(config.channels)
+    stats = _load_or_fit_preprocessing_stats(config)
+    dataset_class = _dataset_class_for_config(config)
+    dataset_kwargs: dict[str, Any] = {}
+    if config.context_radius > 0:
+        dataset_kwargs["context_radius"] = config.context_radius
+
+    train_dataset = dataset_class(
         raw_dir=config.raw_dir,
         epoch_index=config.epoch_index_path,
         split="train",
         channels=channels,
         preprocessing_stats=stats,
         max_participants=config.max_train_participants,
+        **dataset_kwargs,
     )
-    val_dataset = DreamtEpochDataset(
+    val_dataset = dataset_class(
         raw_dir=config.raw_dir,
         epoch_index=config.epoch_index_path,
         split="validation",
         channels=channels,
         preprocessing_stats=stats,
         max_participants=config.max_val_participants,
+        **dataset_kwargs,
     )
 
     if len(train_dataset) == 0:
@@ -185,18 +241,31 @@ def build_train_validation_dataloaders(config: TrainConfig) -> dict[str, Any]:
     if len(val_dataset) == 0:
         raise ValueError("Validation dataset is empty.")
 
+    return {"train": train_dataset, "validation": val_dataset}
+
+
+def _new_seeded_generator(seed: int) -> Any:
+    torch = _require_torch()
     generator = torch.Generator()
-    generator.manual_seed(config.random_seed)
+    generator.manual_seed(seed)
+    return generator
+
+
+def _build_dataloaders_from_datasets(
+    datasets: Mapping[str, Any],
+    config: TrainConfig,
+) -> dict[str, Any]:
+    torch = _require_torch()
     return {
         "train": torch.utils.data.DataLoader(
-            train_dataset,
+            datasets["train"],
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
-            generator=generator,
+            generator=_new_seeded_generator(config.random_seed),
         ),
         "validation": torch.utils.data.DataLoader(
-            val_dataset,
+            datasets["validation"],
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
@@ -204,8 +273,106 @@ def build_train_validation_dataloaders(config: TrainConfig) -> dict[str, Any]:
     }
 
 
+def build_train_validation_dataloaders(config: TrainConfig) -> dict[str, Any]:
+    """Build train and validation loaders without touching the test split."""
+
+    datasets = build_train_validation_datasets(config)
+    return _build_dataloaders_from_datasets(datasets, config)
+
+
+def _context_center_positions(dataset: Any) -> list[int]:
+    """Return center epoch positions from a context dataset."""
+
+    if hasattr(dataset, "center_positions"):
+        return [int(position) for position in dataset.center_positions]
+    if hasattr(dataset, "window_positions") and hasattr(dataset, "context_radius"):
+        return [
+            int(positions[int(dataset.context_radius)])
+            for positions in dataset.window_positions
+        ]
+    raise TypeError("Expected a DreamtContextDataset-like object.")
+
+
+def build_stage10_paired_dataloaders(
+    config: TrainConfig,
+    context_radius: int,
+) -> dict[str, Any]:
+    """Build matched single-epoch and context loaders for one Stage 10 radius.
+
+    The simple CNN loaders are restricted to the same center epochs used by the
+    context CNN, so paired runs compare inputs rather than different target
+    epoch sets. The held-out test split is never loaded here.
+    """
+
+    if context_radius <= 0:
+        raise ValueError("context_radius must be positive for Stage 10 pairing.")
+
+    torch = _require_torch()
+    base_config = replace(config, context_radius=0)
+    context_config = replace(config, context_radius=int(context_radius))
+
+    single_datasets = build_train_validation_datasets(base_config)
+    context_datasets = build_train_validation_datasets(context_config)
+
+    single_train = torch.utils.data.Subset(
+        single_datasets["train"],
+        _context_center_positions(context_datasets["train"]),
+    )
+    single_validation = torch.utils.data.Subset(
+        single_datasets["validation"],
+        _context_center_positions(context_datasets["validation"]),
+    )
+
+    if len(single_train) != len(context_datasets["train"]):
+        raise ValueError("Stage 10 train pairing produced mismatched dataset lengths.")
+    if len(single_validation) != len(context_datasets["validation"]):
+        raise ValueError(
+            "Stage 10 validation pairing produced mismatched dataset lengths."
+        )
+
+    paired_datasets = {
+        "single": {
+            "train": single_train,
+            "validation": single_validation,
+        },
+        "context": {
+            "train": context_datasets["train"],
+            "validation": context_datasets["validation"],
+        },
+    }
+
+    single_loaders = _build_dataloaders_from_datasets(
+        paired_datasets["single"],
+        config,
+    )
+    context_loaders = _build_dataloaders_from_datasets(
+        paired_datasets["context"],
+        config,
+    )
+
+    return {
+        "single": single_loaders,
+        "context": context_loaders,
+        "metadata": {
+            "context_radius": int(context_radius),
+            "train_examples": len(context_datasets["train"]),
+            "validation_examples": len(context_datasets["validation"]),
+        },
+    }
+
+
 def _label_ids_from_dataset(dataset: Any) -> list[int] | None:
     """Return label IDs without loading tensors when the dataset exposes labels."""
+
+    if (
+        hasattr(dataset, "epoch_index")
+        and hasattr(dataset, "window_positions")
+        and hasattr(dataset, "context_radius")
+    ):
+        labels = dataset.epoch_index.iloc[_context_center_positions(dataset)][
+            "mapped_label"
+        ].tolist()
+        return [LABEL_TO_ID[str(label)] for label in labels]
 
     if hasattr(dataset, "epoch_index"):
         labels = dataset.epoch_index["mapped_label"].tolist()
@@ -483,26 +650,7 @@ def train_model(
     """Train a single-epoch CNN with validation monitoring and checkpoints."""
 
     torch = _require_torch()
-    if config.epochs <= 0:
-        raise ValueError("epochs must be positive.")
-    if config.batch_size <= 0:
-        raise ValueError("batch_size must be positive.")
-    if config.learning_rate <= 0:
-        raise ValueError("learning_rate must be positive.")
-    if config.weight_decay < 0:
-        raise ValueError("weight_decay must be non-negative.")
-    if config.kernel_size <= 0:
-        raise ValueError("kernel_size must be positive.")
-    if not config.filters:
-        raise ValueError("At least one convolutional filter size is required.")
-    if any(int(filter_count) <= 0 for filter_count in config.filters):
-        raise ValueError("All convolutional filter sizes must be positive.")
-    if not 0 <= config.dropout < 1:
-        raise ValueError("dropout must be in [0, 1).")
-    if config.max_grad_norm is not None and config.max_grad_norm <= 0:
-        raise ValueError("max_grad_norm must be positive when provided.")
-    if config.patience <= 0:
-        raise ValueError("patience must be positive.")
+    _validate_training_config(config)
 
     set_seed(config.random_seed)
     device = resolve_device(config.device)
@@ -751,6 +899,193 @@ def run_stage9_experiments(
     if history_frames:
         all_history = pd.concat(history_frames, ignore_index=True)
         all_history.to_csv(stage_dir / "all_history.csv", index=False)
+
+    best_row = summary.iloc[0].to_dict()
+    _save_json(best_row, stage_dir / "best_config.json")
+    best_confusion_path = (
+        Path(str(best_row["output_dir"])) / "validation_confusion_matrix.csv"
+    )
+    if best_confusion_path.exists():
+        best_confusion = pd.read_csv(best_confusion_path, index_col=0)
+        best_confusion.to_csv(stage_dir / "best_validation_confusion_matrix.csv")
+
+    return summary
+
+
+def _stage10_pair_radius(config: TrainConfig) -> int:
+    pair_radius = config.comparison_context_radius
+    if pair_radius is None:
+        pair_radius = config.context_radius
+    if pair_radius <= 0:
+        raise ValueError(
+            "Stage 10 configs require a positive comparison_context_radius "
+            "or context_radius."
+        )
+    if config.context_radius not in {0, pair_radius}:
+        raise ValueError(
+            "Stage 10 configs must be either the single-epoch baseline "
+            "or the context model for their comparison radius."
+        )
+    return int(pair_radius)
+
+
+def stage10_experiment_id(config: TrainConfig) -> str:
+    """Return a stable short ID for one Stage 10 comparison configuration."""
+
+    pair_radius = _stage10_pair_radius(config)
+    config_dict = config_to_dict(config)
+    stable_keys = [
+        "model_name",
+        "channels",
+        "batch_size",
+        "epochs",
+        "learning_rate",
+        "weight_decay",
+        "filters",
+        "kernel_size",
+        "dropout",
+        "context_radius",
+        "comparison_context_radius",
+        "class_weighting",
+        "max_grad_norm",
+        "patience",
+        "min_delta",
+        "random_seed",
+        "max_train_participants",
+        "max_val_participants",
+    ]
+    payload = {key: config_dict.get(key) for key in stable_keys}
+    digest = sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:10]
+    family = "context" if config.context_radius > 0 else "single"
+    return f"stage10_{family}_r{pair_radius}_{digest}"
+
+
+def build_stage10_comparison_configs(
+    base_config: TrainConfig | None = None,
+    output_dir: str | Path = DEFAULT_STAGE10_OUTPUT_DIR,
+    context_radii: Sequence[int] = (1, 2),
+) -> list[TrainConfig]:
+    """Create conservative Stage 10 configs for fair context comparisons."""
+
+    if not context_radii:
+        raise ValueError("At least one context radius is required.")
+    invalid_radii = [radius for radius in context_radii if int(radius) <= 0]
+    if invalid_radii:
+        raise ValueError(f"Context radii must be positive: {invalid_radii}")
+
+    base = base_config or TrainConfig(
+        output_dir=output_dir,
+        model_name="single_epoch_cnn_stage10",
+        epochs=40,
+        patience=8,
+    )
+    configs: list[TrainConfig] = []
+    for radius in context_radii:
+        radius = int(radius)
+        configs.append(
+            replace(
+                base,
+                output_dir=output_dir,
+                model_name=f"single_epoch_cnn_stage10_context_eligible_r{radius}",
+                context_radius=0,
+                comparison_context_radius=radius,
+            )
+        )
+        configs.append(
+            replace(
+                base,
+                output_dir=output_dir,
+                model_name=f"context_cnn_stage10_r{radius}",
+                context_radius=radius,
+                comparison_context_radius=radius,
+            )
+        )
+    return configs
+
+
+def run_stage10_experiments(
+    configs: Sequence[TrainConfig],
+    output_dir: str | Path = DEFAULT_STAGE10_OUTPUT_DIR,
+) -> pd.DataFrame:
+    """Run Stage 10 temporal-context CNN comparisons.
+
+    Each single-epoch baseline is trained and evaluated on the same
+    context-eligible center epochs as its paired context CNN. Only train and
+    validation splits are loaded.
+    """
+
+    if not configs:
+        raise ValueError("At least one Stage 10 configuration is required.")
+
+    stage_dir = Path(output_dir)
+    runs_dir = stage_dir / "runs"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows: list[dict[str, Any]] = []
+    history_frames: list[pd.DataFrame] = []
+
+    for config in configs:
+        pair_radius = _stage10_pair_radius(config)
+        experiment_id = stage10_experiment_id(config)
+        run_dir = runs_dir / experiment_id
+        run_config = replace(config, output_dir=run_dir)
+        paired_loaders = build_stage10_paired_dataloaders(
+            run_config,
+            context_radius=pair_radius,
+        )
+        loader_key = "context" if run_config.context_radius > 0 else "single"
+        result = train_model(
+            paired_loaders[loader_key]["train"],
+            paired_loaders[loader_key]["validation"],
+            run_config,
+        )
+
+        config_row = config_to_dict(run_config)
+        metric_row = dict(result.best_metrics)
+        summary_rows.append(
+            {
+                "experiment_id": experiment_id,
+                "comparison_context_radius": pair_radius,
+                "model_family": loader_key,
+                "train_examples": paired_loaders["metadata"]["train_examples"],
+                "validation_examples": paired_loaders["metadata"][
+                    "validation_examples"
+                ],
+                "best_epoch": result.best_epoch,
+                "output_dir": str(result.output_dir),
+                **config_row,
+                **metric_row,
+            }
+        )
+
+        if not result.history.empty:
+            history = result.history.copy()
+            history.insert(0, "experiment_id", experiment_id)
+            history.insert(1, "comparison_context_radius", pair_radius)
+            history.insert(2, "model_family", loader_key)
+            history_frames.append(history)
+
+    summary = pd.DataFrame(summary_rows)
+    sort_columns, ascending = _summary_sort_columns(summary)
+    summary = summary.sort_values(sort_columns, ascending=ascending).reset_index(
+        drop=True
+    )
+    summary.to_csv(stage_dir / "experiment_summary.csv", index=False)
+
+    if history_frames:
+        all_history = pd.concat(history_frames, ignore_index=True)
+        all_history.to_csv(stage_dir / "all_history.csv", index=False)
+
+    best_by_radius = (
+        summary.sort_values(sort_columns, ascending=ascending)
+        .groupby("comparison_context_radius", as_index=False, sort=True)
+        .head(1)
+        .reset_index(drop=True)
+    )
+    best_by_radius.to_csv(stage_dir / "best_by_context_radius.csv", index=False)
 
     best_row = summary.iloc[0].to_dict()
     _save_json(best_row, stage_dir / "best_config.json")

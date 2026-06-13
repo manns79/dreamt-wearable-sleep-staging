@@ -205,6 +205,45 @@ When run locally, Stage 9 writes artifacts under:
 - `results/stage9_training_choices/runs/<experiment_id>/checkpoints/best.pt`
 - `results/stage9_training_choices/runs/<experiment_id>/checkpoints/last.pt`
 
+## Temporal-Context CNN Comparison
+
+Stage 10 asks whether neighboring sleep epochs improve validation performance
+relative to the simple 1D CNN. It keeps the architecture and training loop
+conservative, reusing the same `SleepStageCNN` and `src.train` training
+utilities while replacing single-epoch tensors with `DreamtContextDataset`
+windows for context models.
+
+To keep the comparison fair, each simple CNN baseline is trained and evaluated
+on the same context-eligible center epochs as its paired context CNN. Stage 10
+therefore compares the center epoch alone against the same center epoch plus
+neighboring context, rather than comparing different validation epoch sets.
+The default comparison runs:
+
+- simple 1D CNN on radius-1 context-eligible centers
+- context CNN with `context_radius=1`
+- simple 1D CNN on radius-2 context-eligible centers
+- context CNN with `context_radius=2`
+
+Validation macro F1 remains the primary selection metric, with balanced
+accuracy, validation loss, class-level precision/recall/F1, and confusion
+matrices used as supporting diagnostics. Broader hyperparameter tuning is held
+for Stage 11, where the context radius and other context-CNN choices can be
+varied more systematically. Stage 10 still evaluates only the validation split;
+the held-out test split remains unused.
+
+When run locally, Stage 10 writes artifacts under:
+
+- `results/stage10_temporal_context_cnn/experiment_summary.csv`
+- `results/stage10_temporal_context_cnn/all_history.csv`
+- `results/stage10_temporal_context_cnn/best_by_context_radius.csv`
+- `results/stage10_temporal_context_cnn/best_config.json`
+- `results/stage10_temporal_context_cnn/best_validation_confusion_matrix.csv`
+- `results/stage10_temporal_context_cnn/runs/<experiment_id>/train_history.csv`
+- `results/stage10_temporal_context_cnn/runs/<experiment_id>/validation_metrics.csv`
+- `results/stage10_temporal_context_cnn/runs/<experiment_id>/validation_confusion_matrix.csv`
+- `results/stage10_temporal_context_cnn/runs/<experiment_id>/checkpoints/best.pt`
+- `results/stage10_temporal_context_cnn/runs/<experiment_id>/checkpoints/last.pt`
+
 ## Methods
 
 Implemented and planned methods include:
@@ -273,9 +312,12 @@ This project is not fully implemented yet. The expected workflow will be:
    overfit smoke test, and train the first validation-monitored 1D CNN.
 8. In the same notebook, enable the guarded Stage 9 cell to compare basic
    single-epoch CNN training choices on the validation split only.
-9. Continue moving reusable logic from notebooks into `src/` as new modeling
+9. In the same notebook, enable the guarded Stage 10 cell to compare simple
+   CNN and temporal-context CNN models on matched context-eligible validation
+   centers for `context_radius=1` and `context_radius=2`.
+10. Continue moving reusable logic from notebooks into `src/` as new modeling
    stages mature.
-10. Save generated metrics and figures under `results/`.
+11. Save generated metrics and figures under `results/`.
 
 The dataset overview notebook writes these local intermediate summaries when raw
 participant files are available:
@@ -324,6 +366,7 @@ write interim validation diagnostics:
 - `results/stage6_validation_metrics.csv`
 - `results/stage6_xgboost_validation_permutation_importance.csv`
 - `results/stage9_training_choices/experiment_summary.csv`
+- `results/stage10_temporal_context_cnn/experiment_summary.csv`
 
 ## Limitations
 
