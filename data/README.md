@@ -270,7 +270,26 @@ Normalization statistics are fit from training participants only with
 - `data/processed/preprocessing_metadata.json`
 
 The first version uses median imputation for missing values and per-channel
-standardization. Validation and test datasets should load and apply the saved
-training metadata, never fit their own normalization parameters. Test loaders
-may be created for shape and leakage checks, but final test metrics should be
-deferred until selected model variants are ready for final evaluation.
+standardization. Validation datasets should load and apply the saved training
+metadata, never fit their own normalization parameters. The held-out test split
+should not be used for model prediction or performance reporting until the final
+project comparison.
+
+## First 1D CNN Training Artifacts
+
+Stage 8 reusable training utilities live in `src/models.py` and `src/train.py`.
+The notebook `notebooks/04_cnn_training.ipynb` now acts as a thin local runner
+for the tiny overfit smoke test and the first validation-monitored CNN training
+loop.
+
+Generated Stage 8 artifacts are local results files:
+
+- `results/stage8_single_epoch_cnn/train_history.csv`
+- `results/stage8_single_epoch_cnn/validation_metrics.csv`
+- `results/stage8_single_epoch_cnn/validation_confusion_matrix.csv`
+- `results/stage8_single_epoch_cnn/validation_confusion_matrix.png`
+- `results/stage8_single_epoch_cnn/training_curves.png`
+- `results/stage8_single_epoch_cnn/tiny_overfit_history.csv`
+- `results/stage8_single_epoch_cnn/tiny_overfit_curves.png`
+- `results/stage8_single_epoch_cnn/checkpoints/best.pt`
+- `results/stage8_single_epoch_cnn/checkpoints/last.pt`

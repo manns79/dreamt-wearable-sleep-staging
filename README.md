@@ -149,9 +149,34 @@ imputation and per-channel standardization, then saved locally at:
 
 - `data/processed/preprocessing_metadata.json`
 
-Validation and test datasets apply the saved training metadata. Test loaders may
-be built for shape and leakage checks, but final test metrics remain deferred
-until model variants have been selected.
+Validation datasets apply the saved training metadata. The held-out test split
+remains unused for model prediction and performance reporting until the final
+project comparison.
+
+## First 1D CNN Training Loop
+
+Stage 8 adds a small, reusable single-epoch 1D CNN training loop in
+`src/models.py` and `src/train.py`. The first CNN is intentionally modest: its
+purpose is to prove that the deep learning plumbing is trustworthy before
+larger model variants are explored. The training code supports CPU and GPU
+execution through `device="auto"`, converts input batches to `float32` for
+PyTorch model training, and monitors validation diagnostics after each epoch.
+
+Stage 8 evaluates only the validation split. The held-out test split must not
+be used for model prediction or performance reporting until the final project
+comparison.
+
+The Stage 8 workflow saves local artifacts under:
+
+- `results/stage8_single_epoch_cnn/train_history.csv`
+- `results/stage8_single_epoch_cnn/validation_metrics.csv`
+- `results/stage8_single_epoch_cnn/validation_confusion_matrix.csv`
+- `results/stage8_single_epoch_cnn/validation_confusion_matrix.png`
+- `results/stage8_single_epoch_cnn/training_curves.png`
+- `results/stage8_single_epoch_cnn/tiny_overfit_history.csv`
+- `results/stage8_single_epoch_cnn/tiny_overfit_curves.png`
+- `results/stage8_single_epoch_cnn/checkpoints/best.pt`
+- `results/stage8_single_epoch_cnn/checkpoints/last.pt`
 
 ## Methods
 
@@ -217,8 +242,8 @@ This project is not fully implemented yet. The expected workflow will be:
 6. Run `notebooks/03_feature_baselines.ipynb` to build engineered feature CSVs
    and evaluate traditional baselines on the validation split.
 7. Run `notebooks/04_cnn_training.ipynb` to build PyTorch datasets, save
-   train-only preprocessing metadata, check tensor shapes, and run a tiny CNN
-   overfit smoke test.
+   train-only preprocessing metadata, check tensor shapes, run a tiny CNN
+   overfit smoke test, and train the first validation-monitored 1D CNN.
 8. Continue moving reusable logic from notebooks into `src/` as new modeling
    stages mature.
 9. Save generated metrics and figures under `results/`.
