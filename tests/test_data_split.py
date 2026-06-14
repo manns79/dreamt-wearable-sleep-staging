@@ -1,9 +1,11 @@
 from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 import pytest
 
 from src.data import (
+    DreamtEpochDataset,
     check_no_participant_overlap,
     create_participant_split,
     load_split_assignments,
@@ -16,6 +18,27 @@ def _participant_ids(n=100):
     return [f"S{i:03d}" for i in range(1, n + 1)]
 
 
+def _raw_frame(values):
+    return pd.DataFrame({"BVP": values})
+
+
+def _epoch_index(participant_ids):
+    return pd.DataFrame(
+        [
+            {
+                "participant_id": participant_id,
+                "split": "train",
+                "epoch_id": 0,
+                "start_row": 0,
+                "end_row": 2,
+                "mapped_label": "Wake",
+                "is_valid_epoch": True,
+            }
+            for participant_id in participant_ids
+        ]
+    )
+
+
 def test_create_participant_split_expected_columns_and_sizes():
     split_df = create_participant_split(_participant_ids())
 
@@ -25,6 +48,37 @@ def test_create_participant_split_expected_columns_and_sizes():
         "validation": 15,
         "test": 15,
     }
+
+
+def test_dreamt_epoch_dataset_bounds_participant_signal_cache():
+    participant_ids = ["S001", "S002", "S003"]
+    output_dir = Path("outputs") / f"test-bounded-signal-cache-{uuid4().hex}"
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    for offset, participant_id in enumerate(participant_ids):
+        _raw_frame([float(offset), float(offset + 1)]).to_csv(
+            raw_dir / f"{participant_id}_whole_df.csv",
+            index=False,
+        )
+
+    dataset = DreamtEpochDataset(
+        raw_dir=raw_dir,
+        epoch_index=_epoch_index(participant_ids),
+        split="train",
+        channels=["BVP"],
+        max_cached_participants=2,
+    )
+
+    dataset.get_epoch_array(0)
+    dataset.get_epoch_array(1)
+    dataset.get_epoch_array(2)
+    assert list(dataset.signal_cache._cache) == ["S002", "S003"]
+
+    dataset.get_epoch_array(1)
+    assert list(dataset.signal_cache._cache) == ["S003", "S002"]
+
+    dataset.get_epoch_array(0)
+    assert list(dataset.signal_cache._cache) == ["S002", "S001"]
 
 
 def test_create_participant_split_assigns_every_participant_once():

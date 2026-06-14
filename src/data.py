@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,7 @@ DEFAULT_PREPROCESSING_METADATA_PATH = (
 )
 DEFAULT_INVENTORY_CHUNKSIZE = 500_000
 DEFAULT_EPOCH_INDEX_CHUNKSIZE = 500_000
+DEFAULT_MAX_CACHED_PARTICIPANTS = 4
 
 TIME_COLUMN = "TIMESTAMP"
 LABEL_COLUMN = "Sleep_Stage"
@@ -508,12 +509,22 @@ def _add_derived_channels(df: pd.DataFrame, channels: Iterable[str]) -> pd.DataF
 class _ParticipantSignalCache:
     """Lazy participant-level raw signal cache for epoch/window slicing."""
 
-    def __init__(self, raw_dir: str | Path, channels: Iterable[str]):
+    def __init__(
+        self,
+        raw_dir: str | Path,
+        channels: Iterable[str],
+        max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
+    ):
+        if max_cached_participants is not None and max_cached_participants <= 0:
+            raise ValueError(
+                "max_cached_participants must be positive or None for no limit."
+            )
         self.raw_dir = Path(raw_dir)
         self.channels = list(channels)
+        self.max_cached_participants = max_cached_participants
         self.raw_columns = _raw_columns_for_channels(self.channels)
         self.file_lookup = _participant_file_lookup(self.raw_dir)
-        self._cache: dict[str, pd.DataFrame] = {}
+        self._cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
 
     def require_participants(self, participant_ids: Iterable[str]) -> None:
         missing_ids = sorted(set(participant_ids) - set(self.file_lookup))
@@ -524,13 +535,20 @@ class _ParticipantSignalCache:
             )
 
     def get(self, participant_id: str) -> pd.DataFrame:
-        if participant_id not in self._cache:
+        if participant_id in self._cache:
+            self._cache.move_to_end(participant_id)
+        else:
             raw_df = load_participant_csv(
                 self.file_lookup[participant_id],
                 usecols=self.raw_columns,
             )
             raw_df = _add_derived_channels(raw_df, self.channels)
             self._cache[participant_id] = raw_df[self.channels].copy()
+            if (
+                self.max_cached_participants is not None
+                and len(self._cache) > self.max_cached_participants
+            ):
+                self._cache.popitem(last=False)
         return self._cache[participant_id]
 
 
@@ -581,6 +599,7 @@ class DreamtEpochDataset:
         preprocessing_stats: dict[str, object] | None = None,
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
+        max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
     ):
         self.channels = list(channels)
         self.preprocessing_stats = preprocessing_stats
@@ -592,7 +611,11 @@ class DreamtEpochDataset:
             participant_ids=participant_ids,
             max_participants=max_participants,
         )
-        self.signal_cache = _ParticipantSignalCache(raw_dir, self.channels)
+        self.signal_cache = _ParticipantSignalCache(
+            raw_dir,
+            self.channels,
+            max_cached_participants=max_cached_participants,
+        )
         self.signal_cache.require_participants(self.epoch_index["participant_id"])
 
     def __len__(self) -> int:
@@ -641,6 +664,7 @@ class DreamtContextDataset(DreamtEpochDataset):
         context_radius: int = 2,
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
+        max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
     ):
         if context_radius < 0:
             raise ValueError("context_radius must be non-negative.")
@@ -653,6 +677,7 @@ class DreamtContextDataset(DreamtEpochDataset):
             preprocessing_stats=preprocessing_stats,
             participant_ids=participant_ids,
             max_participants=max_participants,
+            max_cached_participants=max_cached_participants,
         )
         self.window_positions = self._build_window_positions()
 
@@ -724,6 +749,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
         target_position: str = "last",
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
+        max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
     ):
         if sequence_length <= 0:
             raise ValueError("sequence_length must be positive.")
@@ -746,6 +772,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
             preprocessing_stats=preprocessing_stats,
             participant_ids=participant_ids,
             max_participants=max_participants,
+            max_cached_participants=max_cached_participants,
         )
         self.sequence_positions = self._build_sequence_positions()
 

@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from src.data import (
     DEFAULT_EPOCH_INDEX_PATH,
+    DEFAULT_MAX_CACHED_PARTICIPANTS,
     DEFAULT_PREPROCESSING_METADATA_PATH,
     DEFAULT_RAW_DATA_DIR,
     EXPECTED_SIGNAL_COLUMNS,
@@ -62,6 +63,7 @@ class TrainConfig:
     num_workers: int = 0
     max_train_participants: int | None = None
     max_val_participants: int | None = None
+    max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS
     overfit_subset_size: int = 16
     overfit_steps: int = 50
     overfit_learning_rate: float = 1e-2
@@ -177,6 +179,11 @@ def _validate_training_config(config: TrainConfig) -> None:
         raise ValueError("max_grad_norm must be positive when provided.")
     if config.patience <= 0:
         raise ValueError("patience must be positive.")
+    if (
+        config.max_cached_participants is not None
+        and config.max_cached_participants <= 0
+    ):
+        raise ValueError("max_cached_participants must be positive or None.")
 
 
 def _load_or_fit_preprocessing_stats(config: TrainConfig) -> dict[str, object]:
@@ -191,6 +198,7 @@ def _load_or_fit_preprocessing_stats(config: TrainConfig) -> dict[str, object]:
         split="train",
         channels=channels,
         max_participants=config.max_train_participants,
+        max_cached_participants=config.max_cached_participants,
     )
     if metadata_path.exists():
         stats = load_preprocessing_metadata(metadata_path)
@@ -265,6 +273,7 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
         channels=channels,
         preprocessing_stats=stats,
         max_participants=config.max_train_participants,
+        max_cached_participants=config.max_cached_participants,
         **dataset_kwargs,
     )
     val_dataset = dataset_class(
@@ -274,6 +283,7 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
         channels=channels,
         preprocessing_stats=stats,
         max_participants=config.max_val_participants,
+        max_cached_participants=config.max_cached_participants,
         **dataset_kwargs,
     )
 
