@@ -194,10 +194,48 @@ def _load_or_fit_preprocessing_stats(config: TrainConfig) -> dict[str, object]:
     )
     if metadata_path.exists():
         stats = load_preprocessing_metadata(metadata_path)
-    else:
-        stats = fit_normalization_stats(train_unscaled)
-        save_preprocessing_metadata(stats, metadata_path)
+        if _preprocessing_stats_match_dataset(stats, train_unscaled, channels):
+            return stats
+
+    stats = fit_normalization_stats(train_unscaled)
+    save_preprocessing_metadata(stats, metadata_path)
     return stats
+
+
+def _preprocessing_stats_match_dataset(
+    stats: Mapping[str, object],
+    dataset: DreamtEpochDataset,
+    channels: Sequence[str],
+) -> bool:
+    """Return whether saved preprocessing stats match the current train dataset."""
+
+    if list(stats.get("channels", [])) != list(channels):
+        return False
+
+    expected_participants = sorted(dataset.participants)
+    source_participants = stats.get("source_participants")
+    if source_participants is None:
+        return False
+    if sorted(str(participant) for participant in source_participants) != (
+        expected_participants
+    ):
+        return False
+
+    try:
+        n_epochs_fit = int(stats.get("n_epochs_fit", -1))
+    except (TypeError, ValueError):
+        return False
+    if n_epochs_fit != len(dataset):
+        return False
+
+    for key in ["mean", "std", "median"]:
+        values = stats.get(key)
+        if not isinstance(values, Mapping):
+            return False
+        if sorted(str(channel) for channel in values) != sorted(channels):
+            return False
+
+    return True
 
 
 def _dataset_class_for_config(config: TrainConfig) -> type[DreamtEpochDataset]:
@@ -538,6 +576,38 @@ def evaluate_model(
     }
 
 
+def _prefix_metric_keys(
+    metrics: Mapping[str, Any],
+    prefix: str,
+    skip_keys: Sequence[str] = ("model", "split"),
+) -> dict[str, Any]:
+    """Return metrics with a split prefix, excluding identity fields by default."""
+
+    skip_key_set = set(skip_keys)
+    return {
+        f"{prefix}_{key}": value
+        for key, value in metrics.items()
+        if key not in skip_key_set
+    }
+
+
+def _evaluation_loader_from_training_loader(train_loader: Any) -> Any:
+    """Return a non-shuffled loader over the same training examples."""
+
+    torch = _require_torch()
+    if not hasattr(train_loader, "dataset"):
+        return train_loader
+
+    return torch.utils.data.DataLoader(
+        train_loader.dataset,
+        batch_size=getattr(train_loader, "batch_size", 1),
+        shuffle=False,
+        num_workers=getattr(train_loader, "num_workers", 0),
+        collate_fn=getattr(train_loader, "collate_fn", None),
+        pin_memory=getattr(train_loader, "pin_memory", False),
+    )
+
+
 def save_checkpoint(
     path: str | Path,
     model: Any,
@@ -592,7 +662,7 @@ def _save_json(payload: Mapping[str, Any], path: Path) -> None:
 
 
 def plot_training_curves(history: pd.DataFrame, path: str | Path) -> Path:
-    """Save loss and validation macro-F1 curves."""
+    """Save train/validation loss and macro-F1 curves."""
 
     import matplotlib.pyplot as plt
 
@@ -611,9 +681,22 @@ def plot_training_curves(history: pd.DataFrame, path: str | Path) -> Path:
     axes[0].set_ylabel("Loss")
     axes[0].legend()
 
-    axes[1].plot(history["epoch"], history["macro_f1"], marker="o")
+    if "train_macro_f1" in history.columns:
+        axes[1].plot(
+            history["epoch"],
+            history["train_macro_f1"],
+            marker="o",
+            label="train",
+        )
+    axes[1].plot(
+        history["epoch"],
+        history["macro_f1"],
+        marker="o",
+        label="validation",
+    )
     axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Validation macro F1")
+    axes[1].set_ylabel("Macro F1")
+    axes[1].legend()
 
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=150)
@@ -665,6 +748,8 @@ def train_model(
     model = model.to(device)
 
     criterion = build_loss_function(train_loader, config, device)
+    eval_criterion = torch.nn.CrossEntropyLoss()
+    train_eval_loader = _evaluation_loader_from_training_loader(train_loader)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -672,6 +757,7 @@ def train_model(
     )
 
     history_rows: list[dict[str, Any]] = []
+    train_rows: list[dict[str, Any]] = []
     validation_rows: list[dict[str, Any]] = []
     best_score = -float("inf")
     best_epoch = 0
@@ -682,7 +768,7 @@ def train_model(
     last_checkpoint = checkpoints_dir / "last.pt"
 
     for epoch in range(1, config.epochs + 1):
-        train_loss = train_one_epoch(
+        train_objective_loss = train_one_epoch(
             model,
             train_loader,
             criterion,
@@ -690,24 +776,37 @@ def train_model(
             device,
             max_grad_norm=config.max_grad_norm,
         )
+        train_evaluation = evaluate_model(
+            model,
+            train_eval_loader,
+            eval_criterion,
+            device,
+            model_name=config.model_name,
+            split="train",
+        )
         validation = evaluate_model(
             model,
             val_loader,
-            criterion,
+            eval_criterion,
             device,
             model_name=config.model_name,
             split="validation",
         )
+        train_metrics = dict(train_evaluation["metrics"])
         validation_metrics = dict(validation["metrics"])
+        train_loss = float(train_evaluation["loss"])
         validation_loss = float(validation["loss"])
 
         history_row = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "train_objective_loss": train_objective_loss,
             "validation_loss": validation_loss,
+            **_prefix_metric_keys(train_metrics, "train"),
             **validation_metrics,
         }
         history_rows.append(history_row)
+        train_rows.append({"epoch": epoch, "loss": train_loss, **train_metrics})
         validation_rows.append(
             {"epoch": epoch, "loss": validation_loss, **validation_metrics}
         )
@@ -744,8 +843,10 @@ def train_model(
             break
 
     history = pd.DataFrame(history_rows)
+    train_metrics_df = pd.DataFrame(train_rows)
     validation_metrics_df = pd.DataFrame(validation_rows)
     history.to_csv(output_dir / "train_history.csv", index=False)
+    train_metrics_df.to_csv(output_dir / "train_metrics.csv", index=False)
     validation_metrics_df.to_csv(output_dir / "validation_metrics.csv", index=False)
 
     if not history.empty:

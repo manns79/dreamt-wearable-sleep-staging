@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +14,7 @@ from src.train import (  # noqa: E402
     build_stage9_screening_configs,
     build_stage10_comparison_configs,
     build_stage10_paired_dataloaders,
+    build_train_validation_datasets,
     class_counts_from_loader,
     class_weights_from_counts,
     evaluate_model,
@@ -170,9 +172,55 @@ def test_train_model_saves_validation_artifacts(tmp_path):
     assert result.best_epoch >= 1
     assert result.best_checkpoint_path.exists()
     assert result.last_checkpoint_path.exists()
-    assert (Path(tmp_path) / "train_history.csv").exists()
+    history = pd.read_csv(Path(tmp_path) / "train_history.csv")
+    assert "train_macro_f1" in history.columns
+    assert "train_objective_loss" in history.columns
+    assert (Path(tmp_path) / "train_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_confusion_matrix.csv").exists()
+
+
+def test_preprocessing_metadata_refits_when_training_subset_changes(tmp_path):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    _raw_frame(list(range(12))).to_csv(raw_dir / "S001_whole_df.csv", index=False)
+    _raw_frame(list(range(12, 24))).to_csv(raw_dir / "S002_whole_df.csv", index=False)
+    _raw_frame(list(range(24, 36))).to_csv(raw_dir / "S003_whole_df.csv", index=False)
+    epoch_index = pd.concat(
+        [
+            _epoch_index("S001", "train", ["Wake", "Non-REM", "REM"]),
+            _epoch_index("S002", "train", ["Wake", "Non-REM", "REM"]),
+            _epoch_index("S003", "validation", ["Wake", "Non-REM", "REM"]),
+        ],
+        ignore_index=True,
+    )
+    metadata_path = tmp_path / "metadata.json"
+    debug_config = TrainConfig(
+        raw_dir=raw_dir,
+        epoch_index_path=epoch_index,
+        preprocessing_metadata_path=metadata_path,
+        channels=("BVP",),
+        max_train_participants=1,
+        max_val_participants=1,
+    )
+    full_config = TrainConfig(
+        raw_dir=raw_dir,
+        epoch_index_path=epoch_index,
+        preprocessing_metadata_path=metadata_path,
+        channels=("BVP",),
+        max_train_participants=None,
+        max_val_participants=1,
+    )
+
+    build_train_validation_datasets(debug_config)
+    debug_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert debug_metadata["source_participants"] == ["S001"]
+    assert debug_metadata["n_epochs_fit"] == 3
+
+    build_train_validation_datasets(full_config)
+    full_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert full_metadata["source_participants"] == ["S001", "S002"]
+    assert full_metadata["n_epochs_fit"] == 6
 
 
 def test_stage10_paired_dataloaders_align_single_and_context_centers(tmp_path):
