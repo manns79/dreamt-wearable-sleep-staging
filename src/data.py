@@ -34,6 +34,7 @@ DEFAULT_PREPROCESSING_METADATA_PATH = (
 DEFAULT_INVENTORY_CHUNKSIZE = 500_000
 DEFAULT_EPOCH_INDEX_CHUNKSIZE = 500_000
 DEFAULT_MAX_CACHED_PARTICIPANTS = 4
+DEFAULT_DATASET_DTYPE = np.float32
 
 TIME_COLUMN = "TIMESTAMP"
 LABEL_COLUMN = "Sleep_Stage"
@@ -586,8 +587,8 @@ class DreamtEpochDataset:
     """PyTorch dataset for single DREAMT sleep epochs.
 
     Items are returned as ``(x, y)`` where ``x`` has shape
-    ``(channels, timepoints)`` and dtype ``torch.float64``. Labels are integer
-    class IDs using ``LABEL_TO_ID``.
+    ``(channels, timepoints)`` and dtype ``torch.float32`` by default. Labels
+    are integer class IDs using ``LABEL_TO_ID``.
     """
 
     def __init__(
@@ -600,9 +601,11 @@ class DreamtEpochDataset:
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
         max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
+        dtype: Any = DEFAULT_DATASET_DTYPE,
     ):
         self.channels = list(channels)
         self.preprocessing_stats = preprocessing_stats
+        self.dtype = np.dtype(dtype)
         valid_epochs = _load_valid_epoch_index(epoch_index)
         check_epoch_split_leakage(valid_epochs)
         self.epoch_index = _filter_epoch_index_for_split(
@@ -632,7 +635,7 @@ class DreamtEpochDataset:
             from src.preprocessing import apply_normalization
 
             x = apply_normalization(x, self.preprocessing_stats)
-        return x.astype(np.float64, copy=False)
+        return x.astype(self.dtype, copy=False)
 
     def __getitem__(self, index: int) -> tuple[Any, Any]:
         import torch
@@ -641,7 +644,7 @@ class DreamtEpochDataset:
         x = self.get_epoch_array(index)
         y = _label_to_id(row["mapped_label"])
         return (
-            torch.as_tensor(x, dtype=torch.float64),
+            torch.as_tensor(x),
             torch.tensor(y, dtype=torch.long),
         )
 
@@ -665,6 +668,7 @@ class DreamtContextDataset(DreamtEpochDataset):
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
         max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
+        dtype: Any = DEFAULT_DATASET_DTYPE,
     ):
         if context_radius < 0:
             raise ValueError("context_radius must be non-negative.")
@@ -678,6 +682,7 @@ class DreamtContextDataset(DreamtEpochDataset):
             participant_ids=participant_ids,
             max_participants=max_participants,
             max_cached_participants=max_cached_participants,
+            dtype=dtype,
         )
         self.window_positions = self._build_window_positions()
 
@@ -718,11 +723,11 @@ class DreamtContextDataset(DreamtEpochDataset):
 
         positions = self.window_positions[index]
         arrays = [self.get_epoch_array(position) for position in positions]
-        x = np.concatenate(arrays, axis=1).astype(np.float64, copy=False)
+        x = np.concatenate(arrays, axis=1).astype(self.dtype, copy=False)
         center_position = positions[self.context_radius]
         y = _label_to_id(self.epoch_index.iloc[center_position]["mapped_label"])
         return (
-            torch.as_tensor(x, dtype=torch.float64),
+            torch.as_tensor(x),
             torch.tensor(y, dtype=torch.long),
         )
 
@@ -750,6 +755,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
         max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
+        dtype: Any = DEFAULT_DATASET_DTYPE,
     ):
         if sequence_length <= 0:
             raise ValueError("sequence_length must be positive.")
@@ -773,6 +779,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
             participant_ids=participant_ids,
             max_participants=max_participants,
             max_cached_participants=max_cached_participants,
+            dtype=dtype,
         )
         self.sequence_positions = self._build_sequence_positions()
 
@@ -807,7 +814,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
 
         positions = self.sequence_positions[index]
         arrays = [self.get_epoch_array(position) for position in positions]
-        x = np.stack(arrays, axis=0).astype(np.float64, copy=False)
+        x = np.stack(arrays, axis=0).astype(self.dtype, copy=False)
         labels = [
             _label_to_id(self.epoch_index.iloc[position]["mapped_label"])
             for position in positions
@@ -816,7 +823,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
             y: Any = torch.as_tensor(labels, dtype=torch.long)
         else:
             y = torch.tensor(labels[self._target_index()], dtype=torch.long)
-        return torch.as_tensor(x, dtype=torch.float64), y
+        return torch.as_tensor(x), y
 
 
 def fit_normalization_stats(

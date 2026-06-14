@@ -59,7 +59,7 @@ def _epoch_index(participant_id, split, labels, rows_per_epoch=4):
     return pd.DataFrame(rows)
 
 
-def test_dreamt_epoch_dataset_returns_channel_first_float64_tensor():
+def test_dreamt_epoch_dataset_returns_channel_first_float32_tensor_by_default():
     output_dir = _test_output_dir("test-dreamt-epoch-dataset")
     raw_dir = output_dir / "raw"
     raw_dir.mkdir(parents=True)
@@ -79,9 +79,32 @@ def test_dreamt_epoch_dataset_returns_channel_first_float64_tensor():
     x, y = dataset[0]
 
     assert x.shape == (2, 4)
-    assert x.dtype == torch.float64
+    assert x.dtype == torch.float32
     assert y.item() == 0
-    assert torch.allclose(x[1], torch.full((4,), 13.0, dtype=torch.float64))
+    assert torch.allclose(x[1], torch.full((4,), 13.0, dtype=torch.float32))
+
+
+def test_dreamt_epoch_dataset_can_return_float64_tensor_when_requested():
+    output_dir = _test_output_dir("test-dreamt-epoch-dataset-float64")
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    _raw_frame([1.0, 2.0, 3.0, 4.0]).to_csv(
+        raw_dir / "S001_whole_df.csv",
+        index=False,
+    )
+    epoch_index = _epoch_index("S001", "train", ["Wake"])
+
+    dataset = DreamtEpochDataset(
+        raw_dir=raw_dir,
+        epoch_index=epoch_index,
+        split="train",
+        channels=["BVP"],
+        dtype=np.float64,
+    )
+
+    x, _ = dataset[0]
+
+    assert x.dtype == torch.float64
 
 
 def test_fit_normalization_stats_uses_training_participants_only_and_imputes():
@@ -158,6 +181,7 @@ def test_context_dataset_drops_edges_and_does_not_cross_participants():
 
     assert len(dataset) == 2
     assert x.shape == (1, 12)
+    assert x.dtype == torch.float32
     assert y.item() == 1
     assert dataset.window_positions[0] == [0, 1, 2]
     assert dataset.window_positions[1] == [3, 4, 5]
@@ -196,8 +220,10 @@ def test_sequence_dataset_supports_many_to_one_and_many_to_many_labels():
     x_many, y_many = many_to_many[0]
 
     assert x_one.shape == (3, 1, 4)
+    assert x_one.dtype == torch.float32
     assert y_one.item() == 1
     assert x_many.shape == (3, 1, 4)
+    assert x_many.dtype == torch.float32
     assert y_many.tolist() == [0, 1, 2]
 
 
@@ -236,4 +262,5 @@ def test_create_dataloaders_batches_dataset_shapes():
     x_batch, y_batch = next(iter(loaders["train"]))
 
     assert x_batch.shape == (2, 1, 4)
+    assert x_batch.dtype == torch.float32
     assert y_batch.tolist() == [0, 2]

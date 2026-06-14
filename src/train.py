@@ -61,6 +61,7 @@ class TrainConfig:
     random_seed: int = 42
     device: str = "auto"
     num_workers: int = 0
+    dataset_dtype: str = "float32"
     max_train_participants: int | None = None
     max_val_participants: int | None = None
     max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS
@@ -184,6 +185,12 @@ def _validate_training_config(config: TrainConfig) -> None:
         and config.max_cached_participants <= 0
     ):
         raise ValueError("max_cached_participants must be positive or None.")
+    try:
+        np.dtype(config.dataset_dtype)
+    except TypeError as exc:
+        raise ValueError(
+            f"dataset_dtype is not a valid NumPy dtype: {config.dataset_dtype}"
+        ) from exc
 
 
 def _load_or_fit_preprocessing_stats(config: TrainConfig) -> dict[str, object]:
@@ -199,6 +206,7 @@ def _load_or_fit_preprocessing_stats(config: TrainConfig) -> dict[str, object]:
         channels=channels,
         max_participants=config.max_train_participants,
         max_cached_participants=config.max_cached_participants,
+        dtype=config.dataset_dtype,
     )
     if metadata_path.exists():
         stats = load_preprocessing_metadata(metadata_path)
@@ -274,6 +282,7 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
         preprocessing_stats=stats,
         max_participants=config.max_train_participants,
         max_cached_participants=config.max_cached_participants,
+        dtype=config.dataset_dtype,
         **dataset_kwargs,
     )
     val_dataset = dataset_class(
@@ -284,6 +293,7 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
         preprocessing_stats=stats,
         max_participants=config.max_val_participants,
         max_cached_participants=config.max_cached_participants,
+        dtype=config.dataset_dtype,
         **dataset_kwargs,
     )
 
@@ -896,6 +906,7 @@ def stage9_experiment_id(config: TrainConfig) -> str:
         "model_name",
         "channels",
         "batch_size",
+        "dataset_dtype",
         "epochs",
         "learning_rate",
         "weight_decay",
@@ -1052,6 +1063,7 @@ def stage10_experiment_id(config: TrainConfig) -> str:
         "model_name",
         "channels",
         "batch_size",
+        "dataset_dtype",
         "epochs",
         "learning_rate",
         "weight_decay",
