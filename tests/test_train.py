@@ -359,6 +359,7 @@ def test_run_stage9_experiments_writes_ranked_summary(tmp_path, monkeypatch):
         "src.train.run_training_from_config",
         fake_run_training_from_config,
     )
+    monkeypatch.setattr("src.train._prefit_preprocessing_metadata", lambda configs: None)
     configs = [
         TrainConfig(output_dir=tmp_path, dropout=0.25),
         TrainConfig(output_dir=tmp_path, dropout=0.0),
@@ -445,6 +446,7 @@ def test_run_stage10_experiments_writes_ranked_summary(tmp_path, monkeypatch):
         fake_build_stage10_paired_dataloaders,
     )
     monkeypatch.setattr("src.train.train_model", fake_train_model)
+    monkeypatch.setattr("src.train._prefit_preprocessing_metadata", lambda configs: None)
     configs = build_stage10_comparison_configs(
         base_config=TrainConfig(output_dir=tmp_path),
         output_dir=tmp_path,

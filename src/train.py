@@ -257,6 +257,36 @@ def _preprocessing_stats_match_dataset(
     return True
 
 
+def _preprocessing_signature_value(value: object) -> tuple[str, object]:
+    """Return a stable-enough key for path-like or in-memory data sources."""
+    if isinstance(value, str | Path):
+        return ("path", str(Path(value)))
+    return ("object", id(value))
+
+
+def _preprocessing_config_signature(config: TrainConfig) -> tuple[object, ...]:
+    """Return the fields that determine reusable preprocessing metadata."""
+    return (
+        _preprocessing_signature_value(config.raw_dir),
+        _preprocessing_signature_value(config.epoch_index_path),
+        _preprocessing_signature_value(config.preprocessing_metadata_path),
+        tuple(config.channels),
+        config.max_train_participants,
+    )
+
+
+def _prefit_preprocessing_metadata(configs: Sequence[TrainConfig]) -> None:
+    """Fit or validate preprocessing metadata once per unique data signature."""
+    seen: set[tuple[object, ...]] = set()
+    for config in configs:
+        _validate_training_config(config)
+        signature = _preprocessing_config_signature(config)
+        if signature in seen:
+            continue
+        _load_or_fit_preprocessing_stats(config)
+        seen.add(signature)
+
+
 def _dataset_class_for_config(config: TrainConfig) -> type[DreamtEpochDataset]:
     if config.context_radius > 0:
         return DreamtContextDataset
@@ -987,6 +1017,7 @@ def run_stage9_experiments(
     runs_dir = stage_dir / "runs"
     stage_dir.mkdir(parents=True, exist_ok=True)
     runs_dir.mkdir(parents=True, exist_ok=True)
+    _prefit_preprocessing_metadata(configs)
 
     summary_rows: list[dict[str, Any]] = []
     history_frames: list[pd.DataFrame] = []
@@ -1149,6 +1180,7 @@ def run_stage10_experiments(
     runs_dir = stage_dir / "runs"
     stage_dir.mkdir(parents=True, exist_ok=True)
     runs_dir.mkdir(parents=True, exist_ok=True)
+    _prefit_preprocessing_metadata(configs)
 
     summary_rows: list[dict[str, Any]] = []
     history_frames: list[pd.DataFrame] = []
