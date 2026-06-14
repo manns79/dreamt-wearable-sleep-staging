@@ -125,7 +125,9 @@ def test_fit_normalization_stats_uses_training_participants_only_and_imputes():
     x, _ = normalized_dataset[0]
 
     assert loaded_stats["source_participants"] == ["S001"]
-    assert loaded_stats["median"]["BVP"] == 3.0
+    assert loaded_stats["imputation_strategy"] == "mean"
+    assert loaded_stats["mean"]["BVP"] == 3.0
+    assert "median" not in loaded_stats
     assert not torch.isnan(x).any()
     assert x[0, 1].item() == pytest.approx(0.0)
     assert loaded_stats["mean"]["BVP"] < 10

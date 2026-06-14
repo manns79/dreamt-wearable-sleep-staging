@@ -228,7 +228,10 @@ def _preprocessing_stats_match_dataset(
     if n_epochs_fit != len(dataset):
         return False
 
-    for key in ["mean", "std", "median"]:
+    if stats.get("imputation_strategy") != "mean":
+        return False
+
+    for key in ["mean", "std"]:
         values = stats.get(key)
         if not isinstance(values, Mapping):
             return False

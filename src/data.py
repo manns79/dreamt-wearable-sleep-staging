@@ -800,14 +800,19 @@ def fit_normalization_stats(
     split: str = "train",
     max_participants: int | None = None,
 ) -> dict[str, object]:
-    """Fit train-only imputation and standardization metadata for CNN tensors."""
-    from src.preprocessing import fit_channel_preprocessing_stats
+    """Fit train-only imputation and standardization metadata for CNN tensors.
+
+    The fitting pass streams one participant at a time and keeps only scalar
+    channel summaries in memory. Missing values are imputed with train-only
+    channel means, which avoids materializing all samples just to compute
+    medians.
+    """
 
     channels = list(channels)
-    values_by_channel: dict[str, list[float]] = {channel: [] for channel in channels}
 
     if isinstance(train_dataset_or_files, DreamtEpochDataset):
         dataset = train_dataset_or_files
+        channels = list(dataset.channels)
     else:
         participant_ids = [
             extract_participant_id(path) for path in train_dataset_or_files
@@ -824,16 +829,125 @@ def fit_normalization_stats(
     if len(dataset) == 0:
         raise ValueError("Cannot fit normalization stats on an empty training dataset.")
 
-    for position in range(len(dataset)):
-        x = dataset.get_epoch_array(position)
-        for channel_index, channel in enumerate(dataset.channels):
-            if channel in values_by_channel:
-                values_by_channel[channel].extend(x[channel_index].tolist())
-
-    stats = fit_channel_preprocessing_stats(values_by_channel)
+    stats = _fit_streaming_channel_preprocessing_stats(dataset, channels)
     stats["source_participants"] = sorted(dataset.participants)
     stats["n_epochs_fit"] = int(len(dataset))
     return stats
+
+
+def _new_channel_summary_accumulator(
+    channels: Iterable[str],
+) -> dict[str, dict[str, float | int]]:
+    """Create scalar accumulators for streaming channel statistics."""
+    return {
+        channel: {
+            "valid_count": 0,
+            "missing_count": 0,
+            "sum": 0.0,
+            "sum_squares": 0.0,
+        }
+        for channel in channels
+    }
+
+
+def _update_channel_summary(
+    accumulator: dict[str, float | int],
+    values: pd.Series,
+) -> None:
+    """Update one channel accumulator from a raw epoch slice."""
+    numeric = pd.to_numeric(values, errors="coerce")
+    missing_count = int(numeric.isna().sum())
+    valid = numeric.dropna()
+
+    accumulator["missing_count"] = int(accumulator["missing_count"]) + missing_count
+    if valid.empty:
+        return
+
+    array = valid.to_numpy(dtype=np.float64, copy=False)
+    accumulator["valid_count"] = int(accumulator["valid_count"]) + int(array.size)
+    accumulator["sum"] = float(accumulator["sum"]) + float(array.sum())
+    accumulator["sum_squares"] = float(accumulator["sum_squares"]) + float(
+        np.dot(array, array)
+    )
+
+
+def _finalize_streaming_channel_preprocessing_stats(
+    accumulators: dict[str, dict[str, float | int]],
+    epsilon: float,
+) -> dict[str, object]:
+    """Build preprocessing metadata from streaming channel summaries."""
+    means: dict[str, float] = {}
+    stds: dict[str, float] = {}
+    valid_counts: dict[str, int] = {}
+    missing_counts: dict[str, int] = {}
+
+    for channel, accumulator in accumulators.items():
+        valid_count = int(accumulator["valid_count"])
+        if valid_count == 0:
+            raise ValueError(
+                f"Cannot fit preprocessing stats for {channel}; all values are missing."
+            )
+
+        mean = float(accumulator["sum"]) / valid_count
+        second_moment = float(accumulator["sum_squares"]) / valid_count
+        variance = max(0.0, second_moment - mean**2)
+        std = float(np.sqrt(variance))
+        if not pd.notna(std) or std < epsilon:
+            std = float(epsilon)
+
+        means[channel] = mean
+        stds[channel] = std
+        valid_counts[channel] = valid_count
+        missing_counts[channel] = int(accumulator["missing_count"])
+
+    return {
+        "channels": list(accumulators),
+        "normalization": "standardization",
+        "imputation_strategy": "mean",
+        "epsilon": float(epsilon),
+        "mean": means,
+        "std": stds,
+        "valid_count": valid_counts,
+        "missing_count": missing_counts,
+        "fit_scope": "train",
+    }
+
+
+def _fit_streaming_channel_preprocessing_stats(
+    dataset: DreamtEpochDataset,
+    channels: list[str],
+) -> dict[str, object]:
+    """Fit channel stats by loading and releasing one participant at a time."""
+    from src.preprocessing import DEFAULT_NORMALIZATION_EPSILON
+
+    accumulators = _new_channel_summary_accumulator(channels)
+    file_lookup = dataset.signal_cache.file_lookup
+    raw_columns = _raw_columns_for_channels(channels)
+
+    for participant_id, participant_epochs in dataset.epoch_index.groupby(
+        "participant_id",
+        sort=True,
+    ):
+        participant_id = str(participant_id)
+        raw_df = load_participant_csv(file_lookup[participant_id], usecols=raw_columns)
+        signal_df = _add_derived_channels(raw_df, channels)[channels]
+
+        for _, epoch_row in participant_epochs.iterrows():
+            start_row = int(epoch_row["start_row"])
+            end_row = int(epoch_row["end_row"])
+            epoch_df = signal_df.iloc[start_row:end_row]
+            if epoch_df.empty:
+                raise ValueError(
+                    f"Epoch slice is empty for participant {participant_id}, "
+                    f"epoch {epoch_row['epoch_id']}."
+                )
+            for channel in channels:
+                _update_channel_summary(accumulators[channel], epoch_df[channel])
+
+    return _finalize_streaming_channel_preprocessing_stats(
+        accumulators,
+        epsilon=DEFAULT_NORMALIZATION_EPSILON,
+    )
 
 
 def apply_normalization(x: Any, stats: dict[str, object]) -> Any:

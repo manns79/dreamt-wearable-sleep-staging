@@ -44,7 +44,7 @@ P_AS_WAKE_LABEL_MAPPING_NOTE = (
     "convention; it should not be used for the main analysis."
 )
 DEFAULT_LABEL_MAPPING_CHUNKSIZE = 500_000
-DEFAULT_IMPUTATION_STRATEGY = "median"
+DEFAULT_IMPUTATION_STRATEGY = "mean"
 DEFAULT_NORMALIZATION_EPSILON = 1e-8
 LABEL_MAPPING_SUMMARY_COLUMNS = [
     "raw_label",
@@ -1157,12 +1157,13 @@ def fit_channel_preprocessing_stats(
         Mapping from channel name to training-only values. Missing and
         non-numeric values are ignored while fitting statistics.
     imputation_strategy:
-        Currently only ``"median"`` is supported.
+        ``"mean"`` is the memory-efficient default. ``"median"`` remains
+        supported for small in-memory callers and backward compatibility.
     epsilon:
         Minimum standard deviation used to avoid division by zero.
     """
-    if imputation_strategy != "median":
-        raise ValueError("Only median imputation is currently supported.")
+    if imputation_strategy not in {"mean", "median"}:
+        raise ValueError("imputation_strategy must be 'mean' or 'median'.")
     if epsilon <= 0:
         raise ValueError("epsilon must be positive.")
 
@@ -1190,22 +1191,25 @@ def fit_channel_preprocessing_stats(
 
         means[channel] = float(valid.mean())
         stds[channel] = std
-        medians[channel] = float(valid.median())
+        if imputation_strategy == "median":
+            medians[channel] = float(valid.median())
         counts[channel] = int(valid.shape[0])
         missing_counts[channel] = int(series.isna().sum())
 
-    return {
+    stats: dict[str, object] = {
         "channels": channels,
         "normalization": "standardization",
         "imputation_strategy": imputation_strategy,
         "epsilon": float(epsilon),
         "mean": means,
         "std": stds,
-        "median": medians,
         "valid_count": counts,
         "missing_count": missing_counts,
         "fit_scope": "train",
     }
+    if imputation_strategy == "median":
+        stats["median"] = medians
+    return stats
 
 
 def impute_missing_values(x: Any, stats: dict[str, object]) -> Any:
@@ -1213,9 +1217,17 @@ def impute_missing_values(x: Any, stats: dict[str, object]) -> Any:
     import numpy as np
 
     channels = list(stats.get("channels", []))
-    medians = stats.get("median", {})
-    if not channels or not isinstance(medians, dict):
-        raise ValueError("stats must contain channels and median mappings.")
+    imputation_strategy = stats.get("imputation_strategy", DEFAULT_IMPUTATION_STRATEGY)
+    if imputation_strategy == "median":
+        fill_values = stats.get("median", {})
+        value_name = "median"
+    elif imputation_strategy == "mean":
+        fill_values = stats.get("mean", {})
+        value_name = "mean"
+    else:
+        raise ValueError("stats imputation_strategy must be 'mean' or 'median'.")
+    if not channels or not isinstance(fill_values, dict):
+        raise ValueError(f"stats must contain channels and {value_name} mappings.")
 
     arr = np.asarray(x, dtype=np.float64).copy()
     if arr.ndim < 2:
@@ -1230,7 +1242,7 @@ def impute_missing_values(x: Any, stats: dict[str, object]) -> Any:
 
     moved = np.moveaxis(arr, channel_axis, 0)
     for channel_index, channel in enumerate(channels):
-        fill_value = float(medians[channel])
+        fill_value = float(fill_values[channel])
         channel_values = moved[channel_index]
         moved[channel_index] = np.where(
             np.isnan(channel_values),
