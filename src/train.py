@@ -82,6 +82,65 @@ class TrainingResult:
     output_dir: Path
 
 
+class ParticipantBlockSampler:
+    """Yield dataset indices grouped by participant with shuffled block order.
+
+    This keeps lazy participant-level caches effective while still changing the
+    participant order and within-participant epoch order each training epoch.
+    """
+
+    def __init__(self, dataset: Any, seed: int = 42):
+        if len(dataset) == 0:
+            raise ValueError("Cannot sample from an empty dataset.")
+        self.dataset = dataset
+        self.seed = int(seed)
+        self._iteration = 0
+        self._blocks = self._build_participant_blocks(dataset)
+
+    def __len__(self) -> int:
+        return sum(len(indices) for indices in self._blocks.values())
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self._iteration)
+        self._iteration += 1
+
+        participant_ids = list(self._blocks)
+        rng.shuffle(participant_ids)
+        for participant_id in participant_ids:
+            indices = np.array(self._blocks[participant_id], dtype=int)
+            rng.shuffle(indices)
+            yield from indices.tolist()
+
+    @classmethod
+    def _build_participant_blocks(cls, dataset: Any) -> dict[str, list[int]]:
+        blocks: dict[str, list[int]] = {}
+        for index in range(len(dataset)):
+            participant_id = cls._participant_id_for_index(dataset, index)
+            blocks.setdefault(participant_id, []).append(index)
+        return blocks
+
+    @classmethod
+    def _participant_id_for_index(cls, dataset: Any, index: int) -> str:
+        if hasattr(dataset, "indices") and hasattr(dataset, "dataset"):
+            parent_index = int(dataset.indices[index])
+            return cls._participant_id_for_index(dataset.dataset, parent_index)
+
+        if (
+            hasattr(dataset, "epoch_index")
+            and hasattr(dataset, "window_positions")
+            and hasattr(dataset, "context_radius")
+        ):
+            center_position = int(
+                dataset.window_positions[index][dataset.context_radius]
+            )
+            return str(dataset.epoch_index.iloc[center_position]["participant_id"])
+
+        if hasattr(dataset, "epoch_index"):
+            return str(dataset.epoch_index.iloc[index]["participant_id"])
+
+        return "__all__"
+
+
 def _require_torch() -> Any:
     try:
         import torch
@@ -347,13 +406,16 @@ def _build_dataloaders_from_datasets(
     config: TrainConfig,
 ) -> dict[str, Any]:
     torch = _require_torch()
+    train_sampler = ParticipantBlockSampler(
+        datasets["train"],
+        seed=config.random_seed,
+    )
     return {
         "train": torch.utils.data.DataLoader(
             datasets["train"],
             batch_size=config.batch_size,
-            shuffle=True,
+            sampler=train_sampler,
             num_workers=config.num_workers,
-            generator=_new_seeded_generator(config.random_seed),
         ),
         "validation": torch.utils.data.DataLoader(
             datasets["validation"],

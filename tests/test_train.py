@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 
 from src.models import SleepStageCNN  # noqa: E402
 from src.train import (  # noqa: E402
+    ParticipantBlockSampler,
     TrainConfig,
     TrainingResult,
     build_loss_function,
@@ -46,6 +47,31 @@ class SyntheticEpochDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         return self.x[index], self.y[index]
+
+
+class SyntheticParticipantDataset(torch.utils.data.Dataset):
+    def __init__(self):
+        self.epoch_index = pd.DataFrame(
+            {
+                "participant_id": [
+                    "S001",
+                    "S001",
+                    "S001",
+                    "S002",
+                    "S002",
+                    "S003",
+                    "S003",
+                    "S003",
+                    "S003",
+                ],
+            }
+        )
+
+    def __len__(self):
+        return len(self.epoch_index)
+
+    def __getitem__(self, index):
+        return torch.tensor([index], dtype=torch.float32), torch.tensor(0)
 
 
 def _loader(dataset, batch_size=4, shuffle=False):
@@ -178,6 +204,54 @@ def test_train_model_saves_validation_artifacts(tmp_path):
     assert (Path(tmp_path) / "train_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_confusion_matrix.csv").exists()
+
+
+def test_participant_block_sampler_groups_and_shuffles_participant_blocks():
+    dataset = SyntheticParticipantDataset()
+    sampler = ParticipantBlockSampler(dataset, seed=3)
+
+    order = list(iter(sampler))
+    participant_order = dataset.epoch_index.iloc[order]["participant_id"].tolist()
+    block_order = [
+        participant
+        for participant, previous in zip(
+            participant_order,
+            [None, *participant_order[:-1]],
+            strict=True,
+        )
+        if participant != previous
+    ]
+
+    assert sorted(order) == list(range(len(dataset)))
+    assert len(block_order) == dataset.epoch_index["participant_id"].nunique()
+    for participant_id, group in dataset.epoch_index.groupby("participant_id"):
+        positions = [order.index(index) for index in group.index]
+        assert max(positions) - min(positions) + 1 == len(positions), participant_id
+    assert order != list(range(len(dataset)))
+
+
+def test_participant_block_sampler_handles_subset_indices():
+    dataset = SyntheticParticipantDataset()
+    subset = torch.utils.data.Subset(dataset, [0, 2, 3, 5, 6])
+    sampler = ParticipantBlockSampler(subset, seed=7)
+
+    order = list(iter(sampler))
+    parent_order = [subset.indices[index] for index in order]
+    participant_order = (
+        dataset.epoch_index.iloc[parent_order]["participant_id"].tolist()
+    )
+
+    assert sorted(order) == list(range(len(subset)))
+    assert participant_order.count("S001") == 2
+    assert participant_order.count("S002") == 1
+    assert participant_order.count("S003") == 2
+    for participant_id in set(participant_order):
+        positions = [
+            position
+            for position, participant in enumerate(participant_order)
+            if participant == participant_id
+        ]
+        assert max(positions) - min(positions) + 1 == len(positions)
 
 
 def test_preprocessing_metadata_refits_when_training_subset_changes(tmp_path):
@@ -359,7 +433,10 @@ def test_run_stage9_experiments_writes_ranked_summary(tmp_path, monkeypatch):
         "src.train.run_training_from_config",
         fake_run_training_from_config,
     )
-    monkeypatch.setattr("src.train._prefit_preprocessing_metadata", lambda configs: None)
+    monkeypatch.setattr(
+        "src.train._prefit_preprocessing_metadata",
+        lambda configs: None,
+    )
     configs = [
         TrainConfig(output_dir=tmp_path, dropout=0.25),
         TrainConfig(output_dir=tmp_path, dropout=0.0),
@@ -446,7 +523,10 @@ def test_run_stage10_experiments_writes_ranked_summary(tmp_path, monkeypatch):
         fake_build_stage10_paired_dataloaders,
     )
     monkeypatch.setattr("src.train.train_model", fake_train_model)
-    monkeypatch.setattr("src.train._prefit_preprocessing_metadata", lambda configs: None)
+    monkeypatch.setattr(
+        "src.train._prefit_preprocessing_metadata",
+        lambda configs: None,
+    )
     configs = build_stage10_comparison_configs(
         base_config=TrainConfig(output_dir=tmp_path),
         output_dir=tmp_path,
