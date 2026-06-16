@@ -1,11 +1,13 @@
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from src.data import (
     DreamtEpochDataset,
+    build_participant_array_cache,
     check_no_participant_overlap,
     create_participant_split,
     load_split_assignments,
@@ -84,6 +86,47 @@ def test_dreamt_epoch_dataset_bounds_participant_signal_cache():
     dataset.get_epoch_array(0)
     assert dataset.signal_cache.load_count == 4
     assert list(dataset.signal_cache._cache) == ["S002", "S001"]
+
+
+def test_dreamt_epoch_dataset_can_use_participant_array_cache(tmp_path):
+    raw_dir = tmp_path / "raw"
+    cache_dir = tmp_path / "processed" / "deep" / "participants"
+    raw_dir.mkdir(parents=True)
+    _raw_frame([1.0, 2.0, 3.0, 4.0]).to_csv(
+        raw_dir / "S001_whole_df.csv",
+        index=False,
+    )
+    epoch_index = _epoch_index(["S001"])
+    epoch_index.loc[0, "end_row"] = 4
+
+    manifest = build_participant_array_cache(
+        raw_dir=raw_dir,
+        output_dir=cache_dir,
+        channels=["BVP"],
+    )
+    raw_dataset = DreamtEpochDataset(
+        raw_dir=raw_dir,
+        epoch_index=epoch_index,
+        split="train",
+        channels=["BVP"],
+    )
+    cached_dataset = DreamtEpochDataset(
+        raw_dir=raw_dir,
+        epoch_index=epoch_index,
+        split="train",
+        channels=["BVP"],
+        participant_array_cache_dir=cache_dir,
+    )
+
+    np.testing.assert_allclose(
+        cached_dataset.get_epoch_array(0),
+        raw_dataset.get_epoch_array(0),
+    )
+    assert manifest["channels"] == ["BVP"]
+    assert (cache_dir / "manifest.json").exists()
+    assert cached_dataset.signal_cache.load_count == 1
+    cached_dataset.get_epoch_array(0)
+    assert cached_dataset.signal_cache.load_count == 1
 
 
 def test_create_participant_split_assigns_every_participant_once():

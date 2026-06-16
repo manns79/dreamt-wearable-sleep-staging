@@ -17,6 +17,8 @@ import pandas as pd
 from src.data import (
     DEFAULT_EPOCH_INDEX_PATH,
     DEFAULT_MAX_CACHED_PARTICIPANTS,
+    DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
+    PARTICIPANT_ARRAY_CACHE_MANIFEST,
     DEFAULT_PREPROCESSING_METADATA_PATH,
     DEFAULT_RAW_DATA_DIR,
     EXPECTED_SIGNAL_COLUMNS,
@@ -25,6 +27,7 @@ from src.data import (
     TARGET_LABELS,
     DreamtContextDataset,
     DreamtEpochDataset,
+    build_participant_array_cache,
     fit_normalization_stats,
     load_preprocessing_metadata,
     save_preprocessing_metadata,
@@ -64,6 +67,7 @@ class TrainConfig:
     num_workers: int = 0
     train_eval_interval: int | None = 1
     dataset_dtype: str = "float32"
+    participant_array_cache_dir: str | Path | None = None
     max_train_participants: int | None = None
     max_val_participants: int | None = None
     max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS
@@ -261,11 +265,32 @@ def _validate_training_config(config: TrainConfig) -> None:
         ) from exc
 
 
+def _ensure_participant_array_cache(config: TrainConfig) -> None:
+    """Build the participant array cache when configured and not yet present."""
+
+    if config.participant_array_cache_dir is None:
+        return
+
+    manifest_path = (
+        Path(config.participant_array_cache_dir) / PARTICIPANT_ARRAY_CACHE_MANIFEST
+    )
+    if manifest_path.exists():
+        return
+
+    build_participant_array_cache(
+        raw_dir=config.raw_dir,
+        output_dir=config.participant_array_cache_dir,
+        channels=config.channels,
+        dtype=config.dataset_dtype,
+    )
+
+
 def _load_or_fit_preprocessing_stats(config: TrainConfig) -> dict[str, object]:
     """Load saved train-only preprocessing stats, fitting them if needed."""
 
     metadata_path = Path(config.preprocessing_metadata_path)
     channels = list(config.channels)
+    _ensure_participant_array_cache(config)
 
     train_unscaled = DreamtEpochDataset(
         raw_dir=config.raw_dir,
@@ -274,6 +299,7 @@ def _load_or_fit_preprocessing_stats(config: TrainConfig) -> dict[str, object]:
         channels=channels,
         max_participants=config.max_train_participants,
         max_cached_participants=config.max_cached_participants,
+        participant_array_cache_dir=config.participant_array_cache_dir,
         dtype=config.dataset_dtype,
     )
     if metadata_path.exists():
@@ -338,6 +364,7 @@ def _preprocessing_config_signature(config: TrainConfig) -> tuple[object, ...]:
         _preprocessing_signature_value(config.raw_dir),
         _preprocessing_signature_value(config.epoch_index_path),
         _preprocessing_signature_value(config.preprocessing_metadata_path),
+        _preprocessing_signature_value(config.participant_array_cache_dir),
         tuple(config.channels),
         config.max_train_participants,
     )
@@ -380,6 +407,7 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
         preprocessing_stats=stats,
         max_participants=config.max_train_participants,
         max_cached_participants=config.max_cached_participants,
+        participant_array_cache_dir=config.participant_array_cache_dir,
         dtype=config.dataset_dtype,
         **dataset_kwargs,
     )
@@ -391,6 +419,7 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
         preprocessing_stats=stats,
         max_participants=config.max_val_participants,
         max_cached_participants=config.max_cached_participants,
+        participant_array_cache_dir=config.participant_array_cache_dir,
         dtype=config.dataset_dtype,
         **dataset_kwargs,
     )
@@ -1128,6 +1157,7 @@ def stage9_experiment_id(config: TrainConfig) -> str:
         "channels",
         "batch_size",
         "dataset_dtype",
+        "participant_array_cache_dir",
         "epochs",
         "learning_rate",
         "weight_decay",
@@ -1161,7 +1191,10 @@ def build_stage9_screening_configs(
 ) -> list[TrainConfig]:
     """Create the default Stage 9 screening grid for the single-epoch CNN."""
 
-    base = base_config or TrainConfig(train_eval_interval=None)
+    base = base_config or TrainConfig(
+        train_eval_interval=None,
+        participant_array_cache_dir=DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
+    )
     configs: list[TrainConfig] = []
     for learning_rate, dropout, weight_decay, class_weighting, batch_size in product(
         learning_rates,
@@ -1287,6 +1320,7 @@ def stage10_experiment_id(config: TrainConfig) -> str:
         "channels",
         "batch_size",
         "dataset_dtype",
+        "participant_array_cache_dir",
         "epochs",
         "learning_rate",
         "weight_decay",
@@ -1331,6 +1365,7 @@ def build_stage10_comparison_configs(
         epochs=40,
         patience=8,
         train_eval_interval=None,
+        participant_array_cache_dir=DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
     )
     configs: list[TrainConfig] = []
     for radius in context_radii:

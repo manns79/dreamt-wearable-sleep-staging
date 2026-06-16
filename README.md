@@ -144,10 +144,17 @@ without crossing participant boundaries, and `DreamtSequenceDataset` creates
 CNN-GRU-style inputs shaped `(sequence_length, channels, timepoints)` with both
 many-to-one and many-to-many label support.
 
-Preprocessing metadata is fit from training participants only using median
+Preprocessing metadata is fit from training participants only using mean
 imputation and per-channel standardization, then saved locally at:
 
 - `data/processed/preprocessing_metadata.json`
+
+For repeated CNN training, raw participant CSVs can be converted once into
+per-participant `.npy` arrays under `data/processed/deep/participants/`.
+Stage 9 and Stage 10 notebook configs opt into this processed cache with
+`participant_array_cache_dir`; the first configured run builds the cache if its
+manifest is missing, and later runs memory-map the arrays instead of reparsing
+CSV files.
 
 Validation datasets apply the saved training metadata. The held-out test split
 remains unused for model prediction and performance reporting until the final

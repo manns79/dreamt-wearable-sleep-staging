@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,10 @@ DEFAULT_PROCESSED_DATA_DIR = Path("data/processed")
 DEFAULT_PREPROCESSING_METADATA_PATH = (
     DEFAULT_PROCESSED_DATA_DIR / "preprocessing_metadata.json"
 )
+DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR = (
+    DEFAULT_PROCESSED_DATA_DIR / "deep" / "participants"
+)
+PARTICIPANT_ARRAY_CACHE_MANIFEST = "manifest.json"
 DEFAULT_INVENTORY_CHUNKSIZE = 500_000
 DEFAULT_EPOCH_INDEX_CHUNKSIZE = 500_000
 DEFAULT_MAX_CACHED_PARTICIPANTS = 4
@@ -507,6 +511,138 @@ def _add_derived_channels(df: pd.DataFrame, channels: Iterable[str]) -> pd.DataF
     return output
 
 
+def _participant_array_manifest_path(cache_dir: str | Path) -> Path:
+    return Path(cache_dir) / PARTICIPANT_ARRAY_CACHE_MANIFEST
+
+
+def _participant_array_file_name(participant_id: str) -> str:
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(participant_id).strip())
+    if not safe_id:
+        raise ValueError("Participant ID must not be empty.")
+    return f"{safe_id}.npy"
+
+
+def _load_participant_array_manifest(cache_dir: str | Path) -> dict[str, Any]:
+    manifest_path = _participant_array_manifest_path(cache_dir)
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            "Participant array cache manifest does not exist: "
+            f"{manifest_path}"
+        )
+    with manifest_path.open("r", encoding="utf-8") as file:
+        manifest = json.load(file)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Invalid participant array cache manifest: {manifest_path}")
+    return manifest
+
+
+def _participant_array_manifest_matches_channels(
+    manifest: Mapping[str, object],
+    channels: Iterable[str],
+) -> bool:
+    return list(manifest.get("channels", [])) == list(channels)
+
+
+def build_participant_array_cache(
+    raw_dir: str | Path = DEFAULT_RAW_DATA_DIR,
+    output_dir: str | Path = DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
+    channels: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+    participant_ids: Iterable[str] | None = None,
+    pattern: str = DEFAULT_PARTICIPANT_PATTERN,
+    dtype: Any = DEFAULT_DATASET_DTYPE,
+    overwrite: bool = False,
+) -> dict[str, object]:
+    """Build per-participant NumPy arrays for faster deep-learning slicing.
+
+    Each participant is stored as one ``.npy`` array shaped
+    ``(rows, channels)``. Arrays are intentionally not compressed so they can be
+    loaded quickly and memory-mapped during training.
+    """
+
+    channels = list(channels)
+    array_dtype = np.dtype(dtype)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    manifest_path = _participant_array_manifest_path(output_path)
+
+    if manifest_path.exists() and not overwrite:
+        existing_manifest = _load_participant_array_manifest(output_path)
+        if not _participant_array_manifest_matches_channels(
+            existing_manifest,
+            channels,
+        ):
+            raise ValueError(
+                "Existing participant array cache uses different channels. "
+                "Use overwrite=True or a different output_dir."
+            )
+
+    file_lookup = {
+        extract_participant_id(path): path
+        for path in list_participant_csvs(raw_dir, pattern=pattern)
+    }
+    if participant_ids is None:
+        selected_ids = sorted(file_lookup)
+    else:
+        selected_ids = sorted(
+            str(participant_id).strip() for participant_id in participant_ids
+        )
+
+    missing_ids = sorted(set(selected_ids) - set(file_lookup))
+    if missing_ids:
+        raise FileNotFoundError(
+            "Raw CSV file(s) were not found for participant(s): "
+            f"{missing_ids}"
+        )
+
+    raw_columns = _raw_columns_for_channels(channels)
+    participants: dict[str, dict[str, object]] = {}
+    for participant_id in selected_ids:
+        file_name = _participant_array_file_name(participant_id)
+        array_path = output_path / file_name
+
+        if array_path.exists() and not overwrite:
+            array = np.load(array_path, mmap_mode="r", allow_pickle=False)
+            if array.ndim != 2 or array.shape[1] != len(channels):
+                raise ValueError(
+                    "Existing participant array has unexpected shape: "
+                    f"{array_path}"
+                )
+            n_rows = int(array.shape[0])
+        else:
+            raw_df = load_participant_csv(
+                file_lookup[participant_id],
+                usecols=raw_columns,
+            )
+            signal_df = _add_derived_channels(raw_df, channels)
+            columns = [
+                pd.to_numeric(signal_df[channel], errors="coerce").to_numpy(
+                    dtype=array_dtype,
+                    copy=True,
+                )
+                for channel in channels
+            ]
+            array = np.column_stack(columns).astype(array_dtype, copy=False)
+            np.save(array_path, array, allow_pickle=False)
+            n_rows = int(array.shape[0])
+
+        participants[participant_id] = {
+            "file": file_name,
+            "n_rows": n_rows,
+        }
+
+    manifest: dict[str, object] = {
+        "version": 1,
+        "format": "npy_rows_by_channels",
+        "channels": channels,
+        "dtype": array_dtype.name,
+        "participants": participants,
+    }
+    with manifest_path.open("w", encoding="utf-8") as file:
+        json.dump(manifest, file, indent=2, sort_keys=True)
+        file.write("\n")
+    return manifest
+
+
 class _ParticipantSignalCache:
     """Lazy participant-level raw signal cache for epoch/window slicing."""
 
@@ -555,27 +691,106 @@ class _ParticipantSignalCache:
         return self._cache[participant_id]
 
 
+class _ParticipantArrayCache:
+    """Lazy participant-level NumPy array cache for epoch/window slicing."""
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        channels: Iterable[str],
+        max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
+    ):
+        if max_cached_participants is not None and max_cached_participants <= 0:
+            raise ValueError(
+                "max_cached_participants must be positive or None for no limit."
+            )
+        self.cache_dir = Path(cache_dir)
+        self.channels = list(channels)
+        self.max_cached_participants = max_cached_participants
+        self.manifest = _load_participant_array_manifest(self.cache_dir)
+        if not _participant_array_manifest_matches_channels(
+            self.manifest,
+            self.channels,
+        ):
+            raise ValueError(
+                "Participant array cache channels do not match requested channels."
+            )
+        participants = self.manifest.get("participants")
+        if not isinstance(participants, Mapping):
+            raise ValueError(
+                "Participant array cache manifest is missing participants."
+            )
+        self.participants = {
+            str(participant_id): dict(info)
+            for participant_id, info in participants.items()
+        }
+        self._cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self.load_count = 0
+
+    def require_participants(self, participant_ids: Iterable[str]) -> None:
+        missing_ids = sorted(set(participant_ids) - set(self.participants))
+        if missing_ids:
+            raise FileNotFoundError(
+                "Participant array cache file(s) were not found for participant(s): "
+                f"{missing_ids}"
+            )
+
+    def get(self, participant_id: str) -> np.ndarray:
+        if participant_id in self._cache:
+            self._cache.move_to_end(participant_id)
+        else:
+            participant_info = self.participants[participant_id]
+            array_path = self.cache_dir / str(participant_info["file"])
+            if not array_path.exists():
+                raise FileNotFoundError(
+                    f"Participant array cache file does not exist: {array_path}"
+                )
+            self.load_count += 1
+            array = np.load(array_path, mmap_mode="r", allow_pickle=False)
+            if array.ndim != 2 or array.shape[1] != len(self.channels):
+                raise ValueError(
+                    "Participant array cache file has unexpected shape: "
+                    f"{array_path}"
+                )
+            self._cache[participant_id] = array
+            if (
+                self.max_cached_participants is not None
+                and len(self._cache) > self.max_cached_participants
+            ):
+                self._cache.popitem(last=False)
+        return self._cache[participant_id]
+
+
 def _epoch_row_to_array(
     epoch_row: pd.Series,
-    signal_cache: _ParticipantSignalCache,
+    signal_cache: _ParticipantSignalCache | _ParticipantArrayCache,
     channels: list[str],
 ) -> np.ndarray:
     participant_id = str(epoch_row["participant_id"])
     start_row = int(epoch_row["start_row"])
     end_row = int(epoch_row["end_row"])
-    raw_df = signal_cache.get(participant_id)
-    epoch_df = raw_df.iloc[start_row:end_row]
-    if epoch_df.empty:
+    raw_data = signal_cache.get(participant_id)
+    if isinstance(raw_data, pd.DataFrame):
+        epoch_df = raw_data.iloc[start_row:end_row]
+        if epoch_df.empty:
+            raise ValueError(
+                f"Epoch slice is empty for participant {participant_id}, "
+                f"epoch {epoch_row['epoch_id']}."
+            )
+        return (
+            epoch_df[channels]
+            .apply(pd.to_numeric, errors="coerce")
+            .to_numpy(dtype=np.float64)
+            .T
+        )
+
+    epoch_array = raw_data[start_row:end_row]
+    if epoch_array.shape[0] == 0:
         raise ValueError(
             f"Epoch slice is empty for participant {participant_id}, "
             f"epoch {epoch_row['epoch_id']}."
         )
-    return (
-        epoch_df[channels]
-        .apply(pd.to_numeric, errors="coerce")
-        .to_numpy(dtype=np.float64)
-        .T
-    )
+    return np.asarray(epoch_array.T, dtype=np.float64)
 
 
 def _label_to_id(label: object) -> int:
@@ -603,6 +818,7 @@ class DreamtEpochDataset:
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
         max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
+        participant_array_cache_dir: str | Path | None = None,
         dtype: Any = DEFAULT_DATASET_DTYPE,
     ):
         self.channels = list(channels)
@@ -616,11 +832,18 @@ class DreamtEpochDataset:
             participant_ids=participant_ids,
             max_participants=max_participants,
         )
-        self.signal_cache = _ParticipantSignalCache(
-            raw_dir,
-            self.channels,
-            max_cached_participants=max_cached_participants,
-        )
+        if participant_array_cache_dir is None:
+            self.signal_cache = _ParticipantSignalCache(
+                raw_dir,
+                self.channels,
+                max_cached_participants=max_cached_participants,
+            )
+        else:
+            self.signal_cache = _ParticipantArrayCache(
+                participant_array_cache_dir,
+                self.channels,
+                max_cached_participants=max_cached_participants,
+            )
         self.signal_cache.require_participants(self.epoch_index["participant_id"])
 
     def __len__(self) -> int:
@@ -670,6 +893,7 @@ class DreamtContextDataset(DreamtEpochDataset):
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
         max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
+        participant_array_cache_dir: str | Path | None = None,
         dtype: Any = DEFAULT_DATASET_DTYPE,
     ):
         if context_radius < 0:
@@ -684,6 +908,7 @@ class DreamtContextDataset(DreamtEpochDataset):
             participant_ids=participant_ids,
             max_participants=max_participants,
             max_cached_participants=max_cached_participants,
+            participant_array_cache_dir=participant_array_cache_dir,
             dtype=dtype,
         )
         self.window_positions = self._build_window_positions()
@@ -757,6 +982,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
         max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
+        participant_array_cache_dir: str | Path | None = None,
         dtype: Any = DEFAULT_DATASET_DTYPE,
     ):
         if sequence_length <= 0:
@@ -781,6 +1007,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
             participant_ids=participant_ids,
             max_participants=max_participants,
             max_cached_participants=max_cached_participants,
+            participant_array_cache_dir=participant_array_cache_dir,
             dtype=dtype,
         )
         self.sequence_positions = self._build_sequence_positions()
@@ -957,28 +1184,38 @@ def _fit_streaming_channel_preprocessing_stats(
     from src.preprocessing import DEFAULT_NORMALIZATION_EPSILON
 
     accumulators = _new_channel_summary_accumulator(channels)
-    file_lookup = dataset.signal_cache.file_lookup
-    raw_columns = _raw_columns_for_channels(channels)
 
     for participant_id, participant_epochs in dataset.epoch_index.groupby(
         "participant_id",
         sort=True,
     ):
         participant_id = str(participant_id)
-        raw_df = load_participant_csv(file_lookup[participant_id], usecols=raw_columns)
-        signal_df = _add_derived_channels(raw_df, channels)[channels]
+        signal_data = dataset.signal_cache.get(participant_id)
 
         for _, epoch_row in participant_epochs.iterrows():
             start_row = int(epoch_row["start_row"])
             end_row = int(epoch_row["end_row"])
-            epoch_df = signal_df.iloc[start_row:end_row]
-            if epoch_df.empty:
-                raise ValueError(
-                    f"Epoch slice is empty for participant {participant_id}, "
-                    f"epoch {epoch_row['epoch_id']}."
-                )
-            for channel in channels:
-                _update_channel_summary(accumulators[channel], epoch_df[channel])
+            if isinstance(signal_data, pd.DataFrame):
+                epoch_df = signal_data.iloc[start_row:end_row]
+                if epoch_df.empty:
+                    raise ValueError(
+                        f"Epoch slice is empty for participant {participant_id}, "
+                        f"epoch {epoch_row['epoch_id']}."
+                    )
+                for channel in channels:
+                    _update_channel_summary(accumulators[channel], epoch_df[channel])
+            else:
+                epoch_array = signal_data[start_row:end_row]
+                if epoch_array.shape[0] == 0:
+                    raise ValueError(
+                        f"Epoch slice is empty for participant {participant_id}, "
+                        f"epoch {epoch_row['epoch_id']}."
+                    )
+                for channel_index, channel in enumerate(channels):
+                    _update_channel_summary(
+                        accumulators[channel],
+                        pd.Series(epoch_array[:, channel_index]),
+                    )
 
     return _finalize_streaming_channel_preprocessing_stats(
         accumulators,
