@@ -206,6 +206,68 @@ def test_train_model_saves_validation_artifacts(tmp_path):
     assert (Path(tmp_path) / "validation_confusion_matrix.csv").exists()
 
 
+def test_train_model_respects_train_eval_interval(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_evaluate_model(
+        model,
+        dataloader,
+        criterion,
+        device,
+        model_name,
+        split="validation",
+    ):
+        calls.append(split)
+        metrics = {
+            "model": model_name,
+            "split": split,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "macro_f1": 1.0,
+        }
+        confusion = pd.DataFrame(
+            [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            index=["true_Wake", "true_Non-REM", "true_REM"],
+            columns=["pred_Wake", "pred_Non-REM", "pred_REM"],
+        )
+        return {"loss": 0.1, "metrics": metrics, "confusion_matrix": confusion}
+
+    monkeypatch.setattr("src.train.evaluate_model", fake_evaluate_model)
+    dataset = SyntheticEpochDataset(n_examples=18)
+    train_loader = _loader(dataset, batch_size=6, shuffle=True)
+    val_loader = _loader(dataset, batch_size=6, shuffle=False)
+    config = TrainConfig(
+        output_dir=tmp_path,
+        channels=tuple(dataset.channels),
+        batch_size=6,
+        epochs=3,
+        patience=5,
+        train_eval_interval=2,
+    )
+
+    train_model(train_loader, val_loader, config)
+
+    history = pd.read_csv(Path(tmp_path) / "train_history.csv")
+    assert calls.count("validation") == 3
+    assert calls.count("train") == 1
+    assert history["train_eval_ran"].tolist() == [False, True, False]
+    assert history["train_macro_f1"].isna().tolist() == [True, False, True]
+
+
+def test_train_eval_interval_must_not_exceed_epochs(tmp_path):
+    dataset = SyntheticEpochDataset(n_examples=6)
+    loader = _loader(dataset, batch_size=3)
+    config = TrainConfig(
+        output_dir=tmp_path,
+        channels=tuple(dataset.channels),
+        epochs=2,
+        train_eval_interval=3,
+    )
+
+    with pytest.raises(ValueError, match="train_eval_interval"):
+        train_model(loader, loader, config)
+
+
 def test_participant_block_sampler_groups_and_shuffles_participant_blocks():
     dataset = SyntheticParticipantDataset()
     sampler = ParticipantBlockSampler(dataset, seed=3)

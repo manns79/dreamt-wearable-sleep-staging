@@ -161,6 +161,9 @@ purpose is to prove that the deep learning plumbing is trustworthy before
 larger model variants are explored. The training code supports CPU and GPU
 execution through `device="auto"`, converts input batches to `float32` for
 PyTorch model training, and monitors validation diagnostics after each epoch.
+Full train-set diagnostics are configurable with `train_eval_interval`: `1`
+keeps the original every-epoch behavior, while `None` evaluates the train split
+only on the final scheduled epoch or the epoch that triggers early stopping.
 
 Stage 8 evaluates only the validation split. The held-out test split must not
 be used for model prediction or performance reporting until the final project
@@ -188,6 +191,9 @@ rate, dropout including no dropout, and weight decay. Validation macro F1 is
 the primary model-selection metric, with balanced accuracy, accuracy,
 per-class precision/recall/F1, validation loss, and confusion matrices used as
 supporting diagnostics.
+The Stage 9 notebook sets `train_eval_interval=None` by default so grid searches
+continue to validate every epoch without rereading the full train split every
+epoch.
 
 Stage 9 still evaluates only the validation split. The held-out test split must
 not be used for model prediction, model selection, error analysis, or

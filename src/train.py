@@ -61,6 +61,7 @@ class TrainConfig:
     random_seed: int = 42
     device: str = "auto"
     num_workers: int = 0
+    train_eval_interval: int | None = 1
     dataset_dtype: str = "float32"
     max_train_participants: int | None = None
     max_val_participants: int | None = None
@@ -239,6 +240,13 @@ def _validate_training_config(config: TrainConfig) -> None:
         raise ValueError("max_grad_norm must be positive when provided.")
     if config.patience <= 0:
         raise ValueError("patience must be positive.")
+    if config.train_eval_interval is not None and config.train_eval_interval <= 0:
+        raise ValueError("train_eval_interval must be positive or None.")
+    if (
+        config.train_eval_interval is not None
+        and config.train_eval_interval > config.epochs
+    ):
+        raise ValueError("train_eval_interval must be <= epochs or None.")
     if (
         config.max_cached_participants is not None
         and config.max_cached_participants <= 0
@@ -399,6 +407,25 @@ def _new_seeded_generator(seed: int) -> Any:
     generator = torch.Generator()
     generator.manual_seed(seed)
     return generator
+
+
+def _resolved_train_eval_interval(config: TrainConfig) -> int:
+    """Return the concrete interval for full train-set evaluation."""
+
+    if config.train_eval_interval is None:
+        return config.epochs
+    return int(config.train_eval_interval)
+
+
+def _should_evaluate_train_split(
+    epoch: int,
+    config: TrainConfig,
+    stopping_after_epoch: bool = False,
+) -> bool:
+    """Return whether this epoch should include a full train-set eval pass."""
+
+    interval = _resolved_train_eval_interval(config)
+    return epoch % interval == 0 or stopping_after_epoch
 
 
 def _build_dataloaders_from_datasets(
@@ -891,14 +918,6 @@ def train_model(
             device,
             max_grad_norm=config.max_grad_norm,
         )
-        train_evaluation = evaluate_model(
-            model,
-            train_eval_loader,
-            eval_criterion,
-            device,
-            model_name=config.model_name,
-            split="train",
-        )
         validation = evaluate_model(
             model,
             val_loader,
@@ -907,13 +926,41 @@ def train_model(
             model_name=config.model_name,
             split="validation",
         )
-        train_metrics = dict(train_evaluation["metrics"])
         validation_metrics = dict(validation["metrics"])
-        train_loss = float(train_evaluation["loss"])
         validation_loss = float(validation["loss"])
+
+        score = float(validation_metrics["macro_f1"])
+        improved = score > best_score + config.min_delta
+        if improved:
+            best_score = score
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        stopping_after_epoch = stale_epochs >= config.patience
+
+        train_eval_ran = _should_evaluate_train_split(
+            epoch,
+            config,
+            stopping_after_epoch=stopping_after_epoch,
+        )
+        if train_eval_ran:
+            train_evaluation = evaluate_model(
+                model,
+                train_eval_loader,
+                eval_criterion,
+                device,
+                model_name=config.model_name,
+                split="train",
+            )
+            train_metrics = dict(train_evaluation["metrics"])
+            train_loss = float(train_evaluation["loss"])
+        else:
+            train_metrics = {}
+            train_loss = float("nan")
 
         history_row = {
             "epoch": epoch,
+            "train_eval_ran": train_eval_ran,
             "train_loss": train_loss,
             "train_objective_loss": train_objective_loss,
             "validation_loss": validation_loss,
@@ -921,17 +968,20 @@ def train_model(
             **validation_metrics,
         }
         history_rows.append(history_row)
-        train_rows.append({"epoch": epoch, "loss": train_loss, **train_metrics})
+        train_rows.append(
+            {
+                "epoch": epoch,
+                "train_eval_ran": train_eval_ran,
+                "loss": train_loss,
+                **train_metrics,
+            }
+        )
         validation_rows.append(
             {"epoch": epoch, "loss": validation_loss, **validation_metrics}
         )
 
-        score = float(validation_metrics["macro_f1"])
-        improved = score > best_score + config.min_delta
         if improved:
-            best_score = score
             best_epoch = epoch
-            stale_epochs = 0
             best_metrics = history_row.copy()
             best_confusion = validation["confusion_matrix"]
             save_checkpoint(
@@ -942,8 +992,6 @@ def train_model(
                 config=config,
                 metrics=best_metrics,
             )
-        else:
-            stale_epochs += 1
 
         save_checkpoint(
             last_checkpoint,
@@ -954,7 +1002,7 @@ def train_model(
             metrics=history_row,
         )
 
-        if stale_epochs >= config.patience:
+        if stopping_after_epoch:
             break
 
     history = pd.DataFrame(history_rows)
@@ -1009,6 +1057,7 @@ def stage9_experiment_id(config: TrainConfig) -> str:
         "max_grad_norm",
         "patience",
         "min_delta",
+        "train_eval_interval",
         "random_seed",
         "max_train_participants",
         "max_val_participants",
@@ -1031,7 +1080,7 @@ def build_stage9_screening_configs(
 ) -> list[TrainConfig]:
     """Create the default Stage 9 screening grid for the single-epoch CNN."""
 
-    base = base_config or TrainConfig()
+    base = base_config or TrainConfig(train_eval_interval=None)
     configs: list[TrainConfig] = []
     for learning_rate, dropout, weight_decay, class_weighting, batch_size in product(
         learning_rates,
@@ -1169,6 +1218,7 @@ def stage10_experiment_id(config: TrainConfig) -> str:
         "max_grad_norm",
         "patience",
         "min_delta",
+        "train_eval_interval",
         "random_seed",
         "max_train_participants",
         "max_val_participants",
@@ -1199,6 +1249,7 @@ def build_stage10_comparison_configs(
         model_name="single_epoch_cnn_stage10",
         epochs=40,
         patience=8,
+        train_eval_interval=None,
     )
     configs: list[TrainConfig] = []
     for radius in context_radii:
