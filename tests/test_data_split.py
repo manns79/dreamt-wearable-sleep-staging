@@ -70,14 +70,19 @@ def test_dreamt_epoch_dataset_bounds_participant_signal_cache():
     )
 
     dataset.get_epoch_array(0)
+    assert dataset.signal_cache.load_count == 1
     dataset.get_epoch_array(1)
+    assert dataset.signal_cache.load_count == 2
     dataset.get_epoch_array(2)
+    assert dataset.signal_cache.load_count == 3
     assert list(dataset.signal_cache._cache) == ["S002", "S003"]
 
     dataset.get_epoch_array(1)
+    assert dataset.signal_cache.load_count == 3
     assert list(dataset.signal_cache._cache) == ["S003", "S002"]
 
     dataset.get_epoch_array(0)
+    assert dataset.signal_cache.load_count == 4
     assert list(dataset.signal_cache._cache) == ["S002", "S001"]
 
 

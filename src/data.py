@@ -526,6 +526,7 @@ class _ParticipantSignalCache:
         self.raw_columns = _raw_columns_for_channels(self.channels)
         self.file_lookup = _participant_file_lookup(self.raw_dir)
         self._cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
+        self.load_count = 0
 
     def require_participants(self, participant_ids: Iterable[str]) -> None:
         missing_ids = sorted(set(participant_ids) - set(self.file_lookup))
@@ -539,6 +540,7 @@ class _ParticipantSignalCache:
         if participant_id in self._cache:
             self._cache.move_to_end(participant_id)
         else:
+            self.load_count += 1
             raw_df = load_participant_csv(
                 self.file_lookup[participant_id],
                 usecols=self.raw_columns,

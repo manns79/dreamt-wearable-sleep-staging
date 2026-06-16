@@ -164,6 +164,9 @@ PyTorch model training, and monitors validation diagnostics after each epoch.
 Full train-set diagnostics are configurable with `train_eval_interval`: `1`
 keeps the original every-epoch behavior, while `None` evaluates the train split
 only on the final scheduled epoch or the epoch that triggers early stopping.
+`train_history.csv` also records per-epoch phase timings and participant-cache
+load counts for the training pass, optional train evaluation pass, and
+validation pass.
 
 Stage 8 evaluates only the validation split. The held-out test split must not
 be used for model prediction or performance reporting until the final project

@@ -201,6 +201,13 @@ def test_train_model_saves_validation_artifacts(tmp_path):
     history = pd.read_csv(Path(tmp_path) / "train_history.csv")
     assert "train_macro_f1" in history.columns
     assert "train_objective_loss" in history.columns
+    assert "epoch_seconds" in history.columns
+    assert "train_seconds" in history.columns
+    assert "train_eval_seconds" in history.columns
+    assert "validation_seconds" in history.columns
+    assert "train_cache_loads" in history.columns
+    assert "train_eval_cache_loads" in history.columns
+    assert "validation_cache_loads" in history.columns
     assert (Path(tmp_path) / "train_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_confusion_matrix.csv").exists()
@@ -252,6 +259,10 @@ def test_train_model_respects_train_eval_interval(tmp_path, monkeypatch):
     assert calls.count("train") == 1
     assert history["train_eval_ran"].tolist() == [False, True, False]
     assert history["train_macro_f1"].isna().tolist() == [True, False, True]
+    assert history["train_eval_seconds"].iloc[0] == 0.0
+    assert history["train_eval_seconds"].iloc[1] >= 0.0
+    assert history["validation_seconds"].ge(0.0).all()
+    assert history["train_eval_cache_loads"].tolist() == [0, 0, 0]
 
 
 def test_train_eval_interval_must_not_exceed_epochs(tmp_path):

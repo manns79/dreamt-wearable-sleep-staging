@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha1
@@ -750,6 +751,42 @@ def _evaluation_loader_from_training_loader(train_loader: Any) -> Any:
     )
 
 
+def _signal_caches_from_dataset(
+    dataset: Any,
+    seen: set[int] | None = None,
+) -> list[Any]:
+    """Return participant signal caches reachable from a dataset wrapper."""
+
+    if dataset is None:
+        return []
+    if seen is None:
+        seen = set()
+    object_id = id(dataset)
+    if object_id in seen:
+        return []
+    seen.add(object_id)
+
+    caches: list[Any] = []
+    signal_cache = getattr(dataset, "signal_cache", None)
+    if signal_cache is not None:
+        caches.append(signal_cache)
+
+    parent_dataset = getattr(dataset, "dataset", None)
+    if parent_dataset is not None:
+        caches.extend(_signal_caches_from_dataset(parent_dataset, seen=seen))
+    return caches
+
+
+def _participant_cache_load_count_from_loader(dataloader: Any) -> int:
+    """Return in-process participant CSV load count for a loader dataset."""
+
+    dataset = getattr(dataloader, "dataset", None)
+    return sum(
+        int(getattr(cache, "load_count", 0))
+        for cache in _signal_caches_from_dataset(dataset)
+    )
+
+
 def save_checkpoint(
     path: str | Path,
     model: Any,
@@ -910,6 +947,9 @@ def train_model(
     last_checkpoint = checkpoints_dir / "last.pt"
 
     for epoch in range(1, config.epochs + 1):
+        epoch_start_time = time.perf_counter()
+        train_cache_start = _participant_cache_load_count_from_loader(train_loader)
+        train_start_time = time.perf_counter()
         train_objective_loss = train_one_epoch(
             model,
             train_loader,
@@ -918,6 +958,14 @@ def train_model(
             device,
             max_grad_norm=config.max_grad_norm,
         )
+        train_seconds = time.perf_counter() - train_start_time
+        train_cache_loads = (
+            _participant_cache_load_count_from_loader(train_loader)
+            - train_cache_start
+        )
+
+        validation_cache_start = _participant_cache_load_count_from_loader(val_loader)
+        validation_start_time = time.perf_counter()
         validation = evaluate_model(
             model,
             val_loader,
@@ -925,6 +973,11 @@ def train_model(
             device,
             model_name=config.model_name,
             split="validation",
+        )
+        validation_seconds = time.perf_counter() - validation_start_time
+        validation_cache_loads = (
+            _participant_cache_load_count_from_loader(val_loader)
+            - validation_cache_start
         )
         validation_metrics = dict(validation["metrics"])
         validation_loss = float(validation["loss"])
@@ -944,6 +997,10 @@ def train_model(
             stopping_after_epoch=stopping_after_epoch,
         )
         if train_eval_ran:
+            train_eval_cache_start = _participant_cache_load_count_from_loader(
+                train_eval_loader
+            )
+            train_eval_start_time = time.perf_counter()
             train_evaluation = evaluate_model(
                 model,
                 train_eval_loader,
@@ -952,15 +1009,31 @@ def train_model(
                 model_name=config.model_name,
                 split="train",
             )
+            train_eval_seconds = time.perf_counter() - train_eval_start_time
+            train_eval_cache_loads = (
+                _participant_cache_load_count_from_loader(train_eval_loader)
+                - train_eval_cache_start
+            )
             train_metrics = dict(train_evaluation["metrics"])
             train_loss = float(train_evaluation["loss"])
         else:
+            train_eval_seconds = 0.0
+            train_eval_cache_loads = 0
             train_metrics = {}
             train_loss = float("nan")
+
+        epoch_seconds = time.perf_counter() - epoch_start_time
 
         history_row = {
             "epoch": epoch,
             "train_eval_ran": train_eval_ran,
+            "epoch_seconds": epoch_seconds,
+            "train_seconds": train_seconds,
+            "train_eval_seconds": train_eval_seconds,
+            "validation_seconds": validation_seconds,
+            "train_cache_loads": train_cache_loads,
+            "train_eval_cache_loads": train_eval_cache_loads,
+            "validation_cache_loads": validation_cache_loads,
             "train_loss": train_loss,
             "train_objective_loss": train_objective_loss,
             "validation_loss": validation_loss,
@@ -972,12 +1045,20 @@ def train_model(
             {
                 "epoch": epoch,
                 "train_eval_ran": train_eval_ran,
+                "seconds": train_eval_seconds,
+                "cache_loads": train_eval_cache_loads,
                 "loss": train_loss,
                 **train_metrics,
             }
         )
         validation_rows.append(
-            {"epoch": epoch, "loss": validation_loss, **validation_metrics}
+            {
+                "epoch": epoch,
+                "seconds": validation_seconds,
+                "cache_loads": validation_cache_loads,
+                "loss": validation_loss,
+                **validation_metrics,
+            }
         )
 
         if improved:
