@@ -27,6 +27,7 @@ from src.data import (
     TARGET_LABELS,
     DreamtContextDataset,
     DreamtEpochDataset,
+    DreamtSequenceDataset,
     build_participant_array_cache,
     fit_normalization_stats,
     load_preprocessing_metadata,
@@ -37,6 +38,7 @@ from src.evaluate import evaluate_predictions
 DEFAULT_STAGE8_OUTPUT_DIR = Path("results/stage8_single_epoch_cnn")
 DEFAULT_STAGE9_OUTPUT_DIR = Path("results/stage9_training_choices")
 DEFAULT_STAGE10_OUTPUT_DIR = Path("results/stage10_temporal_context_cnn")
+DEFAULT_STAGE11_OUTPUT_DIR = Path("results/stage11_cnn_gru")
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,14 @@ class TrainConfig:
     dropout: float = 0.10
     context_radius: int = 0
     comparison_context_radius: int | None = None
+    sequence_length: int = 1
+    sequence_stride: int = 1
+    sequence_label_mode: str = "many_to_one"
+    sequence_target_position: str = "last"
+    gru_hidden_size: int = 64
+    gru_num_layers: int = 1
+    gru_dropout: float = 0.0
+    gru_bidirectional: bool = False
     class_weighting: bool = False
     max_grad_norm: float | None = None
     patience: int = 5
@@ -141,6 +151,11 @@ class ParticipantBlockSampler:
             )
             return str(dataset.epoch_index.iloc[center_position]["participant_id"])
 
+        if hasattr(dataset, "epoch_index") and hasattr(dataset, "sequence_positions"):
+            target_index = _sequence_target_index(dataset)
+            target_position = int(dataset.sequence_positions[index][target_index])
+            return str(dataset.epoch_index.iloc[target_position]["participant_id"])
+
         if hasattr(dataset, "epoch_index"):
             return str(dataset.epoch_index.iloc[index]["participant_id"])
 
@@ -171,6 +186,44 @@ def _new_sleep_stage_cnn(in_channels: int, config: TrainConfig | None = None) ->
         kernel_size=kernel_size,
         dropout=dropout,
     )
+
+
+def _uses_sequence_model(config: TrainConfig) -> bool:
+    """Return whether a config should use sequence data and a CNN-GRU model."""
+
+    return int(config.sequence_length) > 1
+
+
+def _new_sleep_stage_cnn_gru(
+    in_channels: int,
+    config: TrainConfig,
+) -> Any:
+    from src.models import SleepStageCNNGRU
+
+    return SleepStageCNNGRU(
+        in_channels=in_channels,
+        num_classes=len(TARGET_LABELS),
+        filters=config.filters,
+        kernel_size=config.kernel_size,
+        dropout=config.dropout,
+        gru_hidden_size=config.gru_hidden_size,
+        gru_num_layers=config.gru_num_layers,
+        gru_dropout=config.gru_dropout,
+        bidirectional=config.gru_bidirectional,
+        target_position=config.sequence_target_position,
+        output_mode=config.sequence_label_mode,
+    )
+
+
+def _new_model_for_config(config: TrainConfig) -> Any:
+    """Construct the model implied by a training configuration."""
+
+    if _uses_sequence_model(config):
+        return _new_sleep_stage_cnn_gru(
+            in_channels=len(config.channels),
+            config=config,
+        )
+    return _new_sleep_stage_cnn(in_channels=len(config.channels), config=config)
 
 
 def _json_safe(value: Any) -> Any:
@@ -241,6 +294,26 @@ def _validate_training_config(config: TrainConfig) -> None:
         and config.comparison_context_radius < 0
     ):
         raise ValueError("comparison_context_radius must be non-negative when set.")
+    if config.sequence_length <= 0:
+        raise ValueError("sequence_length must be positive.")
+    if config.sequence_stride <= 0:
+        raise ValueError("sequence_stride must be positive.")
+    if config.sequence_label_mode not in {"many_to_one", "many_to_many"}:
+        raise ValueError(
+            "sequence_label_mode must be 'many_to_one' or 'many_to_many'."
+        )
+    if config.sequence_target_position not in {"first", "center", "last"}:
+        raise ValueError(
+            "sequence_target_position must be 'first', 'center', or 'last'."
+        )
+    if config.context_radius > 0 and _uses_sequence_model(config):
+        raise ValueError("context_radius and sequence_length > 1 cannot be combined.")
+    if config.gru_hidden_size <= 0:
+        raise ValueError("gru_hidden_size must be positive.")
+    if config.gru_num_layers <= 0:
+        raise ValueError("gru_num_layers must be positive.")
+    if not 0 <= config.gru_dropout < 1:
+        raise ValueError("gru_dropout must be in [0, 1).")
     if config.max_grad_norm is not None and config.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive when provided.")
     if config.patience <= 0:
@@ -383,6 +456,8 @@ def _prefit_preprocessing_metadata(configs: Sequence[TrainConfig]) -> None:
 
 
 def _dataset_class_for_config(config: TrainConfig) -> type[DreamtEpochDataset]:
+    if _uses_sequence_model(config):
+        return DreamtSequenceDataset
     if config.context_radius > 0:
         return DreamtContextDataset
     return DreamtEpochDataset
@@ -398,6 +473,15 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
     dataset_kwargs: dict[str, Any] = {}
     if config.context_radius > 0:
         dataset_kwargs["context_radius"] = config.context_radius
+    if _uses_sequence_model(config):
+        dataset_kwargs.update(
+            {
+                "sequence_length": config.sequence_length,
+                "stride": config.sequence_stride,
+                "label_mode": config.sequence_label_mode,
+                "target_position": config.sequence_target_position,
+            }
+        )
 
     train_dataset = dataset_class(
         raw_dir=config.raw_dir,
@@ -503,6 +587,44 @@ def _context_center_positions(dataset: Any) -> list[int]:
     raise TypeError("Expected a DreamtContextDataset-like object.")
 
 
+def _sequence_target_index(dataset: Any) -> int:
+    """Return the target offset used by a sequence dataset."""
+
+    if hasattr(dataset, "_target_index"):
+        return int(dataset._target_index())
+
+    target_position = getattr(dataset, "target_position", "last")
+    sequence_length = int(getattr(dataset, "sequence_length"))
+    if target_position == "first":
+        return 0
+    if target_position == "center":
+        return sequence_length // 2
+    return sequence_length - 1
+
+
+def _sequence_target_positions(dataset: Any) -> list[int]:
+    """Return target epoch-index positions from a sequence dataset."""
+
+    if not hasattr(dataset, "sequence_positions"):
+        raise TypeError("Expected a DreamtSequenceDataset-like object.")
+    target_index = _sequence_target_index(dataset)
+    return [int(positions[target_index]) for positions in dataset.sequence_positions]
+
+
+def _sequence_label_positions(dataset: Any) -> list[int]:
+    """Return label-bearing epoch-index positions for a sequence dataset."""
+
+    if not hasattr(dataset, "sequence_positions"):
+        raise TypeError("Expected a DreamtSequenceDataset-like object.")
+    if getattr(dataset, "label_mode", "many_to_one") == "many_to_many":
+        return [
+            int(position)
+            for positions in dataset.sequence_positions
+            for position in positions
+        ]
+    return _sequence_target_positions(dataset)
+
+
 def build_stage10_paired_dataloaders(
     config: TrainConfig,
     context_radius: int,
@@ -580,6 +702,12 @@ def _label_ids_from_dataset(dataset: Any) -> list[int] | None:
         and hasattr(dataset, "context_radius")
     ):
         labels = dataset.epoch_index.iloc[_context_center_positions(dataset)][
+            "mapped_label"
+        ].tolist()
+        return [LABEL_TO_ID[str(label)] for label in labels]
+
+    if hasattr(dataset, "epoch_index") and hasattr(dataset, "sequence_positions"):
+        labels = dataset.epoch_index.iloc[_sequence_label_positions(dataset)][
             "mapped_label"
         ].tolist()
         return [LABEL_TO_ID[str(label)] for label in labels]
@@ -675,6 +803,11 @@ def train_one_epoch(
     for x_batch, y_batch in dataloader:
         x_batch = x_batch.to(device=device, dtype=_require_torch().float32)
         y_batch = y_batch.to(device=device)
+        if y_batch.ndim != 1:
+            raise ValueError(
+                "train_one_epoch currently supports many-to-one targets only. "
+                "Add sequence loss handling before many-to-many training."
+            )
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(x_batch)
@@ -717,6 +850,11 @@ def evaluate_model(
         for x_batch, y_batch in dataloader:
             x_batch = x_batch.to(device=device, dtype=torch.float32)
             y_batch = y_batch.to(device=device)
+            if y_batch.ndim != 1:
+                raise ValueError(
+                    "evaluate_model currently supports many-to-one targets only. "
+                    "Add sequence evaluation before many-to-many training."
+                )
             logits = model(x_batch)
             loss = criterion(logits, y_batch)
             predictions = logits.argmax(dim=1)
@@ -952,7 +1090,7 @@ def train_model(
     _save_json(config_to_dict(config), output_dir / "config.json")
 
     if model is None:
-        model = _new_sleep_stage_cnn(in_channels=len(config.channels), config=config)
+        model = _new_model_for_config(config)
     model = model.to(device)
 
     criterion = build_loss_function(train_loader, config, device)
@@ -1142,7 +1280,7 @@ def train_model(
 
 
 def run_training_from_config(config: TrainConfig) -> TrainingResult:
-    """Build Stage 8 train/validation loaders and run CNN training."""
+    """Build train/validation loaders and train the configured model."""
 
     loaders = build_train_validation_dataloaders(config)
     return train_model(loaders["train"], loaders["validation"], config)
@@ -1473,6 +1611,189 @@ def run_stage10_experiments(
         .reset_index(drop=True)
     )
     best_by_radius.to_csv(stage_dir / "best_by_context_radius.csv", index=False)
+
+    best_row = summary.iloc[0].to_dict()
+    _save_json(best_row, stage_dir / "best_config.json")
+    best_confusion_path = (
+        Path(str(best_row["output_dir"])) / "validation_confusion_matrix.csv"
+    )
+    if best_confusion_path.exists():
+        best_confusion = pd.read_csv(best_confusion_path, index_col=0)
+        best_confusion.to_csv(stage_dir / "best_validation_confusion_matrix.csv")
+
+    return summary
+
+
+def stage11_experiment_id(config: TrainConfig) -> str:
+    """Return a stable short ID for one Stage 11 CNN-GRU configuration."""
+
+    config_dict = config_to_dict(config)
+    stable_keys = [
+        "model_name",
+        "channels",
+        "batch_size",
+        "dataset_dtype",
+        "participant_array_cache_dir",
+        "epochs",
+        "learning_rate",
+        "weight_decay",
+        "filters",
+        "kernel_size",
+        "dropout",
+        "sequence_length",
+        "sequence_stride",
+        "sequence_label_mode",
+        "sequence_target_position",
+        "gru_hidden_size",
+        "gru_num_layers",
+        "gru_dropout",
+        "gru_bidirectional",
+        "class_weighting",
+        "max_grad_norm",
+        "patience",
+        "min_delta",
+        "train_eval_interval",
+        "random_seed",
+        "max_train_participants",
+        "max_val_participants",
+    ]
+    payload = {key: config_dict.get(key) for key in stable_keys}
+    digest = sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:10]
+    return f"stage11_cnn_gru_s{config.sequence_length}_{digest}"
+
+
+def build_stage11_sequence_configs(
+    base_config: TrainConfig | None = None,
+    output_dir: str | Path = DEFAULT_STAGE11_OUTPUT_DIR,
+    sequence_lengths: Sequence[int] = (5, 11),
+) -> list[TrainConfig]:
+    """Create Stage 11 many-to-one CNN-GRU comparison configs."""
+
+    if not sequence_lengths:
+        raise ValueError("At least one sequence length is required.")
+    invalid_lengths = [length for length in sequence_lengths if int(length) <= 1]
+    if invalid_lengths:
+        raise ValueError(f"Sequence lengths must be greater than 1: {invalid_lengths}")
+
+    base = base_config or TrainConfig(
+        output_dir=output_dir,
+        model_name="cnn_gru_stage11",
+        batch_size=16,
+        epochs=40,
+        learning_rate=1e-3,
+        weight_decay=1e-4,
+        dropout=0.10,
+        class_weighting=True,
+        max_grad_norm=1.0,
+        patience=8,
+        train_eval_interval=None,
+        participant_array_cache_dir=DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
+        sequence_stride=1,
+        sequence_label_mode="many_to_one",
+        sequence_target_position="center",
+        gru_hidden_size=64,
+        gru_num_layers=1,
+        gru_dropout=0.0,
+        gru_bidirectional=False,
+    )
+
+    configs: list[TrainConfig] = []
+    for sequence_length in sequence_lengths:
+        sequence_length = int(sequence_length)
+        configs.append(
+            replace(
+                base,
+                output_dir=output_dir,
+                model_name=f"cnn_gru_stage11_s{sequence_length}",
+                context_radius=0,
+                comparison_context_radius=None,
+                sequence_length=sequence_length,
+            )
+        )
+    return configs
+
+
+def run_stage11_experiments(
+    configs: Sequence[TrainConfig],
+    output_dir: str | Path = DEFAULT_STAGE11_OUTPUT_DIR,
+) -> pd.DataFrame:
+    """Run Stage 11 many-to-one CNN-GRU sequence-length comparisons.
+
+    Only the train and validation splits are loaded. Class-weighted cross
+    entropy is controlled by each config; no balanced sampling is used.
+    """
+
+    if not configs:
+        raise ValueError("At least one Stage 11 configuration is required.")
+
+    stage_dir = Path(output_dir)
+    runs_dir = stage_dir / "runs"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    _prefit_preprocessing_metadata(configs)
+
+    summary_rows: list[dict[str, Any]] = []
+    history_frames: list[pd.DataFrame] = []
+
+    for config in configs:
+        _validate_training_config(config)
+        if not _uses_sequence_model(config):
+            raise ValueError("Stage 11 configs must use sequence_length > 1.")
+        if config.sequence_label_mode != "many_to_one":
+            raise ValueError("Stage 11 currently supports many_to_one configs only.")
+
+        experiment_id = stage11_experiment_id(config)
+        run_dir = runs_dir / experiment_id
+        run_config = replace(config, output_dir=run_dir)
+        loaders = build_train_validation_dataloaders(run_config)
+        result = train_model(
+            loaders["train"],
+            loaders["validation"],
+            run_config,
+        )
+
+        config_row = config_to_dict(run_config)
+        metric_row = dict(result.best_metrics)
+        summary_rows.append(
+            {
+                "experiment_id": experiment_id,
+                "model_family": "cnn_gru",
+                "train_examples": len(loaders["train"].dataset),
+                "validation_examples": len(loaders["validation"].dataset),
+                "best_epoch": result.best_epoch,
+                "output_dir": str(result.output_dir),
+                **config_row,
+                **metric_row,
+            }
+        )
+
+        if not result.history.empty:
+            history = result.history.copy()
+            history.insert(0, "experiment_id", experiment_id)
+            history.insert(1, "sequence_length", run_config.sequence_length)
+            history.insert(2, "model_family", "cnn_gru")
+            history_frames.append(history)
+
+    summary = pd.DataFrame(summary_rows)
+    sort_columns, ascending = _summary_sort_columns(summary)
+    summary = summary.sort_values(sort_columns, ascending=ascending).reset_index(
+        drop=True
+    )
+    summary.to_csv(stage_dir / "experiment_summary.csv", index=False)
+
+    if history_frames:
+        all_history = pd.concat(history_frames, ignore_index=True)
+        all_history.to_csv(stage_dir / "all_history.csv", index=False)
+
+    best_by_length = (
+        summary.sort_values(sort_columns, ascending=ascending)
+        .groupby("sequence_length", as_index=False, sort=True)
+        .head(1)
+        .reset_index(drop=True)
+    )
+    best_by_length.to_csv(stage_dir / "best_by_sequence_length.csv", index=False)
 
     best_row = summary.iloc[0].to_dict()
     _save_json(best_row, stage_dir / "best_config.json")

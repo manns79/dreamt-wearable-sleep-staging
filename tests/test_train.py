@@ -15,6 +15,7 @@ from src.train import (  # noqa: E402
     build_stage9_screening_configs,
     build_stage10_comparison_configs,
     build_stage10_paired_dataloaders,
+    build_stage11_sequence_configs,
     build_train_validation_datasets,
     class_counts_from_loader,
     class_weights_from_counts,
@@ -23,10 +24,12 @@ from src.train import (  # noqa: E402
     resolve_device,
     run_stage9_experiments,
     run_stage10_experiments,
+    run_stage11_experiments,
     run_tiny_overfit_test,
     save_checkpoint,
     stage9_experiment_id,
     stage10_experiment_id,
+    stage11_experiment_id,
     train_model,
     train_one_epoch,
 )
@@ -72,6 +75,51 @@ class SyntheticParticipantDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         return torch.tensor([index], dtype=torch.float32), torch.tensor(0)
+
+
+class SyntheticSequenceDataset(torch.utils.data.Dataset):
+    sequence_length = 3
+    label_mode = "many_to_one"
+    target_position = "center"
+    sequence_positions = [[0, 1, 2], [1, 2, 3], [4, 5, 6], [5, 6, 7]]
+
+    def __init__(self):
+        self.epoch_index = pd.DataFrame(
+            {
+                "participant_id": [
+                    "S001",
+                    "S001",
+                    "S001",
+                    "S001",
+                    "S002",
+                    "S002",
+                    "S002",
+                    "S002",
+                ],
+                "mapped_label": [
+                    "REM",
+                    "Wake",
+                    "Non-REM",
+                    "REM",
+                    "Wake",
+                    "REM",
+                    "Non-REM",
+                    "Wake",
+                ],
+            }
+        )
+
+    def _target_index(self):
+        return 1
+
+    def __len__(self):
+        return len(self.sequence_positions)
+
+    def __getitem__(self, index):
+        target_position = self.sequence_positions[index][self._target_index()]
+        label = self.epoch_index.iloc[target_position]["mapped_label"]
+        label_id = {"Wake": 0, "Non-REM": 1, "REM": 2}[label]
+        return torch.zeros(3, 1, 8, dtype=torch.float32), torch.tensor(label_id)
 
 
 def _loader(dataset, batch_size=4, shuffle=False):
@@ -327,6 +375,28 @@ def test_participant_block_sampler_handles_subset_indices():
         assert max(positions) - min(positions) + 1 == len(positions)
 
 
+def test_participant_block_sampler_groups_sequence_targets_by_participant():
+    dataset = SyntheticSequenceDataset()
+    sampler = ParticipantBlockSampler(dataset, seed=7)
+
+    order = list(iter(sampler))
+    participant_order = [
+        dataset.epoch_index.iloc[dataset.sequence_positions[index][1]][
+            "participant_id"
+        ]
+        for index in order
+    ]
+
+    assert sorted(order) == list(range(len(dataset)))
+    for participant_id in set(participant_order):
+        positions = [
+            position
+            for position, participant in enumerate(participant_order)
+            if participant == participant_id
+        ]
+        assert max(positions) - min(positions) + 1 == len(positions)
+
+
 def test_preprocessing_metadata_refits_when_training_subset_changes(tmp_path):
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
@@ -405,6 +475,41 @@ def test_stage10_paired_dataloaders_align_single_and_context_centers(tmp_path):
     assert y_single.tolist() == y_context.tolist()
 
 
+def test_sequence_config_builds_sequence_datasets(tmp_path):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    labels = ["Wake", "Non-REM", "REM", "Wake", "REM"]
+    _raw_frame(list(range(20))).to_csv(raw_dir / "S001_whole_df.csv", index=False)
+    _raw_frame(list(range(20, 40))).to_csv(
+        raw_dir / "S002_whole_df.csv",
+        index=False,
+    )
+    epoch_index = pd.concat(
+        [
+            _epoch_index("S001", "train", labels),
+            _epoch_index("S002", "validation", labels),
+        ],
+        ignore_index=True,
+    )
+    config = TrainConfig(
+        raw_dir=raw_dir,
+        epoch_index_path=epoch_index,
+        preprocessing_metadata_path=tmp_path / "metadata.json",
+        channels=("BVP",),
+        batch_size=2,
+        sequence_length=3,
+        sequence_target_position="center",
+    )
+
+    datasets = build_train_validation_datasets(config)
+    x_sequence, y_sequence = datasets["train"][0]
+
+    assert len(datasets["train"]) == 3
+    assert hasattr(datasets["train"], "sequence_positions")
+    assert x_sequence.shape == (3, 1, 4)
+    assert y_sequence.item() == 1
+
+
 def test_class_weights_are_inverse_frequency_and_train_only():
     dataset = SyntheticEpochDataset(n_examples=6)
     dataset.y = torch.tensor([0, 0, 0, 1, 1, 2])
@@ -438,6 +543,14 @@ def test_class_counts_for_context_dataset_use_center_labels_only():
     counts = class_counts_from_loader(loader)
 
     assert counts == {"Wake": 1, "Non-REM": 1, "REM": 1}
+
+
+def test_class_counts_for_sequence_dataset_use_target_labels_only():
+    loader = _loader(SyntheticSequenceDataset(), batch_size=1)
+
+    counts = class_counts_from_loader(loader)
+
+    assert counts == {"Wake": 1, "Non-REM": 2, "REM": 1}
 
 
 def test_build_loss_function_adds_weights_when_requested():
@@ -614,4 +727,91 @@ def test_run_stage10_experiments_writes_ranked_summary(tmp_path, monkeypatch):
     assert (Path(tmp_path) / "experiment_summary.csv").exists()
     assert (Path(tmp_path) / "all_history.csv").exists()
     assert (Path(tmp_path) / "best_by_context_radius.csv").exists()
+    assert (Path(tmp_path) / "best_config.json").exists()
+
+
+def test_stage11_sequence_configs_compare_sequence_lengths(tmp_path):
+    base_config = TrainConfig(
+        output_dir=tmp_path,
+        epochs=3,
+        patience=2,
+        class_weighting=True,
+        sequence_target_position="center",
+    )
+
+    configs = build_stage11_sequence_configs(
+        base_config=base_config,
+        output_dir=tmp_path,
+        sequence_lengths=(5, 11),
+    )
+
+    assert [config.sequence_length for config in configs] == [5, 11]
+    assert all(config.sequence_label_mode == "many_to_one" for config in configs)
+    assert all(config.sequence_target_position == "center" for config in configs)
+    assert all(config.class_weighting for config in configs)
+    assert all(config.epochs == 3 for config in configs)
+    assert stage11_experiment_id(configs[0]) != stage11_experiment_id(configs[1])
+
+
+def test_run_stage11_experiments_writes_ranked_summary(tmp_path, monkeypatch):
+    dataset = SyntheticSequenceDataset()
+    loader = _loader(dataset, batch_size=2)
+
+    def fake_build_train_validation_dataloaders(config):
+        return {"train": loader, "validation": loader}
+
+    def fake_train_model(train_loader, val_loader, config):
+        output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            index=["true_Wake", "true_Non-REM", "true_REM"],
+            columns=["pred_Wake", "pred_Non-REM", "pred_REM"],
+        ).to_csv(output_dir / "validation_confusion_matrix.csv")
+        score = 0.8 if config.sequence_length == 11 else 0.6
+        history = pd.DataFrame(
+            {
+                "epoch": [1],
+                "train_loss": [1.0],
+                "validation_loss": [0.5],
+                "macro_f1": [score],
+                "balanced_accuracy": [score],
+            }
+        )
+        return TrainingResult(
+            history=history,
+            best_metrics=history.iloc[0].to_dict(),
+            best_epoch=1,
+            best_checkpoint_path=output_dir / "checkpoints" / "best.pt",
+            last_checkpoint_path=output_dir / "checkpoints" / "last.pt",
+            output_dir=output_dir,
+        )
+
+    monkeypatch.setattr(
+        "src.train.build_train_validation_dataloaders",
+        fake_build_train_validation_dataloaders,
+    )
+    monkeypatch.setattr("src.train.train_model", fake_train_model)
+    monkeypatch.setattr(
+        "src.train._prefit_preprocessing_metadata",
+        lambda configs: None,
+    )
+    configs = build_stage11_sequence_configs(
+        base_config=TrainConfig(
+            output_dir=tmp_path,
+            sequence_label_mode="many_to_one",
+            sequence_target_position="center",
+        ),
+        output_dir=tmp_path,
+        sequence_lengths=(5, 11),
+    )
+
+    summary = run_stage11_experiments(configs, output_dir=tmp_path)
+
+    assert summary.loc[0, "sequence_length"] == 11
+    assert set(summary["model_family"]) == {"cnn_gru"}
+    assert set(summary["train_examples"]) == {len(dataset)}
+    assert (Path(tmp_path) / "experiment_summary.csv").exists()
+    assert (Path(tmp_path) / "all_history.csv").exists()
+    assert (Path(tmp_path) / "best_by_sequence_length.csv").exists()
     assert (Path(tmp_path) / "best_config.json").exists()
