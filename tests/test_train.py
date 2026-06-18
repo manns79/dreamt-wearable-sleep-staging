@@ -16,6 +16,7 @@ from src.train import (  # noqa: E402
     build_stage10_comparison_configs,
     build_stage10_paired_dataloaders,
     build_stage11_sequence_configs,
+    build_stage12_many_to_many_configs,
     build_train_validation_datasets,
     class_counts_from_loader,
     class_weights_from_counts,
@@ -25,11 +26,13 @@ from src.train import (  # noqa: E402
     run_stage9_experiments,
     run_stage10_experiments,
     run_stage11_experiments,
+    run_stage12_experiments,
     run_tiny_overfit_test,
     save_checkpoint,
     stage9_experiment_id,
     stage10_experiment_id,
     stage11_experiment_id,
+    stage12_experiment_id,
     train_model,
     train_one_epoch,
 )
@@ -122,6 +125,34 @@ class SyntheticSequenceDataset(torch.utils.data.Dataset):
         return torch.zeros(3, 1, 8, dtype=torch.float32), torch.tensor(label_id)
 
 
+class SyntheticManyToManySequenceDataset(SyntheticSequenceDataset):
+    label_mode = "many_to_many"
+
+    def __init__(self, return_sample_weights=False):
+        super().__init__()
+        self.return_sample_weights = return_sample_weights
+        counts = {}
+        for positions in self.sequence_positions:
+            for position in positions:
+                counts[position] = counts.get(position, 0) + 1
+        self._weights = {position: 1.0 / count for position, count in counts.items()}
+
+    def __getitem__(self, index):
+        label_ids = []
+        for position in self.sequence_positions[index]:
+            label = self.epoch_index.iloc[position]["mapped_label"]
+            label_ids.append({"Wake": 0, "Non-REM": 1, "REM": 2}[label])
+        x = torch.zeros(3, 1, 8, dtype=torch.float32)
+        y = torch.tensor(label_ids, dtype=torch.long)
+        if not self.return_sample_weights:
+            return x, y
+        weights = torch.tensor(
+            [self._weights[position] for position in self.sequence_positions[index]],
+            dtype=torch.float32,
+        )
+        return x, y, weights
+
+
 def _loader(dataset, batch_size=4, shuffle=False):
     return torch.utils.data.DataLoader(
         dataset,
@@ -191,6 +222,43 @@ def test_train_one_epoch_and_evaluate_model_return_metrics():
     assert validation["loss"] > 0
     assert "macro_f1" in validation["metrics"]
     assert validation["confusion_matrix"].shape == (3, 3)
+
+
+def test_evaluate_model_aggregates_many_to_many_sequence_probabilities():
+    class FixedManyToManyModel(torch.nn.Module):
+        def forward(self, x):
+            logits = torch.zeros(x.shape[0], x.shape[1], 3)
+            logits[..., 0] = 2.0
+            logits[:, 1, 1] = 3.0
+            return logits
+
+    dataset = SyntheticManyToManySequenceDataset(return_sample_weights=True)
+    loader = _loader(dataset, batch_size=2)
+    config = TrainConfig(
+        sequence_length=3,
+        sequence_label_mode="many_to_many",
+        sequence_loss_weighting="inverse_epoch_coverage",
+        sequence_aggregation="uniform",
+        sequence_extra_aggregations=("center_weighted",),
+    )
+
+    validation = evaluate_model(
+        FixedManyToManyModel(),
+        loader,
+        torch.nn.CrossEntropyLoss(reduction="none"),
+        torch.device("cpu"),
+        model_name="synthetic_m2m",
+        config=config,
+    )
+
+    assert validation["metrics"]["aggregation_method"] == "uniform"
+    assert "center_weighted_macro_f1" in validation["metrics"]
+    assert "sequence_position_macro_f1" in validation["metrics"]
+    assert set(validation["aggregated_epoch_predictions"]) == {
+        "uniform",
+        "center_weighted",
+    }
+    assert not validation["sequence_position_predictions"].empty
 
 
 def test_save_and_load_checkpoint_round_trip(tmp_path):
@@ -553,6 +621,14 @@ def test_class_counts_for_sequence_dataset_use_target_labels_only():
     assert counts == {"Wake": 1, "Non-REM": 2, "REM": 1}
 
 
+def test_class_counts_for_many_to_many_sequence_dataset_use_unique_epochs():
+    loader = _loader(SyntheticManyToManySequenceDataset(), batch_size=1)
+
+    counts = class_counts_from_loader(loader)
+
+    assert counts == {"Wake": 3, "Non-REM": 2, "REM": 3}
+
+
 def test_build_loss_function_adds_weights_when_requested():
     dataset = SyntheticEpochDataset(n_examples=6)
     dataset.y = torch.tensor([0, 0, 0, 1, 1, 2])
@@ -811,6 +887,99 @@ def test_run_stage11_experiments_writes_ranked_summary(tmp_path, monkeypatch):
     assert summary.loc[0, "sequence_length"] == 11
     assert set(summary["model_family"]) == {"cnn_gru"}
     assert set(summary["train_examples"]) == {len(dataset)}
+    assert (Path(tmp_path) / "experiment_summary.csv").exists()
+    assert (Path(tmp_path) / "all_history.csv").exists()
+    assert (Path(tmp_path) / "best_by_sequence_length.csv").exists()
+    assert (Path(tmp_path) / "best_config.json").exists()
+
+
+def test_stage12_configs_train_once_per_sequence_length_with_two_aggregations(
+    tmp_path,
+):
+    base_config = TrainConfig(output_dir=tmp_path, epochs=3, patience=2)
+
+    configs = build_stage12_many_to_many_configs(
+        base_config=base_config,
+        output_dir=tmp_path,
+        sequence_lengths=(5, 11),
+        aggregation_methods=("uniform", "center_weighted"),
+    )
+
+    assert [config.sequence_length for config in configs] == [5, 11]
+    assert all(config.sequence_label_mode == "many_to_many" for config in configs)
+    assert all(
+        config.sequence_loss_weighting == "inverse_epoch_coverage"
+        for config in configs
+    )
+    assert all(config.sequence_aggregation == "uniform" for config in configs)
+    assert all(
+        config.sequence_extra_aggregations == ("center_weighted",)
+        for config in configs
+    )
+    assert stage12_experiment_id(configs[0]) != stage12_experiment_id(configs[1])
+
+
+def test_run_stage12_experiments_writes_aggregation_summary(tmp_path, monkeypatch):
+    dataset = SyntheticManyToManySequenceDataset(return_sample_weights=True)
+    loader = _loader(dataset, batch_size=2)
+
+    def fake_build_train_validation_dataloaders(config):
+        return {"train": loader, "validation": loader}
+
+    def fake_train_model(train_loader, val_loader, config):
+        output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            index=["true_Wake", "true_Non-REM", "true_REM"],
+            columns=["pred_Wake", "pred_Non-REM", "pred_REM"],
+        ).to_csv(output_dir / "validation_confusion_matrix.csv")
+        pd.DataFrame(
+            [[1, 1, 0], [0, 2, 0], [0, 0, 2]],
+            index=["true_Wake", "true_Non-REM", "true_REM"],
+            columns=["pred_Wake", "pred_Non-REM", "pred_REM"],
+        ).to_csv(output_dir / "validation_confusion_matrix_center_weighted.csv")
+        history = pd.DataFrame(
+            {
+                "epoch": [1],
+                "train_loss": [1.0],
+                "validation_loss": [0.5],
+                "macro_f1": [0.6],
+                "balanced_accuracy": [0.6],
+                "aggregation_method": ["uniform"],
+                "center_weighted_macro_f1": [0.8],
+                "center_weighted_balanced_accuracy": [0.8],
+            }
+        )
+        return TrainingResult(
+            history=history,
+            best_metrics=history.iloc[0].to_dict(),
+            best_epoch=1,
+            best_checkpoint_path=output_dir / "checkpoints" / "best.pt",
+            last_checkpoint_path=output_dir / "checkpoints" / "last.pt",
+            output_dir=output_dir,
+        )
+
+    monkeypatch.setattr(
+        "src.train.build_train_validation_dataloaders",
+        fake_build_train_validation_dataloaders,
+    )
+    monkeypatch.setattr("src.train.train_model", fake_train_model)
+    monkeypatch.setattr(
+        "src.train._prefit_preprocessing_metadata",
+        lambda configs: None,
+    )
+    configs = build_stage12_many_to_many_configs(
+        base_config=TrainConfig(output_dir=tmp_path),
+        output_dir=tmp_path,
+        sequence_lengths=(5,),
+        aggregation_methods=("uniform", "center_weighted"),
+    )
+
+    summary = run_stage12_experiments(configs, output_dir=tmp_path)
+
+    assert set(summary["aggregation_method"]) == {"uniform", "center_weighted"}
+    assert summary.loc[0, "aggregation_method"] == "center_weighted"
     assert (Path(tmp_path) / "experiment_summary.csv").exists()
     assert (Path(tmp_path) / "all_history.csv").exists()
     assert (Path(tmp_path) / "best_by_sequence_length.csv").exists()

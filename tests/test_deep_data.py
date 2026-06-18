@@ -215,9 +215,20 @@ def test_sequence_dataset_supports_many_to_one_and_many_to_many_labels():
         sequence_length=3,
         label_mode="many_to_many",
     )
+    weighted_many_to_many = DreamtSequenceDataset(
+        raw_dir=raw_dir,
+        epoch_index=epoch_index,
+        split="train",
+        channels=["BVP"],
+        sequence_length=3,
+        label_mode="many_to_many",
+        return_sample_weights=True,
+        sample_weight_mode="inverse_epoch_coverage",
+    )
 
     x_one, y_one = many_to_one[0]
     x_many, y_many = many_to_many[0]
+    _, _, weights = weighted_many_to_many[0]
 
     assert x_one.shape == (3, 1, 4)
     assert x_one.dtype == torch.float32
@@ -225,6 +236,7 @@ def test_sequence_dataset_supports_many_to_one_and_many_to_many_labels():
     assert x_many.shape == (3, 1, 4)
     assert x_many.dtype == torch.float32
     assert y_many.tolist() == [0, 1, 2]
+    assert weights.tolist() == [1.0, 0.5, 0.5]
 
 
 def test_check_epoch_split_leakage_rejects_participant_overlap():

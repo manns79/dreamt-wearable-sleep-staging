@@ -862,7 +862,7 @@ class DreamtEpochDataset:
             x = apply_normalization(x, self.preprocessing_stats)
         return x.astype(self.dtype, copy=False)
 
-    def __getitem__(self, index: int) -> tuple[Any, Any]:
+    def __getitem__(self, index: int) -> tuple[Any, ...]:
         import torch
 
         row = self.epoch_index.iloc[index]
@@ -965,7 +965,9 @@ class DreamtSequenceDataset(DreamtEpochDataset):
     Items have shape ``(sequence_length, channels, timepoints)``. With
     ``label_mode="many_to_one"``, the target is the final epoch label by
     default. With ``label_mode="many_to_many"``, the target is a vector of
-    labels for every epoch in the sequence.
+    labels for every epoch in the sequence. When ``return_sample_weights`` is
+    enabled for many-to-many training, each item also returns one loss weight
+    per sequence position.
     """
 
     def __init__(
@@ -979,6 +981,8 @@ class DreamtSequenceDataset(DreamtEpochDataset):
         stride: int = 1,
         label_mode: str = "many_to_one",
         target_position: str = "last",
+        return_sample_weights: bool = False,
+        sample_weight_mode: str = "none",
         participant_ids: Iterable[str] | None = None,
         max_participants: int | None = None,
         max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
@@ -993,11 +997,21 @@ class DreamtSequenceDataset(DreamtEpochDataset):
             raise ValueError("label_mode must be 'many_to_one' or 'many_to_many'.")
         if target_position not in {"first", "center", "last"}:
             raise ValueError("target_position must be 'first', 'center', or 'last'.")
+        if sample_weight_mode not in {"none", "inverse_epoch_coverage"}:
+            raise ValueError(
+                "sample_weight_mode must be 'none' or 'inverse_epoch_coverage'."
+            )
+        if return_sample_weights and label_mode != "many_to_many":
+            raise ValueError(
+                "return_sample_weights is only supported for many_to_many labels."
+            )
 
         self.sequence_length = int(sequence_length)
         self.stride = int(stride)
         self.label_mode = label_mode
         self.target_position = target_position
+        self.return_sample_weights = bool(return_sample_weights)
+        self.sample_weight_mode = sample_weight_mode
         super().__init__(
             raw_dir=raw_dir,
             epoch_index=epoch_index,
@@ -1011,6 +1025,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
             dtype=dtype,
         )
         self.sequence_positions = self._build_sequence_positions()
+        self._sample_weights_by_position = self._build_sample_weights_by_position()
 
     def _build_sequence_positions(self) -> list[list[int]]:
         sequences: list[list[int]] = []
@@ -1038,6 +1053,17 @@ class DreamtSequenceDataset(DreamtEpochDataset):
             return self.sequence_length // 2
         return self.sequence_length - 1
 
+    def _build_sample_weights_by_position(self) -> dict[int, float]:
+        if self.sample_weight_mode == "none":
+            return {}
+
+        counts: Counter[int] = Counter(
+            int(position)
+            for positions in self.sequence_positions
+            for position in positions
+        )
+        return {position: 1.0 / count for position, count in counts.items()}
+
     def __getitem__(self, index: int) -> tuple[Any, Any]:
         import torch
 
@@ -1052,7 +1078,14 @@ class DreamtSequenceDataset(DreamtEpochDataset):
             y: Any = torch.as_tensor(labels, dtype=torch.long)
         else:
             y = torch.tensor(labels[self._target_index()], dtype=torch.long)
-        return torch.as_tensor(x), y
+        if not self.return_sample_weights:
+            return torch.as_tensor(x), y
+
+        weights = [
+            self._sample_weights_by_position[int(position)]
+            for position in positions
+        ]
+        return torch.as_tensor(x), y, torch.as_tensor(weights, dtype=torch.float32)
 
 
 def fit_normalization_stats(

@@ -39,6 +39,7 @@ DEFAULT_STAGE8_OUTPUT_DIR = Path("results/stage8_single_epoch_cnn")
 DEFAULT_STAGE9_OUTPUT_DIR = Path("results/stage9_training_choices")
 DEFAULT_STAGE10_OUTPUT_DIR = Path("results/stage10_temporal_context_cnn")
 DEFAULT_STAGE11_OUTPUT_DIR = Path("results/stage11_cnn_gru")
+DEFAULT_STAGE12_OUTPUT_DIR = Path("results/stage12_cnn_gru_many_to_many")
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,9 @@ class TrainConfig:
     sequence_stride: int = 1
     sequence_label_mode: str = "many_to_one"
     sequence_target_position: str = "last"
+    sequence_loss_weighting: str = "none"
+    sequence_aggregation: str = "none"
+    sequence_extra_aggregations: Sequence[str] = ()
     gru_hidden_size: int = 64
     gru_num_layers: int = 1
     gru_dropout: float = 0.0
@@ -306,6 +310,38 @@ def _validate_training_config(config: TrainConfig) -> None:
         raise ValueError(
             "sequence_target_position must be 'first', 'center', or 'last'."
         )
+    if config.sequence_loss_weighting not in {"none", "inverse_epoch_coverage"}:
+        raise ValueError(
+            "sequence_loss_weighting must be 'none' or 'inverse_epoch_coverage'."
+        )
+    aggregation_methods = [
+        config.sequence_aggregation,
+        *list(config.sequence_extra_aggregations),
+    ]
+    invalid_aggregations = [
+        method
+        for method in aggregation_methods
+        if method not in {"none", "uniform", "center_weighted"}
+    ]
+    if invalid_aggregations:
+        raise ValueError(
+            "sequence aggregation methods must be 'none', 'uniform', or "
+            f"'center_weighted': {invalid_aggregations}"
+        )
+    if (
+        config.sequence_label_mode == "many_to_many"
+        and config.sequence_aggregation == "none"
+    ):
+        raise ValueError(
+            "many_to_many sequence configs require a primary sequence_aggregation."
+        )
+    if (
+        config.sequence_label_mode != "many_to_many"
+        and config.sequence_loss_weighting != "none"
+    ):
+        raise ValueError(
+            "sequence_loss_weighting is only supported for many_to_many configs."
+        )
     if config.context_radius > 0 and _uses_sequence_model(config):
         raise ValueError("context_radius and sequence_length > 1 cannot be combined.")
     if config.gru_hidden_size <= 0:
@@ -480,6 +516,11 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
                 "stride": config.sequence_stride,
                 "label_mode": config.sequence_label_mode,
                 "target_position": config.sequence_target_position,
+                "return_sample_weights": (
+                    config.sequence_label_mode == "many_to_many"
+                    and config.sequence_loss_weighting != "none"
+                ),
+                "sample_weight_mode": config.sequence_loss_weighting,
             }
         )
 
@@ -617,11 +658,12 @@ def _sequence_label_positions(dataset: Any) -> list[int]:
     if not hasattr(dataset, "sequence_positions"):
         raise TypeError("Expected a DreamtSequenceDataset-like object.")
     if getattr(dataset, "label_mode", "many_to_one") == "many_to_many":
-        return [
+        unique_positions = dict.fromkeys(
             int(position)
             for positions in dataset.sequence_positions
             for position in positions
-        ]
+        )
+        return list(unique_positions)
     return _sequence_target_positions(dataset)
 
 
@@ -735,8 +777,10 @@ def class_counts_from_loader(dataloader: Any) -> dict[str, int]:
     label_ids = _label_ids_from_dataset(getattr(dataloader, "dataset", None))
 
     if label_ids is None:
-        for _, y_batch in dataloader:
-            for label_id in y_batch.detach().cpu().numpy().astype(int).tolist():
+        for batch in dataloader:
+            _, y_batch, _ = _unpack_training_batch(batch)
+            batch_labels = y_batch.detach().cpu().numpy().astype(int).reshape(-1)
+            for label_id in batch_labels.tolist():
                 counts[ID_TO_LABEL[int(label_id)]] += 1
     else:
         for label_id in label_ids:
@@ -774,8 +818,9 @@ def build_loss_function(
     """Create the training criterion, optionally with train-only class weights."""
 
     torch = _require_torch()
+    reduction = "none" if config.sequence_label_mode == "many_to_many" else "mean"
     if not config.class_weighting:
-        return torch.nn.CrossEntropyLoss()
+        return torch.nn.CrossEntropyLoss(reduction=reduction)
 
     counts = class_counts_from_loader(train_loader)
     weights = torch.as_tensor(
@@ -783,7 +828,61 @@ def build_loss_function(
         dtype=torch.float32,
         device=device,
     )
-    return torch.nn.CrossEntropyLoss(weight=weights)
+    return torch.nn.CrossEntropyLoss(weight=weights, reduction=reduction)
+
+
+def _unpack_training_batch(batch: Any) -> tuple[Any, Any, Any | None]:
+    """Return ``x``, ``y``, and optional per-target loss weights from a batch."""
+
+    if not isinstance(batch, list | tuple):
+        raise TypeError("Expected dataloader batches to be tuples or lists.")
+    if len(batch) == 2:
+        x_batch, y_batch = batch
+        return x_batch, y_batch, None
+    if len(batch) == 3:
+        x_batch, y_batch, sample_weight_batch = batch
+        return x_batch, y_batch, sample_weight_batch
+    raise ValueError("Expected dataloader batches to contain 2 or 3 items.")
+
+
+def _classification_loss(
+    logits: Any,
+    y_batch: Any,
+    criterion: Any,
+    sample_weight_batch: Any | None = None,
+) -> tuple[Any, float]:
+    """Compute one batch loss and the denominator used for averaging."""
+
+    if y_batch.ndim == 1:
+        loss = criterion(logits, y_batch)
+        if loss.ndim != 0:
+            loss = loss.mean()
+        return loss, float(y_batch.shape[0])
+
+    if y_batch.ndim != 2:
+        raise ValueError("Expected targets to be rank 1 or rank 2.")
+    if logits.ndim != 3:
+        raise ValueError("Many-to-many targets require rank-3 logits.")
+
+    num_classes = int(logits.shape[-1])
+    loss_values = criterion(
+        logits.reshape(-1, num_classes),
+        y_batch.reshape(-1),
+    )
+    if loss_values.ndim == 0:
+        return loss_values, float(y_batch.numel())
+
+    loss_values = loss_values.reshape(y_batch.shape)
+    if sample_weight_batch is None:
+        return loss_values.mean(), float(y_batch.numel())
+
+    weights = sample_weight_batch.to(
+        device=loss_values.device,
+        dtype=loss_values.dtype,
+    )
+    denominator = weights.sum().clamp_min(1e-12)
+    loss = (loss_values * weights).sum() / denominator
+    return loss, float(denominator.detach().cpu().item())
 
 
 def train_one_epoch(
@@ -800,18 +899,21 @@ def train_one_epoch(
     total_loss = 0.0
     total_examples = 0
 
-    for x_batch, y_batch in dataloader:
+    for batch in dataloader:
+        x_batch, y_batch, sample_weight_batch = _unpack_training_batch(batch)
         x_batch = x_batch.to(device=device, dtype=_require_torch().float32)
         y_batch = y_batch.to(device=device)
-        if y_batch.ndim != 1:
-            raise ValueError(
-                "train_one_epoch currently supports many-to-one targets only. "
-                "Add sequence loss handling before many-to-many training."
-            )
+        if sample_weight_batch is not None:
+            sample_weight_batch = sample_weight_batch.to(device=device)
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(x_batch)
-        loss = criterion(logits, y_batch)
+        loss, batch_denominator = _classification_loss(
+            logits,
+            y_batch,
+            criterion,
+            sample_weight_batch=sample_weight_batch,
+        )
         loss.backward()
         if max_grad_norm is not None:
             _require_torch().nn.utils.clip_grad_norm_(
@@ -820,13 +922,216 @@ def train_one_epoch(
             )
         optimizer.step()
 
-        batch_size = int(y_batch.shape[0])
-        total_loss += float(loss.item()) * batch_size
-        total_examples += batch_size
+        total_loss += float(loss.item()) * batch_denominator
+        total_examples += batch_denominator
 
     if total_examples == 0:
         raise ValueError("Cannot train on an empty dataloader.")
     return total_loss / total_examples
+
+
+def _safe_label_name(label: str) -> str:
+    return label.replace("-", "_").replace(" ", "_")
+
+
+def _probability_column(label: str) -> str:
+    return f"prob_{_safe_label_name(label)}"
+
+
+def _sequence_aggregation_methods(config: TrainConfig | None) -> list[str]:
+    if config is None:
+        return ["uniform"]
+
+    methods = [
+        config.sequence_aggregation,
+        *list(config.sequence_extra_aggregations),
+    ]
+    unique_methods = list(
+        dict.fromkeys(method for method in methods if method != "none")
+    )
+    return unique_methods or ["uniform"]
+
+
+def _sequence_position_weights(sequence_length: int, method: str) -> np.ndarray:
+    if method == "uniform":
+        return np.ones(sequence_length, dtype=np.float64)
+    if method == "center_weighted":
+        positions = np.arange(sequence_length, dtype=np.float64)
+        center = (sequence_length - 1) / 2.0
+        max_distance = max(center, sequence_length - 1 - center)
+        return max_distance + 1.0 - np.abs(positions - center)
+    raise ValueError(f"Unsupported sequence aggregation method: {method}")
+
+
+def _unwrap_dataset_indices(
+    dataset: Any,
+    indices: Sequence[int],
+) -> tuple[Any, list[int]]:
+    if hasattr(dataset, "indices") and hasattr(dataset, "dataset"):
+        parent_indices = [int(dataset.indices[int(index)]) for index in indices]
+        return _unwrap_dataset_indices(dataset.dataset, parent_indices)
+    return dataset, [int(index) for index in indices]
+
+
+def _sequence_positions_for_dataset_indices(
+    dataset: Any,
+    indices: Sequence[int],
+) -> tuple[Any, list[int], list[list[int]]]:
+    root_dataset, root_indices = _unwrap_dataset_indices(dataset, indices)
+    if not hasattr(root_dataset, "sequence_positions"):
+        raise TypeError("Expected a DreamtSequenceDataset-like object.")
+    sequence_positions = [
+        [int(position) for position in root_dataset.sequence_positions[index]]
+        for index in root_indices
+    ]
+    return root_dataset, root_indices, sequence_positions
+
+
+def _epoch_prediction_identity(
+    dataset: Any,
+    epoch_index_position: int,
+) -> tuple[tuple[Any, Any], dict[str, Any]]:
+    row = dataset.epoch_index.iloc[int(epoch_index_position)]
+    participant_id = str(row.get("participant_id", ""))
+    epoch_id = row.get("epoch_id", int(epoch_index_position))
+    key = (participant_id, epoch_id)
+    payload = {
+        "participant_id": participant_id,
+        "epoch_id": epoch_id,
+        "epoch_index_position": int(epoch_index_position),
+        "true_label": str(row["mapped_label"]),
+    }
+    return key, payload
+
+
+def _sequence_position_prediction_frame(
+    dataset: Any,
+    sequence_indices: Sequence[int],
+    sequence_positions: Sequence[Sequence[int]],
+    probabilities: np.ndarray,
+    y_true_ids: np.ndarray,
+    aggregation_method: str,
+) -> pd.DataFrame:
+    position_weights = _sequence_position_weights(
+        int(probabilities.shape[1]),
+        aggregation_method,
+    )
+    pred_ids = probabilities.argmax(axis=2)
+    rows: list[dict[str, Any]] = []
+
+    for row_index, positions in enumerate(sequence_positions):
+        for position_in_sequence, epoch_index_position in enumerate(positions):
+            _, identity = _epoch_prediction_identity(dataset, epoch_index_position)
+            row: dict[str, Any] = {
+                "sequence_index": int(sequence_indices[row_index]),
+                "position_in_sequence": int(position_in_sequence),
+                "aggregation_weight": float(position_weights[position_in_sequence]),
+                **identity,
+                "true_label": ID_TO_LABEL[
+                    int(y_true_ids[row_index, position_in_sequence])
+                ],
+                "pred_label": ID_TO_LABEL[
+                    int(pred_ids[row_index, position_in_sequence])
+                ],
+            }
+            for class_index, label in ID_TO_LABEL.items():
+                row[_probability_column(label)] = float(
+                    probabilities[row_index, position_in_sequence, int(class_index)]
+                )
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _aggregate_sequence_probabilities(
+    dataset: Any,
+    sequence_positions: Sequence[Sequence[int]],
+    probabilities: np.ndarray,
+    aggregation_method: str,
+    model_name: str,
+    split: str,
+) -> dict[str, Any]:
+    position_weights = _sequence_position_weights(
+        int(probabilities.shape[1]),
+        aggregation_method,
+    )
+    aggregates: dict[tuple[Any, Any], dict[str, Any]] = {}
+
+    for sequence_index, positions in enumerate(sequence_positions):
+        for position_in_sequence, epoch_index_position in enumerate(positions):
+            key, identity = _epoch_prediction_identity(dataset, epoch_index_position)
+            if key not in aggregates:
+                aggregates[key] = {
+                    **identity,
+                    "probability_sum": np.zeros(len(TARGET_LABELS), dtype=np.float64),
+                    "weight_sum": 0.0,
+                    "n_predictions": 0,
+                }
+            weight = float(position_weights[position_in_sequence])
+            aggregates[key]["probability_sum"] += (
+                probabilities[sequence_index, position_in_sequence] * weight
+            )
+            aggregates[key]["weight_sum"] = (
+                float(aggregates[key]["weight_sum"]) + weight
+            )
+            aggregates[key]["n_predictions"] = int(aggregates[key]["n_predictions"]) + 1
+
+    rows: list[dict[str, Any]] = []
+    y_true: list[str] = []
+    y_pred: list[str] = []
+    for aggregate in aggregates.values():
+        averaged_probabilities = aggregate["probability_sum"] / float(
+            aggregate["weight_sum"]
+        )
+        pred_label = ID_TO_LABEL[int(np.argmax(averaged_probabilities))]
+        true_label = str(aggregate["true_label"])
+        row = {
+            "participant_id": aggregate["participant_id"],
+            "epoch_id": aggregate["epoch_id"],
+            "epoch_index_position": aggregate["epoch_index_position"],
+            "true_label": true_label,
+            "pred_label": pred_label,
+            "n_predictions": int(aggregate["n_predictions"]),
+            "aggregation_weight_sum": float(aggregate["weight_sum"]),
+        }
+        for class_index, label in ID_TO_LABEL.items():
+            row[_probability_column(label)] = float(
+                averaged_probabilities[int(class_index)]
+            )
+        rows.append(row)
+        y_true.append(true_label)
+        y_pred.append(pred_label)
+
+    metrics, confusion = evaluate_predictions(
+        y_true,
+        y_pred,
+        model_name=model_name,
+        split=split,
+        labels=TARGET_LABELS,
+    )
+    metrics["aggregation_method"] = aggregation_method
+    metrics["n_aggregated_epochs"] = len(rows)
+    metrics["mean_predictions_per_epoch"] = float(
+        np.mean([row["n_predictions"] for row in rows])
+    )
+    return {
+        "metrics": metrics,
+        "confusion_matrix": confusion,
+        "epoch_predictions": pd.DataFrame(rows),
+    }
+
+
+def _prefix_metrics(
+    metrics: Mapping[str, Any],
+    prefix: str,
+    skip_keys: Sequence[str] = ("model", "split", "aggregation_method"),
+) -> dict[str, Any]:
+    skip_key_set = set(skip_keys)
+    return {
+        f"{prefix}_{key}": value
+        for key, value in metrics.items()
+        if key not in skip_key_set
+    }
 
 
 def evaluate_model(
@@ -836,6 +1141,7 @@ def evaluate_model(
     device: Any,
     model_name: str,
     split: str = "validation",
+    config: TrainConfig | None = None,
 ) -> dict[str, Any]:
     """Evaluate a model and return loss, metrics, predictions, and confusion."""
 
@@ -845,25 +1151,49 @@ def evaluate_model(
     total_examples = 0
     true_ids: list[int] = []
     pred_ids: list[int] = []
+    sequence_true_batches: list[np.ndarray] = []
+    sequence_probability_batches: list[np.ndarray] = []
+    sequence_indices: list[int] = []
+    sequence_offset = 0
 
     with torch.no_grad():
-        for x_batch, y_batch in dataloader:
+        for batch in dataloader:
+            x_batch, y_batch, sample_weight_batch = _unpack_training_batch(batch)
             x_batch = x_batch.to(device=device, dtype=torch.float32)
             y_batch = y_batch.to(device=device)
-            if y_batch.ndim != 1:
-                raise ValueError(
-                    "evaluate_model currently supports many-to-one targets only. "
-                    "Add sequence evaluation before many-to-many training."
-                )
+            if sample_weight_batch is not None:
+                sample_weight_batch = sample_weight_batch.to(device=device)
             logits = model(x_batch)
-            loss = criterion(logits, y_batch)
-            predictions = logits.argmax(dim=1)
+            loss, batch_denominator = _classification_loss(
+                logits,
+                y_batch,
+                criterion,
+                sample_weight_batch=sample_weight_batch,
+            )
 
-            batch_size = int(y_batch.shape[0])
-            total_loss += float(loss.item()) * batch_size
-            total_examples += batch_size
-            true_ids.extend(y_batch.detach().cpu().numpy().astype(int).tolist())
-            pred_ids.extend(predictions.detach().cpu().numpy().astype(int).tolist())
+            if y_batch.ndim == 1:
+                predictions = logits.argmax(dim=1)
+                true_ids.extend(y_batch.detach().cpu().numpy().astype(int).tolist())
+                pred_ids.extend(predictions.detach().cpu().numpy().astype(int).tolist())
+            else:
+                probabilities = torch.softmax(logits, dim=2)
+                predictions = logits.argmax(dim=2)
+                true_array = y_batch.detach().cpu().numpy().astype(int)
+                pred_array = predictions.detach().cpu().numpy().astype(int)
+                true_ids.extend(true_array.reshape(-1).tolist())
+                pred_ids.extend(pred_array.reshape(-1).tolist())
+                sequence_true_batches.append(true_array)
+                sequence_probability_batches.append(
+                    probabilities.detach().cpu().numpy().astype(np.float64)
+                )
+                batch_size = int(y_batch.shape[0])
+                sequence_indices.extend(
+                    range(sequence_offset, sequence_offset + batch_size)
+                )
+                sequence_offset += batch_size
+
+            total_loss += float(loss.item()) * batch_denominator
+            total_examples += batch_denominator
 
     if total_examples == 0:
         raise ValueError("Cannot evaluate an empty dataloader.")
@@ -877,6 +1207,66 @@ def evaluate_model(
         split=split,
         labels=TARGET_LABELS,
     )
+    if sequence_probability_batches:
+        probabilities = np.concatenate(sequence_probability_batches, axis=0)
+        sequence_true_ids = np.concatenate(sequence_true_batches, axis=0)
+        root_dataset, root_indices, sequence_positions = (
+            _sequence_positions_for_dataset_indices(
+                getattr(dataloader, "dataset", None),
+                sequence_indices,
+            )
+        )
+        aggregation_methods = _sequence_aggregation_methods(config)
+        primary_method = aggregation_methods[0]
+        primary = _aggregate_sequence_probabilities(
+            root_dataset,
+            sequence_positions,
+            probabilities,
+            aggregation_method=primary_method,
+            model_name=model_name,
+            split=split,
+        )
+        raw_metrics = dict(metrics)
+        metrics = dict(primary["metrics"])
+        metrics.update(_prefix_metrics(raw_metrics, "sequence_position"))
+
+        extra_confusions: dict[str, pd.DataFrame] = {}
+        aggregated_predictions: dict[str, pd.DataFrame] = {
+            primary_method: primary["epoch_predictions"],
+        }
+        sequence_position_predictions = _sequence_position_prediction_frame(
+            root_dataset,
+            root_indices,
+            sequence_positions,
+            probabilities,
+            sequence_true_ids,
+            aggregation_method=primary_method,
+        )
+        for method in aggregation_methods[1:]:
+            result = _aggregate_sequence_probabilities(
+                root_dataset,
+                sequence_positions,
+                probabilities,
+                aggregation_method=method,
+                model_name=model_name,
+                split=split,
+            )
+            metrics.update(_prefix_metrics(result["metrics"], method))
+            extra_confusions[method] = result["confusion_matrix"]
+            aggregated_predictions[method] = result["epoch_predictions"]
+
+        return {
+            "loss": total_loss / total_examples,
+            "metrics": metrics,
+            "confusion_matrix": primary["confusion_matrix"],
+            "sequence_position_confusion_matrix": confusion,
+            "extra_confusion_matrices": extra_confusions,
+            "sequence_position_predictions": sequence_position_predictions,
+            "aggregated_epoch_predictions": aggregated_predictions,
+            "y_true": y_true,
+            "y_pred": y_pred,
+        }
+
     return {
         "loss": total_loss / total_examples,
         "metrics": metrics,
@@ -1094,7 +1484,8 @@ def train_model(
     model = model.to(device)
 
     criterion = build_loss_function(train_loader, config, device)
-    eval_criterion = torch.nn.CrossEntropyLoss()
+    eval_reduction = "none" if config.sequence_label_mode == "many_to_many" else "mean"
+    eval_criterion = torch.nn.CrossEntropyLoss(reduction=eval_reduction)
     train_eval_loader = _evaluation_loader_from_training_loader(train_loader)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1110,6 +1501,10 @@ def train_model(
     stale_epochs = 0
     best_metrics: dict[str, Any] = {}
     best_confusion: pd.DataFrame | None = None
+    best_sequence_position_confusion: pd.DataFrame | None = None
+    best_extra_confusions: dict[str, pd.DataFrame] = {}
+    best_sequence_position_predictions: pd.DataFrame | None = None
+    best_aggregated_epoch_predictions: dict[str, pd.DataFrame] = {}
     best_checkpoint = checkpoints_dir / "best.pt"
     last_checkpoint = checkpoints_dir / "last.pt"
 
@@ -1140,6 +1535,7 @@ def train_model(
             device,
             model_name=config.model_name,
             split="validation",
+            config=config,
         )
         validation_seconds = time.perf_counter() - validation_start_time
         validation_cache_loads = (
@@ -1175,6 +1571,7 @@ def train_model(
                 device,
                 model_name=config.model_name,
                 split="train",
+                config=config,
             )
             train_eval_seconds = time.perf_counter() - train_eval_start_time
             train_eval_cache_loads = (
@@ -1232,6 +1629,16 @@ def train_model(
             best_epoch = epoch
             best_metrics = history_row.copy()
             best_confusion = validation["confusion_matrix"]
+            best_sequence_position_confusion = validation.get(
+                "sequence_position_confusion_matrix"
+            )
+            best_extra_confusions = dict(validation.get("extra_confusion_matrices", {}))
+            best_sequence_position_predictions = validation.get(
+                "sequence_position_predictions"
+            )
+            best_aggregated_epoch_predictions = dict(
+                validation.get("aggregated_epoch_predictions", {})
+            )
             save_checkpoint(
                 best_checkpoint,
                 model,
@@ -1267,6 +1674,22 @@ def train_model(
         plot_confusion_matrix(
             best_confusion,
             output_dir / "validation_confusion_matrix.png",
+        )
+    if best_sequence_position_confusion is not None:
+        best_sequence_position_confusion.to_csv(
+            output_dir / "validation_sequence_position_confusion_matrix.csv"
+        )
+    for method, confusion in best_extra_confusions.items():
+        confusion.to_csv(output_dir / f"validation_confusion_matrix_{method}.csv")
+    if best_sequence_position_predictions is not None:
+        best_sequence_position_predictions.to_csv(
+            output_dir / "validation_sequence_position_predictions.csv",
+            index=False,
+        )
+    for method, predictions in best_aggregated_epoch_predictions.items():
+        predictions.to_csv(
+            output_dir / f"validation_aggregated_epoch_predictions_{method}.csv",
+            index=False,
         )
 
     return TrainingResult(
@@ -1800,6 +2223,293 @@ def run_stage11_experiments(
     best_confusion_path = (
         Path(str(best_row["output_dir"])) / "validation_confusion_matrix.csv"
     )
+    if best_confusion_path.exists():
+        best_confusion = pd.read_csv(best_confusion_path, index_col=0)
+        best_confusion.to_csv(stage_dir / "best_validation_confusion_matrix.csv")
+
+    return summary
+
+
+def stage12_experiment_id(config: TrainConfig) -> str:
+    """Return a stable short ID for one Stage 12 many-to-many CNN-GRU config."""
+
+    config_dict = config_to_dict(config)
+    stable_keys = [
+        "model_name",
+        "channels",
+        "batch_size",
+        "dataset_dtype",
+        "participant_array_cache_dir",
+        "epochs",
+        "learning_rate",
+        "weight_decay",
+        "filters",
+        "kernel_size",
+        "dropout",
+        "sequence_length",
+        "sequence_stride",
+        "sequence_label_mode",
+        "sequence_loss_weighting",
+        "sequence_aggregation",
+        "sequence_extra_aggregations",
+        "gru_hidden_size",
+        "gru_num_layers",
+        "gru_dropout",
+        "gru_bidirectional",
+        "class_weighting",
+        "max_grad_norm",
+        "patience",
+        "min_delta",
+        "train_eval_interval",
+        "random_seed",
+        "max_train_participants",
+        "max_val_participants",
+    ]
+    payload = {key: config_dict.get(key) for key in stable_keys}
+    digest = sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:10]
+    return f"stage12_cnn_gru_m2m_s{config.sequence_length}_{digest}"
+
+
+def build_stage12_many_to_many_configs(
+    base_config: TrainConfig | None = None,
+    output_dir: str | Path = DEFAULT_STAGE12_OUTPUT_DIR,
+    sequence_lengths: Sequence[int] = (5, 11),
+    aggregation_methods: Sequence[str] = ("uniform", "center_weighted"),
+) -> list[TrainConfig]:
+    """Create Stage 12 many-to-many CNN-GRU comparison configs."""
+
+    if not sequence_lengths:
+        raise ValueError("At least one sequence length is required.")
+    invalid_lengths = [length for length in sequence_lengths if int(length) <= 1]
+    if invalid_lengths:
+        raise ValueError(f"Sequence lengths must be greater than 1: {invalid_lengths}")
+    aggregation_methods = tuple(dict.fromkeys(aggregation_methods))
+    if not aggregation_methods:
+        raise ValueError("At least one aggregation method is required.")
+    invalid_methods = [
+        method
+        for method in aggregation_methods
+        if method not in {"uniform", "center_weighted"}
+    ]
+    if invalid_methods:
+        raise ValueError(f"Invalid aggregation method(s): {invalid_methods}")
+
+    primary_aggregation = aggregation_methods[0]
+    extra_aggregations = aggregation_methods[1:]
+    base = base_config or TrainConfig(
+        output_dir=output_dir,
+        model_name="cnn_gru_stage12_many_to_many",
+        batch_size=8,
+        epochs=40,
+        learning_rate=1e-3,
+        weight_decay=1e-4,
+        dropout=0.10,
+        class_weighting=True,
+        max_grad_norm=1.0,
+        patience=8,
+        train_eval_interval=None,
+        participant_array_cache_dir=DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
+        sequence_stride=1,
+        sequence_label_mode="many_to_many",
+        sequence_target_position="center",
+        sequence_loss_weighting="inverse_epoch_coverage",
+        sequence_aggregation=primary_aggregation,
+        sequence_extra_aggregations=extra_aggregations,
+        gru_hidden_size=64,
+        gru_num_layers=1,
+        gru_dropout=0.0,
+        gru_bidirectional=False,
+    )
+
+    configs: list[TrainConfig] = []
+    for sequence_length in sequence_lengths:
+        sequence_length = int(sequence_length)
+        configs.append(
+            replace(
+                base,
+                output_dir=output_dir,
+                model_name=f"cnn_gru_stage12_m2m_s{sequence_length}",
+                context_radius=0,
+                comparison_context_radius=None,
+                sequence_length=sequence_length,
+                sequence_label_mode="many_to_many",
+                sequence_loss_weighting="inverse_epoch_coverage",
+                sequence_aggregation=primary_aggregation,
+                sequence_extra_aggregations=extra_aggregations,
+            )
+        )
+    return configs
+
+
+def _base_aggregation_metric_keys() -> set[str]:
+    keys = {
+        "accuracy",
+        "balanced_accuracy",
+        "macro_f1",
+        "aggregation_method",
+        "n_aggregated_epochs",
+        "mean_predictions_per_epoch",
+    }
+    for label in TARGET_LABELS:
+        safe_label = _safe_label_name(label)
+        keys.update(
+            {
+                f"{safe_label}_precision",
+                f"{safe_label}_recall",
+                f"{safe_label}_f1",
+            }
+        )
+    return keys
+
+
+def _stage12_metric_row_for_aggregation(
+    best_metrics: Mapping[str, Any],
+    method: str,
+    primary_method: str,
+) -> dict[str, Any]:
+    common_keys = {
+        "epoch",
+        "train_eval_ran",
+        "epoch_seconds",
+        "train_seconds",
+        "train_eval_seconds",
+        "validation_seconds",
+        "train_cache_loads",
+        "train_eval_cache_loads",
+        "validation_cache_loads",
+        "train_loss",
+        "train_objective_loss",
+        "validation_loss",
+        "best_epoch",
+    }
+    metric_keys = _base_aggregation_metric_keys()
+    row = {
+        key: value
+        for key, value in best_metrics.items()
+        if key in common_keys or key.startswith("sequence_position_")
+    }
+    if method == primary_method:
+        row.update(
+            {
+                key: value
+                for key, value in best_metrics.items()
+                if key in metric_keys
+            }
+        )
+        return row
+
+    prefix = f"{method}_"
+    row.update(
+        {
+            key.removeprefix(prefix): value
+            for key, value in best_metrics.items()
+            if key.startswith(prefix)
+        }
+    )
+    row["aggregation_method"] = method
+    return row
+
+
+def run_stage12_experiments(
+    configs: Sequence[TrainConfig],
+    output_dir: str | Path = DEFAULT_STAGE12_OUTPUT_DIR,
+) -> pd.DataFrame:
+    """Run Stage 12 many-to-many CNN-GRU experiments.
+
+    Each config trains once. The summary contains one row per requested
+    aggregation method, so uniform and center-weighted probability averaging
+    can be compared without duplicating training.
+    """
+
+    if not configs:
+        raise ValueError("At least one Stage 12 configuration is required.")
+
+    stage_dir = Path(output_dir)
+    runs_dir = stage_dir / "runs"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    _prefit_preprocessing_metadata(configs)
+
+    summary_rows: list[dict[str, Any]] = []
+    history_frames: list[pd.DataFrame] = []
+
+    for config in configs:
+        _validate_training_config(config)
+        if config.sequence_label_mode != "many_to_many":
+            raise ValueError("Stage 12 configs must use many_to_many labels.")
+        if config.sequence_loss_weighting != "inverse_epoch_coverage":
+            raise ValueError(
+                "Stage 12 configs must use inverse_epoch_coverage loss weighting."
+            )
+
+        experiment_id = stage12_experiment_id(config)
+        run_dir = runs_dir / experiment_id
+        run_config = replace(config, output_dir=run_dir)
+        loaders = build_train_validation_dataloaders(run_config)
+        result = train_model(
+            loaders["train"],
+            loaders["validation"],
+            run_config,
+        )
+
+        config_row = config_to_dict(run_config)
+        methods = _sequence_aggregation_methods(run_config)
+        for method in methods:
+            metric_row = _stage12_metric_row_for_aggregation(
+                result.best_metrics,
+                method=method,
+                primary_method=methods[0],
+            )
+            summary_rows.append(
+                {
+                    "experiment_id": experiment_id,
+                    "model_family": "cnn_gru_many_to_many",
+                    "aggregation_method": method,
+                    "train_examples": len(loaders["train"].dataset),
+                    "validation_examples": len(loaders["validation"].dataset),
+                    "best_epoch": result.best_epoch,
+                    "output_dir": str(result.output_dir),
+                    **config_row,
+                    **metric_row,
+                }
+            )
+
+        if not result.history.empty:
+            history = result.history.copy()
+            history.insert(0, "experiment_id", experiment_id)
+            history.insert(1, "sequence_length", run_config.sequence_length)
+            history.insert(2, "model_family", "cnn_gru_many_to_many")
+            history_frames.append(history)
+
+    summary = pd.DataFrame(summary_rows)
+    sort_columns, ascending = _summary_sort_columns(summary)
+    summary = summary.sort_values(sort_columns, ascending=ascending).reset_index(
+        drop=True
+    )
+    summary.to_csv(stage_dir / "experiment_summary.csv", index=False)
+
+    if history_frames:
+        all_history = pd.concat(history_frames, ignore_index=True)
+        all_history.to_csv(stage_dir / "all_history.csv", index=False)
+
+    best_by_length = (
+        summary.sort_values(sort_columns, ascending=ascending)
+        .groupby("sequence_length", as_index=False, sort=True)
+        .head(1)
+        .reset_index(drop=True)
+    )
+    best_by_length.to_csv(stage_dir / "best_by_sequence_length.csv", index=False)
+
+    best_row = summary.iloc[0].to_dict()
+    _save_json(best_row, stage_dir / "best_config.json")
+    method = str(best_row["aggregation_method"])
+    run_dir = Path(str(best_row["output_dir"]))
+    if method == str(best_row["sequence_aggregation"]):
+        best_confusion_path = run_dir / "validation_confusion_matrix.csv"
+    else:
+        best_confusion_path = run_dir / f"validation_confusion_matrix_{method}.csv"
     if best_confusion_path.exists():
         best_confusion = pd.read_csv(best_confusion_path, index_col=0)
         best_confusion.to_csv(stage_dir / "best_validation_confusion_matrix.csv")
