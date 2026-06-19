@@ -123,8 +123,9 @@ are available, the notebook writes:
 
 The test feature table is saved for later final evaluation only. Stage 6 model
 selection uses participant-level cross-validation within the training split.
-The validation split is used for interim evaluation and XGBoost permutation
-importance; the test split is not used for tuning, feature selection,
+The validation split is used for interim evaluation, feature-level permutation
+importance, and feature-group permutation importance; the test split is not
+used for tuning, feature selection,
 permutation importance, or interim conclusions.
 
 Current baseline models in the notebook are:
@@ -132,7 +133,8 @@ Current baseline models in the notebook are:
 - majority-class classifier as a sanity check
 - balanced elastic-net multinomial logistic regression in a scikit-learn
   imputation/scaling/model pipeline
-- XGBoost trained on all engineered features with modest training-CV tuning
+- balanced XGBoost trained on all engineered features with modest training-CV
+  tuning
 
 ## Deep Learning Tensor Preparation
 
@@ -379,8 +381,13 @@ write interim validation diagnostics:
 - `results/ablation_results.csv`
 - `results/confusion_matrix.png`
 - `results/figures/`
-- `results/stage6_validation_metrics.csv`
-- `results/stage6_xgboost_validation_permutation_importance.csv`
+- `results/stage6_feature_baselines/validation_metrics.csv`
+- `results/stage6_feature_baselines/validation_confusion_matrix_<model>.csv`
+- `results/stage6_feature_baselines/validation_confusion_matrix_<model>.png`
+- `results/stage6_feature_baselines/validation_permutation_importance_<model>.csv`
+- `results/stage6_feature_baselines/validation_group_permutation_importance_<model>.csv`
+- `results/stage6_feature_baselines/feature_group_correlation_matrix.csv`
+- `results/stage6_feature_baselines/feature_group_correlation_matrix.png`
 - `results/stage9_training_choices/experiment_summary.csv`
 - `results/stage10_temporal_context_cnn/experiment_summary.csv`
 
