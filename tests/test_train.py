@@ -22,6 +22,7 @@ from src.train import (  # noqa: E402
     class_weights_from_counts,
     evaluate_model,
     load_checkpoint,
+    plot_training_curves,
     resolve_device,
     run_stage9_experiments,
     run_stage10_experiments,
@@ -379,6 +380,43 @@ def test_train_model_respects_train_eval_interval(tmp_path, monkeypatch):
     assert history["train_eval_seconds"].iloc[1] >= 0.0
     assert history["validation_seconds"].ge(0.0).all()
     assert history["train_eval_cache_loads"].tolist() == [0, 0, 0]
+
+
+def test_plot_training_curves_labels_train_objective_and_eval_losses(
+    tmp_path,
+    monkeypatch,
+):
+    import matplotlib.axes
+
+    plot_calls = []
+    original_plot = matplotlib.axes.Axes.plot
+
+    def spy_plot(self, *args, **kwargs):
+        plot_calls.append(kwargs.get("label"))
+        return original_plot(self, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "plot", spy_plot)
+    history = pd.DataFrame(
+        {
+            "epoch": [1, 2, 3],
+            "train_objective_loss": [1.2, 1.1, 1.0],
+            "train_loss": [float("nan"), 0.9, float("nan")],
+            "validation_loss": [1.0, 0.8, 0.7],
+            "train_macro_f1": [float("nan"), 0.4, float("nan")],
+            "macro_f1": [0.3, 0.5, 0.6],
+        }
+    )
+
+    plot_training_curves(history, tmp_path / "training_curves.png")
+
+    assert (tmp_path / "training_curves.png").exists()
+    assert plot_calls == [
+        "train objective",
+        "train eval",
+        "validation eval",
+        "train eval",
+        "validation eval",
+    ]
 
 
 def test_train_eval_interval_must_not_exceed_epochs(tmp_path):

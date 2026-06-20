@@ -173,9 +173,11 @@ PyTorch model training, and monitors validation diagnostics after each epoch.
 Full train-set diagnostics are configurable with `train_eval_interval`: `1`
 keeps the original every-epoch behavior, while `None` evaluates the train split
 only on the final scheduled epoch or the epoch that triggers early stopping.
-`train_history.csv` also records per-epoch phase timings and participant-cache
-load counts for the training pass, optional train evaluation pass, and
-validation pass.
+`train_history.csv` records the per-epoch training objective loss separately
+from optional full-train evaluation loss, and `training_curves.png` labels these
+as distinct curves. It also records per-epoch phase timings and
+participant-cache load counts for the training pass, optional train evaluation
+pass, and validation pass.
 
 Stage 8 evaluates only the validation split. The held-out test split must not
 be used for model prediction or performance reporting until the final project
@@ -205,7 +207,9 @@ per-class precision/recall/F1, validation loss, and confusion matrices used as
 supporting diagnostics.
 The Stage 9 notebook sets `train_eval_interval=None` by default so grid searches
 continue to validate every epoch without rereading the full train split every
-epoch.
+epoch. The training curves therefore show validation loss every epoch, the
+training objective every epoch, and full train-set evaluation metrics only where
+that evaluation pass ran.
 
 Stage 9 still evaluates only the validation split. The held-out test split must
 not be used for model prediction, model selection, error analysis, or
