@@ -59,7 +59,7 @@ def test_grouped_permutation_importance_shuffles_group_together():
     assert scores["HR_IBI_BVP"] > scores["temperature"]
 
 
-def test_feature_group_correlation_matrix_reports_mean_absolute_blocks():
+def test_feature_group_correlation_matrix_reports_mean_absolute_pairwise_blocks():
     X = pd.DataFrame(
         {
             "HR_mean": [0.0, 1.0, 2.0, 3.0],
@@ -77,5 +77,6 @@ def test_feature_group_correlation_matrix_reports_mean_absolute_blocks():
     matrix = feature_group_correlation_matrix(X, groups)
 
     assert np.isclose(matrix.loc["HR_IBI_BVP", "temperature"], 1.0)
+    # Same-group cells average distinct feature pairs, not identity correlations.
     assert np.isclose(matrix.loc["HR_IBI_BVP", "HR_IBI_BVP"], 1.0)
     assert np.isnan(matrix.loc["temperature", "temperature"])

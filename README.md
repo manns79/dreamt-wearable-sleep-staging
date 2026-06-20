@@ -392,6 +392,10 @@ write interim validation diagnostics:
 - `results/stage6_feature_baselines/validation_group_permutation_importance_<model>.csv`
 - `results/stage6_feature_baselines/feature_group_correlation_matrix.csv`
 - `results/stage6_feature_baselines/feature_group_correlation_matrix.png`
+
+The feature-group correlation matrix reports mean absolute pairwise feature
+correlations. Same-group diagonal cells therefore summarize redundancy among
+distinct features in the group and exclude each feature's self-correlation.
 - `results/stage9_training_choices/experiment_summary.csv`
 - `results/stage10_temporal_context_cnn/experiment_summary.csv`
 

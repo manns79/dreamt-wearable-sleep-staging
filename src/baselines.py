@@ -132,7 +132,11 @@ def feature_group_correlation_matrix(
     X: pd.DataFrame,
     groups: Mapping[str, Sequence[str]],
 ) -> pd.DataFrame:
-    """Return mean absolute feature correlations between configured groups."""
+    """Return mean absolute pairwise feature correlations by group.
+
+    Diagonal cells summarize within-group feature redundancy, excluding each
+    feature's self-correlation with itself.
+    """
 
     corr = X.corr(numeric_only=True).abs()
     rows: list[dict[str, object]] = []
