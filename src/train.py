@@ -57,7 +57,7 @@ class TrainConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     filters: Sequence[int] = (16, 32, 64)
-    kernel_size: int = 7
+    kernel_size: int = 31
     dropout: float = 0.10
     context_radius: int = 0
     comparison_context_radius: int | None = None
@@ -181,7 +181,7 @@ def _new_sleep_stage_cnn(in_channels: int, config: TrainConfig | None = None) ->
     from src.models import SleepStageCNN
 
     filters = config.filters if config is not None else (16, 32, 64)
-    kernel_size = config.kernel_size if config is not None else 7
+    kernel_size = config.kernel_size if config is not None else 31
     dropout = config.dropout if config is not None else 0.10
     return SleepStageCNN(
         in_channels=in_channels,

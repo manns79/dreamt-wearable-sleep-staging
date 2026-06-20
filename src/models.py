@@ -60,7 +60,7 @@ class SleepStageCNN(nn.Module):
         in_channels: int,
         num_classes: int = 3,
         filters: Sequence[int] = (16, 32, 64),
-        kernel_size: int = 7,
+        kernel_size: int = 31,
         dropout: float = 0.10,
     ):
         super().__init__()
@@ -115,7 +115,7 @@ class SleepStageCNNGRU(nn.Module):
         in_channels: int,
         num_classes: int = 3,
         filters: Sequence[int] = (16, 32, 64),
-        kernel_size: int = 7,
+        kernel_size: int = 31,
         dropout: float = 0.10,
         gru_hidden_size: int = 64,
         gru_num_layers: int = 1,
