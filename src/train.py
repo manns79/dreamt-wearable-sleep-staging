@@ -1398,7 +1398,7 @@ def _save_json(payload: Mapping[str, Any], path: Path) -> None:
 
 
 def plot_training_curves(history: pd.DataFrame, path: str | Path) -> Path:
-    """Save training-objective, evaluation-loss, and macro-F1 curves."""
+    """Save training-objective loss and validation macro-F1 curves."""
 
     import matplotlib.pyplot as plt
 
@@ -1406,47 +1406,21 @@ def plot_training_curves(history: pd.DataFrame, path: str | Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    if "train_objective_loss" in history.columns:
-        axes[0].plot(
-            history["epoch"],
-            history["train_objective_loss"],
-            marker="o",
-            label="train objective",
-        )
-    if "train_loss" in history.columns and history["train_loss"].notna().any():
-        axes[0].plot(
-            history["epoch"],
-            history["train_loss"],
-            linestyle="--",
-            marker="o",
-            label="train eval",
-        )
     axes[0].plot(
         history["epoch"],
-        history["validation_loss"],
+        history["train_objective_loss"],
         marker="o",
-        label="validation eval",
     )
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
-    axes[0].legend()
 
-    if "train_macro_f1" in history.columns and history["train_macro_f1"].notna().any():
-        axes[1].plot(
-            history["epoch"],
-            history["train_macro_f1"],
-            marker="o",
-            label="train eval",
-        )
     axes[1].plot(
         history["epoch"],
         history["macro_f1"],
         marker="o",
-        label="validation eval",
     )
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Macro F1")
-    axes[1].legend()
 
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=150)

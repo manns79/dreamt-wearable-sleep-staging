@@ -382,20 +382,27 @@ def test_train_model_respects_train_eval_interval(tmp_path, monkeypatch):
     assert history["train_eval_cache_loads"].tolist() == [0, 0, 0]
 
 
-def test_plot_training_curves_labels_train_objective_and_eval_losses(
+def test_plot_training_curves_shows_objective_loss_and_validation_macro_f1(
     tmp_path,
     monkeypatch,
 ):
     import matplotlib.axes
 
+    legend_calls = []
     plot_calls = []
     original_plot = matplotlib.axes.Axes.plot
+    original_legend = matplotlib.axes.Axes.legend
 
     def spy_plot(self, *args, **kwargs):
         plot_calls.append(kwargs.get("label"))
         return original_plot(self, *args, **kwargs)
 
+    def spy_legend(self, *args, **kwargs):
+        legend_calls.append(True)
+        return original_legend(self, *args, **kwargs)
+
     monkeypatch.setattr(matplotlib.axes.Axes, "plot", spy_plot)
+    monkeypatch.setattr(matplotlib.axes.Axes, "legend", spy_legend)
     history = pd.DataFrame(
         {
             "epoch": [1, 2, 3],
@@ -410,13 +417,8 @@ def test_plot_training_curves_labels_train_objective_and_eval_losses(
     plot_training_curves(history, tmp_path / "training_curves.png")
 
     assert (tmp_path / "training_curves.png").exists()
-    assert plot_calls == [
-        "train objective",
-        "train eval",
-        "validation eval",
-        "train eval",
-        "validation eval",
-    ]
+    assert plot_calls == [None, None]
+    assert legend_calls == []
 
 
 def test_train_eval_interval_must_not_exceed_epochs(tmp_path):
