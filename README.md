@@ -2,25 +2,47 @@
 
 ## Project Overview
 
-This repository is the initial scaffold for a deep learning project focused on wearable-based sleep stage classification using the DREAMT dataset. The goal is to develop a reproducible deep learning workflow that uses physiological signals from wearable devices to classify sleep stages.
+This repository contains an in-progress, reproducible Python workflow for wearable-based sleep stage classification using the DREAMT dataset. The current target is three-class sleep staging: `Wake`, `Non-REM`, and `REM`.
 
-The repository is currently in an initial scaffold stage. Core implementation details, experiments, model training code, and final results will be added as the project develops.
+It now includes reusable source modules, staged notebooks, automated tests, engineered feature baselines, PyTorch dataset utilities, 1D CNN training workflows, temporal-context CNN comparisons, and CNN-GRU sequence-model utilities. Raw data, trained checkpoints, and final held-out test results are not committed.
+
+## Current Status
+
+| Stage | Status | Main files |
+| --- | --- | --- |
+| 1. Dataset inventory | Implemented | `notebooks/01_dataset_overview.ipynb`, `src/data.py` |
+| 2. Label mapping audit | Implemented | `notebooks/01_dataset_overview.ipynb`, `src/preprocessing.py` |
+| 3. Participant split | Implemented | `src/data.py` |
+| 4. Epoch index construction | Implemented | `src/data.py`, `src/preprocessing.py` |
+| 5. Training-set EDA | Implemented | `notebooks/02_train_set_eda.ipynb`, `src/plots.py` |
+| 6. Engineered feature baselines | Implemented | `notebooks/03_feature_baselines.ipynb`, `src/features.py`, `src/baselines.py`, `src/evaluate.py` |
+| 7. PyTorch tensor datasets | Implemented | `src/data.py`, `notebooks/04_cnn_training.ipynb` |
+| 8. First 1D CNN training loop | Implemented | `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
+| 9. Single-epoch CNN training choices | Implemented as guarded validation runs | `src/train.py`, `notebooks/04_cnn_training.ipynb` |
+| 10. Temporal-context CNN comparison | Implemented as guarded validation runs | `src/train.py`, `notebooks/04_cnn_training.ipynb` |
+| 11. Many-to-one CNN-GRU comparison | Implemented as guarded validation runs | `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
+| 12. Many-to-many CNN-GRU aggregation | Implemented as guarded validation runs | `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
+| Error analysis | Placeholder notebook | `notebooks/05_error_analysis.ipynb` |
+
+The guarded training cells are disabled by default so routine notebook
+execution does not launch long experiments. When enabled locally, they write
+stage-specific artifacts under `results/stage*/`.
 
 ## Dataset
 
-The project will use the DREAMT dataset, which contains wearable physiological signals relevant to sleep analysis. Raw DREAMT data should not be committed to GitHub. Real dataset files should remain local and should be handled according to the dataset access terms and privacy requirements. 
+The project uses the DREAMT dataset, which contains wearable physiological signals relevant to sleep analysis. Raw DREAMT data should not be committed to GitHub. Real dataset files should remain local and should be handled according to the dataset access terms and privacy requirements.
 
-Local data files should be placed under `data/raw/`, while intermediate and processed modeling files should remain in local-only data folders. A small synthetic dataset will be added later for illustrative purposes, but it will be clearly separated from the real DREAMT data.
+Local data files should be placed under `data/raw/`, while intermediate and processed modeling files should remain in local-only data folders. `data/README.md` documents the expected local data products in more detail.
 
 ## Prediction Task
 
-The target task will likely be three-class sleep staging:
+The target task is three-class sleep staging:
 
-- Wake
-- REM
-- Non-REM
+- `Wake`
+- `Non-REM`
+- `REM`
 
-Participant-level train, validation, and test splits will be used wherever possible to reduce data leakage risk. The project will avoid using validation or test information during exploratory analysis, feature engineering, preprocessing decisions, and model selection.
+Participant-level train, validation, and test splits are used to reduce data leakage risk. The workflow avoids using validation or test information during exploratory analysis, feature engineering, preprocessing decisions, and model selection.
 
 ## Participant Split
 
@@ -153,7 +175,7 @@ imputation and per-channel standardization, then saved locally at:
 
 For repeated CNN training, raw participant CSVs can be converted once into
 per-participant `.npy` arrays under `data/processed/deep/participants/`.
-Stage 9 and Stage 10 notebook configs opt into this processed cache with
+Stage 9 through Stage 12 notebook configs opt into this processed cache with
 `participant_array_cache_dir`; the first configured run builds the cache if its
 manifest is missing, and later runs memory-map the arrays instead of reparsing
 CSV files.
@@ -248,10 +270,8 @@ The default comparison runs:
 
 Validation macro F1 remains the primary selection metric, with balanced
 accuracy, validation loss, class-level precision/recall/F1, and confusion
-matrices used as supporting diagnostics. Broader hyperparameter tuning is held
-for Stage 11, where the context radius and other context-CNN choices can be
-varied more systematically. Stage 10 still evaluates only the validation split;
-the held-out test split remains unused.
+matrices used as supporting diagnostics. Stage 10 still evaluates only the
+validation split; the held-out test split remains unused.
 
 When run locally, Stage 10 writes artifacts under:
 
@@ -266,9 +286,42 @@ When run locally, Stage 10 writes artifacts under:
 - `results/stage10_temporal_context_cnn/runs/<experiment_id>/checkpoints/best.pt`
 - `results/stage10_temporal_context_cnn/runs/<experiment_id>/checkpoints/last.pt`
 
+## CNN-GRU Sequence Comparisons
+
+Stage 11 and Stage 12 extend the deep-learning workflow from concatenated
+context windows to explicit epoch sequences. `SleepStageCNNGRU` encodes each
+epoch with the CNN trunk, passes epoch embeddings through a GRU, and predicts
+sleep-stage labels from the sequence representation.
+
+Stage 11 trains many-to-one CNN-GRU models and compares default sequence
+lengths of 5 and 11, predicting the center epoch label. Stage 12 trains
+many-to-many CNN-GRU models that predict a label for every epoch in each input
+sequence. Because overlapping sequences can produce multiple probability
+predictions for the same sleep epoch, Stage 12 aggregates probabilities back to
+one prediction per epoch and can compare uniform and center-weighted
+aggregation from the same trained checkpoint.
+
+These stages are available through guarded cells in
+`notebooks/04_cnn_training.ipynb` and reusable functions in `src/train.py`.
+They continue the same validation-only development pattern: the held-out test
+split remains unused until a final comparison is ready.
+
+When run locally, these stages write artifacts under:
+
+- `results/stage11_cnn_gru/experiment_summary.csv`
+- `results/stage11_cnn_gru/all_history.csv`
+- `results/stage11_cnn_gru/best_by_sequence_length.csv`
+- `results/stage11_cnn_gru/best_config.json`
+- `results/stage11_cnn_gru/best_validation_confusion_matrix.csv`
+- `results/stage12_cnn_gru_many_to_many/experiment_summary.csv`
+- `results/stage12_cnn_gru_many_to_many/all_history.csv`
+- `results/stage12_cnn_gru_many_to_many/best_by_sequence_length.csv`
+- `results/stage12_cnn_gru_many_to_many/best_config.json`
+- `results/stage12_cnn_gru_many_to_many/best_validation_confusion_matrix.csv`
+
 ## Methods
 
-Implemented and planned methods include:
+Implemented methods include:
 
 - Dataset inspection and integrity checks
 - Training-set-only exploratory data analysis
@@ -276,25 +329,40 @@ Implemented and planned methods include:
 - Traditional machine learning baselines using engineered epoch-level features
 - PyTorch tensor datasets for single-epoch CNNs, temporal-context CNNs, and
   CNN-GRU sequence models
-- PyTorch deep learning models, likely starting with a 1D CNN
-- Evaluation using accuracy, balanced accuracy, macro F1, class-specific F1 scores, and confusion matrices
+- PyTorch 1D CNN and CNN-GRU models
+- Validation monitoring with accuracy, balanced accuracy, macro F1,
+  class-specific precision/recall/F1, and confusion matrices
 
-The traditional baseline workflow is now implemented as an interim validation
-stage. Deep learning models and final held-out test comparisons remain future
-work.
+Final held-out test comparisons remain future work. The current modeling
+outputs are interim validation diagnostics used to develop and compare model
+families without touching the test split.
 
 ## Repository Structure
 
 ```text
 dreamt-wearable-sleep-staging/
-├── README.md
-├── pyproject.toml
-├── .gitignore
-├── data/
-├── notebooks/
-├── src/
-├── results/
-└── executive_summary.md
+  README.md
+  pyproject.toml
+  data/
+    README.md
+  notebooks/
+    01_dataset_overview.ipynb
+    02_train_set_eda.ipynb
+    03_feature_baselines.ipynb
+    04_cnn_training.ipynb
+    05_error_analysis.ipynb
+  src/
+    baselines.py
+    data.py
+    evaluate.py
+    features.py
+    models.py
+    plots.py
+    preprocessing.py
+    train.py
+  tests/
+  results/
+  executive_summary.md
 ```
 
 The structure is designed to support reproducible data science work:
@@ -302,7 +370,8 @@ The structure is designed to support reproducible data science work:
 - `notebooks/` = experimentation and explanation. Notebooks are used for exploration, reporting, and communicating analysis decisions.
 - `src/` = reusable project code. Source modules contain importable logic shared across notebooks and scripts.
 - `data/` = data documentation, not raw committed data. Real DREAMT files should remain local.
-- `results/` = outputs produced by experiments, such as metrics tables, confusion matrices, and figures.
+- `tests/` = automated tests for reusable project code.
+- `results/` = placeholder files plus local experiment outputs when notebooks or training utilities are run.
 - `README.md` = how someone understands and runs the project.
 
 Notebooks are intentionally separated from source code. Notebooks are useful for exploration, explanation, and final reporting, while `src/` holds reusable code that can be imported by notebooks and scripts. This separation improves reproducibility, avoids duplicated logic, and helps reduce data leakage by keeping shared preprocessing, splitting, feature extraction, modeling, and evaluation behavior in one place.
@@ -312,15 +381,22 @@ Notebooks are intentionally separated from source code. Notebooks are useful for
 Create and activate a virtual environment, then install the project dependencies:
 
 ```bash
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
+On Windows PowerShell, activate the environment with:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+```
 
 ## How to Run
 
-This project is not fully implemented yet. The expected workflow will be:
+After placing local DREAMT participant CSVs under `data/raw/`, the expected
+workflow is:
 
 1. Place local DREAMT files under `data/raw/`.
 2. Run `notebooks/01_dataset_overview.ipynb` to build the participant inventory and label-mapping summaries.
@@ -337,9 +413,10 @@ This project is not fully implemented yet. The expected workflow will be:
 9. In the same notebook, enable the guarded Stage 10 cell to compare simple
    CNN and temporal-context CNN models on matched context-eligible validation
    centers for `context_radius=1` and `context_radius=2`.
-10. Continue moving reusable logic from notebooks into `src/` as new modeling
-   stages mature.
-11. Save generated metrics and figures under `results/`.
+10. In the same notebook, enable the guarded Stage 11 and Stage 12 cells to run
+    CNN-GRU sequence comparisons on the validation split only.
+11. Save generated metrics, figures, summaries, and checkpoints under
+    stage-specific local `results/` folders.
 
 The dataset overview notebook writes these local intermediate summaries when raw
 participant files are available:
@@ -356,6 +433,10 @@ the raw files and epoch index are available:
 - `data/processed/features_train.csv`
 - `data/processed/features_val.csv`
 - `data/processed/features_test.csv`
+
+The CNN training notebook and training utilities write train-only preprocessing
+metadata when local deep-learning datasets are built:
+
 - `data/processed/preprocessing_metadata.json`
 
 Generate the epoch index locally after placing DREAMT participant files under
@@ -373,17 +454,18 @@ epoch_index = build_epoch_index(
 summary = summarize_epoch_index(epoch_index)
 ```
 
-As implementation develops, this section will include concrete commands for preprocessing, training, evaluation, and report generation.
-
 ## Results
 
-Final held-out test results are not available yet. Placeholder files are
-included under `results/` to show intended outputs, and Stage 6 can additionally
-write interim validation diagnostics:
+Final held-out test results are not available yet. The committed files directly
+under `results/` are minimal placeholders, not model-performance claims:
 
 - `results/metrics.csv`
 - `results/ablation_results.csv`
 - `results/confusion_matrix.png`
+
+When local DREAMT files are available, implemented stages can write interim
+validation diagnostics and training artifacts such as:
+
 - `results/figures/`
 - `results/stage6_feature_baselines/validation_metrics.csv`
 - `results/stage6_feature_baselines/validation_confusion_matrix_<model>.csv`
@@ -392,18 +474,44 @@ write interim validation diagnostics:
 - `results/stage6_feature_baselines/validation_group_permutation_importance_<model>.csv`
 - `results/stage6_feature_baselines/feature_group_correlation_matrix.csv`
 - `results/stage6_feature_baselines/feature_group_correlation_matrix.png`
-
-The feature-group correlation matrix reports mean absolute pairwise feature
-correlations. Same-group diagonal cells therefore summarize redundancy among
-distinct features in the group and exclude each feature's self-correlation.
+- `results/stage8_single_epoch_cnn/`
 - `results/stage9_training_choices/experiment_summary.csv`
 - `results/stage10_temporal_context_cnn/experiment_summary.csv`
+- `results/stage11_cnn_gru/experiment_summary.csv`
+- `results/stage12_cnn_gru_many_to_many/experiment_summary.csv`
+
+The feature-group correlation matrix reports mean absolute pairwise feature
+correlations. Same-group diagonal cells summarize redundancy among distinct
+features in the group and exclude each feature's self-correlation.
+
+## Testing
+
+The repository includes automated tests for the reusable code in `src/`,
+including participant splitting, label mapping, epoch preprocessing, engineered
+features, PyTorch dataset shapes, CNN/CNN-GRU models, training utilities, and
+staged experiment-summary writers.
+
+Run the test suite with:
+
+```bash
+pytest
+```
+
+Run linting with:
+
+```bash
+ruff check .
+```
 
 ## Limitations
 
-This scaffold does not include raw data, trained models, or final experimental
-results. Stage 6 reports validation diagnostics only; final comparisons should
-wait until the modeling pipeline is mature and each selected model class is
-evaluated once on the held-out test split. Future work must carefully address
-participant-level splitting, class imbalance, missing data, wearable signal
-quality, and privacy requirements.
+This repository does not include raw data, trained models, or final held-out
+test results. Stage 6 through Stage 12 report validation diagnostics for model
+development, not final benchmark claims. Final comparisons should wait until
+model choices are fixed and each selected model class is evaluated once on the
+held-out test split.
+
+Known next steps include completing the error-analysis notebook, selecting the
+final model families to evaluate, documenting final test-set results, and
+continuing to account for participant-level splitting, class imbalance, missing
+data, wearable signal quality, and privacy requirements.
