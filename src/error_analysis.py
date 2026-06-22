@@ -1021,13 +1021,6 @@ def discover_validation_prediction_files(
         )
         add_if_exists(path, stage="stage6", model_family=family, model_name=model_name)
 
-    add_if_exists(
-        root / "stage8_single_epoch_cnn" / "validation_epoch_predictions.csv",
-        stage="stage8",
-        model_family="single_epoch_cnn",
-        model_name="stage8_single_epoch_cnn",
-    )
-
     stage_specs = [
         (
             "stage9_training_choices",
@@ -1059,24 +1052,31 @@ def discover_validation_prediction_files(
             model_name=model_name,
         )
 
+    if not any(row["model_name"] == "stage9_best_single_epoch_cnn" for row in rows):
+        add_if_exists(
+            root / "stage8_single_epoch_cnn" / "validation_epoch_predictions.csv",
+            stage="stage8",
+            model_family="single_epoch_cnn",
+            model_name="stage8_single_epoch_cnn",
+        )
+
     stage10_summary_path = (
         root / "stage10_temporal_context_cnn" / "experiment_summary.csv"
     )
     if stage10_summary_path.exists():
         summary = pd.read_csv(stage10_summary_path)
-        if not summary.empty and "output_dir" in summary.columns:
-            for model_family, group in summary.groupby("model_family", sort=True):
-                row = group.iloc[0]
-                name = (
-                    "stage10_best_context_cnn"
-                    if model_family == "context"
-                    else "stage10_best_context_eligible_single_cnn"
-                )
+        if (
+            not summary.empty
+            and {"output_dir", "model_family"}.issubset(summary.columns)
+        ):
+            context_summary = summary[summary["model_family"] == "context"]
+            if not context_summary.empty:
+                row = context_summary.iloc[0]
                 add_if_exists(
                     Path(str(row["output_dir"])) / "validation_epoch_predictions.csv",
                     stage="stage10",
-                    model_family=str(model_family),
-                    model_name=name,
+                    model_family="context",
+                    model_name="stage10_best_context_cnn",
                 )
 
     stage12_summary_path = (
@@ -1088,14 +1088,147 @@ def discover_validation_prediction_files(
             summary.columns
         ):
             row = summary.iloc[0]
-            method = str(row["aggregation_method"])
-            add_if_exists(
-                Path(str(row["output_dir"]))
-                / f"validation_aggregated_epoch_predictions_{method}.csv",
-                stage="stage12",
-                model_family="cnn_gru_many_to_many",
-                model_name=f"stage12_best_cnn_gru_many_to_many_{method}",
+            best_output_dir = str(row["output_dir"])
+            best_run_rows = summary[
+                summary["output_dir"].astype(str) == best_output_dir
+            ]
+            for _, method_row in best_run_rows.iterrows():
+                method = str(method_row["aggregation_method"])
+                add_if_exists(
+                    Path(best_output_dir)
+                    / f"validation_aggregated_epoch_predictions_{method}.csv",
+                    stage="stage12",
+                    model_family="cnn_gru_many_to_many",
+                    model_name=f"stage12_best_cnn_gru_many_to_many_{method}",
+                )
+
+    return pd.DataFrame(rows)
+
+
+def _best_output_dirs_by_group(
+    summary_path: Path,
+    group_column: str | None = None,
+) -> list[Path]:
+    if not summary_path.exists():
+        return []
+    summary = pd.read_csv(summary_path)
+    if summary.empty or "output_dir" not in summary.columns:
+        return []
+    if group_column is not None and group_column in summary.columns:
+        return [
+            Path(str(group.iloc[0]["output_dir"]))
+            for _, group in summary.groupby(group_column, sort=True)
+        ]
+    return [Path(str(summary.iloc[0]["output_dir"]))]
+
+
+def materialize_deep_validation_predictions_from_checkpoints(
+    results_dir: str | Path = "results",
+    *,
+    overwrite: bool = False,
+) -> pd.DataFrame:
+    """Export missing deep validation predictions from saved best checkpoints.
+
+    The function performs inference only. It rebuilds validation dataloaders,
+    restores saved best checkpoints, and writes prediction CSVs without running
+    any training epochs.
+    """
+
+    from src.train import export_validation_predictions_from_checkpoint
+
+    root = Path(results_dir)
+    candidate_dirs: list[tuple[str, Path]] = []
+
+    stage9_dirs = _best_output_dirs_by_group(
+        root / "stage9_training_choices" / "experiment_summary.csv",
+    )
+    for directory in stage9_dirs:
+        candidate_dirs.append(("stage9_best_single_epoch_cnn", directory))
+
+    if not stage9_dirs:
+        stage8_dir = root / "stage8_single_epoch_cnn"
+        candidate_dirs.append(("stage8_single_epoch_cnn", stage8_dir))
+
+    stage10_summary_path = (
+        root / "stage10_temporal_context_cnn" / "experiment_summary.csv"
+    )
+    if stage10_summary_path.exists():
+        stage10_summary = pd.read_csv(stage10_summary_path)
+        if {"model_family", "output_dir"}.issubset(stage10_summary.columns):
+            context_summary = stage10_summary[
+                stage10_summary["model_family"] == "context"
+            ]
+        else:
+            context_summary = pd.DataFrame()
+        if not context_summary.empty:
+            candidate_dirs.append(
+                (
+                    "stage10_best_context_cnn",
+                    Path(str(context_summary.iloc[0]["output_dir"])),
+                )
             )
+
+    for directory in _best_output_dirs_by_group(
+        root / "stage11_cnn_gru" / "experiment_summary.csv",
+    ):
+        candidate_dirs.append(("stage11_best_cnn_gru", directory))
+
+    for directory in _best_output_dirs_by_group(
+        root / "stage12_cnn_gru_many_to_many" / "experiment_summary.csv",
+    ):
+        candidate_dirs.append(("stage12_best_cnn_gru_many_to_many", directory))
+
+    rows: list[dict[str, Any]] = []
+    seen_dirs: set[Path] = set()
+    for model_name, run_dir in candidate_dirs:
+        run_dir = Path(run_dir)
+        if run_dir in seen_dirs:
+            continue
+        seen_dirs.add(run_dir)
+        checkpoint_path = run_dir / "checkpoints" / "best.pt"
+        config_path = run_dir / "config.json"
+        if not checkpoint_path.exists():
+            rows.append(
+                {
+                    "model_name": model_name,
+                    "run_dir": str(run_dir),
+                    "status": "missing_checkpoint",
+                }
+            )
+            continue
+
+        expected_single_path = run_dir / "validation_epoch_predictions.csv"
+        expected_many_to_many_paths = list(
+            run_dir.glob("validation_aggregated_epoch_predictions_*.csv")
+        )
+        if (
+            not overwrite
+            and expected_single_path.exists()
+            or (not overwrite and expected_many_to_many_paths)
+        ):
+            rows.append(
+                {
+                    "model_name": model_name,
+                    "run_dir": str(run_dir),
+                    "status": "already_available",
+                }
+            )
+            continue
+
+        written = export_validation_predictions_from_checkpoint(
+            run_dir,
+            config_path=config_path if config_path.exists() else None,
+            checkpoint_path=checkpoint_path,
+            overwrite=overwrite,
+        )
+        rows.append(
+            {
+                "model_name": model_name,
+                "run_dir": str(run_dir),
+                "status": "exported",
+                "artifacts": "|".join(str(path) for path in written.values()),
+            }
+        )
 
     return pd.DataFrame(rows)
 

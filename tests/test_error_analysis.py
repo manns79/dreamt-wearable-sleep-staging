@@ -5,7 +5,9 @@ import pytest
 
 from src.error_analysis import (
     confidence_diagnostics,
+    discover_validation_prediction_files,
     error_type_summary,
+    materialize_deep_validation_predictions_from_checkpoints,
     model_agreement_summary,
     model_validation_metrics,
     normalize_prediction_frame,
@@ -103,3 +105,63 @@ def test_confidence_and_error_type_helpers_return_expected_rows():
     assert "Wake -> Non-REM" in set(errors["error_type"])
     assert metrics["macro_f1"].between(0, 1).all()
     assert not temporal.empty
+
+
+def test_discovery_includes_all_stage12_aggregations_for_best_checkpoint(tmp_path):
+    stage_dir = tmp_path / "stage12_cnn_gru_many_to_many"
+    run_dir = stage_dir / "runs" / "best"
+    run_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "output_dir": [str(run_dir), str(run_dir)],
+            "aggregation_method": ["uniform", "center_weighted"],
+            "macro_f1": [0.5, 0.6],
+        }
+    ).to_csv(stage_dir / "experiment_summary.csv", index=False)
+    for method in ["uniform", "center_weighted"]:
+        _prediction_frame().head(1).to_csv(
+            run_dir / f"validation_aggregated_epoch_predictions_{method}.csv",
+            index=False,
+        )
+
+    discovery = discover_validation_prediction_files(results_dir=tmp_path)
+
+    assert set(discovery["model_name"]) == {
+        "stage12_best_cnn_gru_many_to_many_uniform",
+        "stage12_best_cnn_gru_many_to_many_center_weighted",
+    }
+
+
+def test_materialize_deep_predictions_uses_checkpoints_without_training(
+    tmp_path,
+    monkeypatch,
+):
+    stage_dir = tmp_path / "stage11_cnn_gru"
+    run_dir = stage_dir / "runs" / "best"
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "best.pt").write_text("checkpoint", encoding="utf-8")
+    run_dir.mkdir(exist_ok=True)
+    pd.DataFrame({"output_dir": [str(run_dir)], "macro_f1": [0.7]}).to_csv(
+        stage_dir / "experiment_summary.csv",
+        index=False,
+    )
+    calls = []
+
+    def fake_export(run_dir_arg, **kwargs):
+        calls.append((run_dir_arg, kwargs))
+        output_path = Path(run_dir_arg) / "validation_epoch_predictions.csv"
+        output_path.write_text("prediction", encoding="utf-8")
+        return {"epoch_predictions": output_path}
+
+    monkeypatch.setattr(
+        "src.train.export_validation_predictions_from_checkpoint",
+        fake_export,
+    )
+
+    summary = materialize_deep_validation_predictions_from_checkpoints(
+        results_dir=tmp_path,
+    )
+
+    assert calls
+    assert "exported" in set(summary["status"])

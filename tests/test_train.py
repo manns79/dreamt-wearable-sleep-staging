@@ -21,6 +21,7 @@ from src.train import (  # noqa: E402
     class_counts_from_loader,
     class_weights_from_counts,
     evaluate_model,
+    export_validation_predictions_from_checkpoint,
     load_checkpoint,
     plot_training_curves,
     resolve_device,
@@ -332,6 +333,76 @@ def test_train_model_saves_validation_artifacts(tmp_path):
     assert (Path(tmp_path) / "validation_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_confusion_matrix.csv").exists()
     assert (Path(tmp_path) / "validation_epoch_predictions.csv").exists()
+
+
+def test_export_validation_predictions_from_checkpoint_runs_inference_only(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint_path = tmp_path / "checkpoints" / "best.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+    config = TrainConfig(output_dir=tmp_path)
+    (tmp_path / "config.json").write_text(
+        json.dumps({"output_dir": str(tmp_path)}),
+        encoding="utf-8",
+    )
+
+    def fake_load_checkpoint(path, map_location="cpu"):
+        assert Path(path) == checkpoint_path
+        return {"model_state_dict": {}}
+
+    class FakeModel(torch.nn.Module):
+        pass
+
+    def fake_evaluate_model(
+        model,
+        dataloader,
+        criterion,
+        device,
+        model_name,
+        split="validation",
+        config=None,
+    ):
+        confusion = pd.DataFrame(
+            [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            index=["true_Wake", "true_Non-REM", "true_REM"],
+            columns=["pred_Wake", "pred_Non-REM", "pred_REM"],
+        )
+        predictions = pd.DataFrame(
+            {
+                "participant_id": ["S001"],
+                "epoch_id": [1],
+                "true_label": ["Wake"],
+                "pred_label": ["Wake"],
+                "prob_Wake": [0.8],
+                "prob_Non_REM": [0.1],
+                "prob_REM": [0.1],
+            }
+        )
+        return {
+            "loss": 0.1,
+            "metrics": {"model": model_name, "split": split, "macro_f1": 1.0},
+            "confusion_matrix": confusion,
+            "epoch_predictions": predictions,
+        }
+
+    monkeypatch.setattr("src.train.load_checkpoint", fake_load_checkpoint)
+    monkeypatch.setattr("src.train._new_model_for_config", lambda config: FakeModel())
+    monkeypatch.setattr("src.train.resolve_device", lambda device: torch.device("cpu"))
+    monkeypatch.setattr(
+        "src.train._validation_loader_for_prediction_export",
+        lambda c: [],
+    )
+    monkeypatch.setattr("src.train.evaluate_model", fake_evaluate_model)
+
+    written = export_validation_predictions_from_checkpoint(
+        tmp_path,
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert config.output_dir == tmp_path
+    assert written["epoch_predictions"].exists()
+    assert (tmp_path / "validation_metrics_from_checkpoint.csv").exists()
 
 
 def test_train_model_respects_train_eval_interval(tmp_path, monkeypatch):

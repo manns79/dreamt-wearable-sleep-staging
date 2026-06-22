@@ -334,6 +334,9 @@ confidence, high-confidence mistakes, model agreement, and shared-epoch
 metrics. Deep-learning runs created after Stage 13 save
 `validation_epoch_predictions.csv` for single-output validation models, while
 Stage 12 continues to use its aggregated epoch-level prediction outputs.
+For older completed deep-learning runs, Stage 13 can export validation
+prediction tables from saved `checkpoints/best.pt` files without retraining;
+this reruns validation inference only.
 
 When run locally, Stage 13 writes artifacts under:
 
