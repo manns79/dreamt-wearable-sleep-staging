@@ -223,6 +223,9 @@ def test_train_one_epoch_and_evaluate_model_return_metrics():
     assert validation["loss"] > 0
     assert "macro_f1" in validation["metrics"]
     assert validation["confusion_matrix"].shape == (3, 3)
+    assert "epoch_predictions" in validation
+    assert len(validation["epoch_predictions"]) == len(dataset)
+    assert "prob_Wake" in validation["epoch_predictions"].columns
 
 
 def test_evaluate_model_aggregates_many_to_many_sequence_probabilities():
@@ -328,6 +331,7 @@ def test_train_model_saves_validation_artifacts(tmp_path):
     assert (Path(tmp_path) / "train_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_metrics.csv").exists()
     assert (Path(tmp_path) / "validation_confusion_matrix.csv").exists()
+    assert (Path(tmp_path) / "validation_epoch_predictions.csv").exists()
 
 
 def test_train_model_respects_train_eval_interval(tmp_path, monkeypatch):
@@ -340,6 +344,7 @@ def test_train_model_respects_train_eval_interval(tmp_path, monkeypatch):
         device,
         model_name,
         split="validation",
+        config=None,
     ):
         calls.append(split)
         metrics = {

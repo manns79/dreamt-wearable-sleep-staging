@@ -22,7 +22,7 @@ It now includes reusable source modules, staged notebooks, automated tests, engi
 | 10. Temporal-context CNN comparison | Implemented as guarded validation runs | `src/train.py`, `notebooks/04_cnn_training.ipynb` |
 | 11. Many-to-one CNN-GRU comparison | Implemented as guarded validation runs | `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
 | 12. Many-to-many CNN-GRU aggregation | Implemented as guarded validation runs | `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
-| Error analysis | Placeholder notebook | `notebooks/05_error_analysis.ipynb` |
+| 13. Validation error analysis | Implemented as guarded validation diagnostics | `src/error_analysis.py`, `notebooks/05_error_analysis.ipynb` |
 
 The guarded training cells are disabled by default so routine notebook
 execution does not launch long experiments. When enabled locally, they write
@@ -319,6 +319,37 @@ When run locally, these stages write artifacts under:
 - `results/stage12_cnn_gru_many_to_many/best_config.json`
 - `results/stage12_cnn_gru_many_to_many/best_validation_confusion_matrix.csv`
 
+## Validation Error Analysis
+
+Stage 13 is implemented in `notebooks/05_error_analysis.ipynb`, with reusable
+helpers in `src/error_analysis.py`. It analyzes validation predictions from the
+implemented model families without loading or evaluating the held-out test
+split. The notebook can optionally rebuild Stage 6 validation prediction tables
+from saved train/validation feature CSVs, and it discovers prediction artifacts
+from completed deep-learning stages.
+
+Stage 13 summarizes native validation metrics, coverage, common error types,
+participant-level performance, transition-neighborhood errors, prediction
+confidence, high-confidence mistakes, model agreement, and shared-epoch
+metrics. Deep-learning runs created after Stage 13 save
+`validation_epoch_predictions.csv` for single-output validation models, while
+Stage 12 continues to use its aggregated epoch-level prediction outputs.
+
+When run locally, Stage 13 writes artifacts under:
+
+- `results/stage13_error_analysis/combined_validation_predictions.csv`
+- `results/stage13_error_analysis/model_validation_metrics.csv`
+- `results/stage13_error_analysis/model_coverage.csv`
+- `results/stage13_error_analysis/error_type_summary.csv`
+- `results/stage13_error_analysis/participant_error_summary.csv`
+- `results/stage13_error_analysis/temporal_error_summary.csv`
+- `results/stage13_error_analysis/confidence_summary.csv`
+- `results/stage13_error_analysis/confidence_bins.csv`
+- `results/stage13_error_analysis/high_confidence_errors.csv`
+- `results/stage13_error_analysis/model_disagreement_summary.csv`
+- `results/stage13_error_analysis/shared_epoch_model_metrics.csv`
+- `results/stage13_error_analysis/figures/confusion_matrix_<model>.png`
+
 ## Methods
 
 Implemented methods include:
@@ -332,6 +363,8 @@ Implemented methods include:
 - PyTorch 1D CNN and CNN-GRU models
 - Validation monitoring with accuracy, balanced accuracy, macro F1,
   class-specific precision/recall/F1, and confusion matrices
+- Validation error analysis across model families, participants, transition
+  neighborhoods, prediction confidence, and shared-epoch model agreement
 
 Final held-out test comparisons remain future work. The current modeling
 outputs are interim validation diagnostics used to develop and compare model
@@ -415,7 +448,9 @@ workflow is:
    centers for `context_radius=1` and `context_radius=2`.
 10. In the same notebook, enable the guarded Stage 11 and Stage 12 cells to run
     CNN-GRU sequence comparisons on the validation split only.
-11. Save generated metrics, figures, summaries, and checkpoints under
+11. Run `notebooks/05_error_analysis.ipynb` to generate Stage 13 validation
+    error-analysis diagnostics from available validation prediction artifacts.
+12. Save generated metrics, figures, summaries, and checkpoints under
     stage-specific local `results/` folders.
 
 The dataset overview notebook writes these local intermediate summaries when raw
@@ -479,6 +514,7 @@ validation diagnostics and training artifacts such as:
 - `results/stage10_temporal_context_cnn/experiment_summary.csv`
 - `results/stage11_cnn_gru/experiment_summary.csv`
 - `results/stage12_cnn_gru_many_to_many/experiment_summary.csv`
+- `results/stage13_error_analysis/model_validation_metrics.csv`
 
 The feature-group correlation matrix reports mean absolute pairwise feature
 correlations. Same-group diagonal cells summarize redundancy among distinct

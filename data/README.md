@@ -293,3 +293,21 @@ Generated Stage 8 artifacts are local results files:
 - `results/stage8_single_epoch_cnn/tiny_overfit_curves.png`
 - `results/stage8_single_epoch_cnn/checkpoints/best.pt`
 - `results/stage8_single_epoch_cnn/checkpoints/last.pt`
+
+## Validation Error Analysis Artifacts
+
+Stage 13 reusable helpers live in `src/error_analysis.py`, and
+`notebooks/05_error_analysis.ipynb` is the local runner. The stage consumes
+validation prediction tables only. It can optionally rebuild Stage 6 validation
+prediction tables from `features_train.csv` and `features_val.csv`; it does not
+load `features_test.csv` or evaluate the held-out test split.
+
+Expected local Stage 13 outputs are written under:
+
+- `results/stage13_error_analysis/predictions/`
+- `results/stage13_error_analysis/model_validation_metrics.csv`
+- `results/stage13_error_analysis/model_coverage.csv`
+- `results/stage13_error_analysis/error_type_summary.csv`
+- `results/stage13_error_analysis/participant_error_summary.csv`
+- `results/stage13_error_analysis/model_disagreement_summary.csv`
+- `results/stage13_error_analysis/figures/`

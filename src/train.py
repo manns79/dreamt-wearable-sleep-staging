@@ -6,7 +6,7 @@ import json
 import random
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from hashlib import sha1
 from itertools import product
 from pathlib import Path
@@ -1001,7 +1001,77 @@ def _epoch_prediction_identity(
         "epoch_index_position": int(epoch_index_position),
         "true_label": str(row["mapped_label"]),
     }
+    if "split" in row:
+        payload["split"] = str(row["split"])
     return key, payload
+
+
+def _epoch_index_position_for_prediction(
+    dataset: Any,
+    root_index: int,
+) -> int | None:
+    """Return the label-bearing epoch-index position for one dataset item."""
+
+    if hasattr(dataset, "sequence_positions"):
+        if getattr(dataset, "label_mode", "many_to_one") == "many_to_many":
+            return None
+        target_index = _sequence_target_index(dataset)
+        return int(dataset.sequence_positions[int(root_index)][target_index])
+
+    if hasattr(dataset, "window_positions") and hasattr(dataset, "context_radius"):
+        return int(
+            dataset.window_positions[int(root_index)][int(dataset.context_radius)]
+        )
+
+    if hasattr(dataset, "epoch_index"):
+        return int(root_index)
+
+    return None
+
+
+def _single_output_epoch_prediction_frame(
+    dataset: Any,
+    dataset_indices: Sequence[int],
+    probabilities: np.ndarray,
+    true_ids: np.ndarray,
+    pred_ids: np.ndarray,
+) -> pd.DataFrame:
+    """Build an epoch-level prediction table for single-output evaluators."""
+
+    root_dataset, root_indices = _unwrap_dataset_indices(dataset, dataset_indices)
+    rows: list[dict[str, Any]] = []
+    for row_index, root_index in enumerate(root_indices):
+        epoch_index_position = _epoch_index_position_for_prediction(
+            root_dataset,
+            int(root_index),
+        )
+        if epoch_index_position is None:
+            identity: dict[str, Any] = {
+                "participant_id": None,
+                "epoch_id": None,
+                "epoch_index_position": None,
+                "true_label": ID_TO_LABEL[int(true_ids[row_index])],
+            }
+        else:
+            _, identity = _epoch_prediction_identity(
+                root_dataset,
+                epoch_index_position,
+            )
+            identity["true_label"] = ID_TO_LABEL[int(true_ids[row_index])]
+
+        row = {
+            "prediction_index": int(row_index),
+            "dataset_index": int(root_index),
+            **identity,
+            "pred_label": ID_TO_LABEL[int(pred_ids[row_index])],
+        }
+        for class_index, label in ID_TO_LABEL.items():
+            row[_probability_column(label)] = float(
+                probabilities[row_index, int(class_index)]
+            )
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def _sequence_position_prediction_frame(
@@ -1151,6 +1221,11 @@ def evaluate_model(
     total_examples = 0
     true_ids: list[int] = []
     pred_ids: list[int] = []
+    single_true_batches: list[np.ndarray] = []
+    single_pred_batches: list[np.ndarray] = []
+    single_probability_batches: list[np.ndarray] = []
+    single_indices: list[int] = []
+    single_offset = 0
     sequence_true_batches: list[np.ndarray] = []
     sequence_probability_batches: list[np.ndarray] = []
     sequence_indices: list[int] = []
@@ -1172,9 +1247,20 @@ def evaluate_model(
             )
 
             if y_batch.ndim == 1:
+                probabilities = torch.softmax(logits, dim=1)
                 predictions = logits.argmax(dim=1)
-                true_ids.extend(y_batch.detach().cpu().numpy().astype(int).tolist())
-                pred_ids.extend(predictions.detach().cpu().numpy().astype(int).tolist())
+                true_array = y_batch.detach().cpu().numpy().astype(int)
+                pred_array = predictions.detach().cpu().numpy().astype(int)
+                true_ids.extend(true_array.tolist())
+                pred_ids.extend(pred_array.tolist())
+                single_true_batches.append(true_array)
+                single_pred_batches.append(pred_array)
+                single_probability_batches.append(
+                    probabilities.detach().cpu().numpy().astype(np.float64)
+                )
+                batch_size = int(y_batch.shape[0])
+                single_indices.extend(range(single_offset, single_offset + batch_size))
+                single_offset += batch_size
             else:
                 probabilities = torch.softmax(logits, dim=2)
                 predictions = logits.argmax(dim=2)
@@ -1207,6 +1293,15 @@ def evaluate_model(
         split=split,
         labels=TARGET_LABELS,
     )
+    epoch_predictions = None
+    if single_probability_batches:
+        epoch_predictions = _single_output_epoch_prediction_frame(
+            getattr(dataloader, "dataset", None),
+            single_indices,
+            np.concatenate(single_probability_batches, axis=0),
+            np.concatenate(single_true_batches, axis=0),
+            np.concatenate(single_pred_batches, axis=0),
+        )
     if sequence_probability_batches:
         probabilities = np.concatenate(sequence_probability_batches, axis=0)
         sequence_true_ids = np.concatenate(sequence_true_batches, axis=0)
@@ -1271,6 +1366,7 @@ def evaluate_model(
         "loss": total_loss / total_examples,
         "metrics": metrics,
         "confusion_matrix": confusion,
+        "epoch_predictions": epoch_predictions,
         "y_true": y_true,
         "y_pred": y_pred,
     }
@@ -1390,6 +1486,149 @@ def load_checkpoint(
         return torch.load(path, map_location=map_location)
 
 
+def train_config_from_mapping(payload: Mapping[str, Any]) -> TrainConfig:
+    """Create a ``TrainConfig`` from a saved config mapping."""
+
+    valid_fields = {field.name for field in fields(TrainConfig)}
+    config_values = {
+        key: value for key, value in dict(payload).items() if key in valid_fields
+    }
+    return TrainConfig(**config_values)
+
+
+def load_train_config(
+    config_path: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
+) -> TrainConfig:
+    """Load a saved training config from JSON or checkpoint metadata."""
+
+    if config_path is not None and Path(config_path).exists():
+        with Path(config_path).open("r", encoding="utf-8") as file:
+            return train_config_from_mapping(json.load(file))
+
+    if checkpoint_path is not None and Path(checkpoint_path).exists():
+        checkpoint = load_checkpoint(checkpoint_path)
+        config_payload = checkpoint.get("config")
+        if isinstance(config_payload, Mapping):
+            return train_config_from_mapping(config_payload)
+
+    raise FileNotFoundError(
+        "Could not load a training config from config_path or checkpoint_path."
+    )
+
+
+def _validation_loader_for_prediction_export(config: TrainConfig) -> Any:
+    """Build the validation loader that matches a saved run configuration."""
+
+    if (
+        config.comparison_context_radius is not None
+        and config.comparison_context_radius > 0
+    ):
+        paired = build_stage10_paired_dataloaders(
+            config,
+            context_radius=int(config.comparison_context_radius),
+        )
+        loader_key = "context" if config.context_radius > 0 else "single"
+        return paired[loader_key]["validation"]
+
+    return build_train_validation_dataloaders(config)["validation"]
+
+
+def export_validation_predictions_from_checkpoint(
+    run_dir: str | Path,
+    *,
+    config_path: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    overwrite: bool = False,
+) -> dict[str, Path]:
+    """Export validation prediction artifacts from a saved checkpoint.
+
+    This rebuilds the validation dataloader, restores the checkpointed model,
+    and runs evaluation only. It does not train or update model weights.
+    """
+
+    torch = _require_torch()
+    run_path = Path(run_dir)
+    checkpoint_file = Path(checkpoint_path) if checkpoint_path else (
+        run_path / "checkpoints" / "best.pt"
+    )
+    config_file = Path(config_path) if config_path else run_path / "config.json"
+    output_path = Path(output_dir) if output_dir else run_path
+
+    config = load_train_config(
+        config_path=config_file,
+        checkpoint_path=checkpoint_file,
+    )
+    checkpoint = load_checkpoint(checkpoint_file, map_location="cpu")
+    device = resolve_device(config.device)
+    model = _new_model_for_config(config)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+
+    val_loader = _validation_loader_for_prediction_export(config)
+    reduction = "none" if config.sequence_label_mode == "many_to_many" else "mean"
+    criterion = torch.nn.CrossEntropyLoss(reduction=reduction)
+    validation = evaluate_model(
+        model,
+        val_loader,
+        criterion,
+        device,
+        model_name=config.model_name,
+        split="validation",
+        config=config,
+    )
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    written: dict[str, Path] = {}
+
+    metrics_path = output_path / "validation_metrics_from_checkpoint.csv"
+    if overwrite or not metrics_path.exists():
+        pd.DataFrame([{**validation["metrics"], "loss": validation["loss"]}]).to_csv(
+            metrics_path,
+            index=False,
+        )
+    written["metrics"] = metrics_path
+
+    confusion_path = output_path / "validation_confusion_matrix.csv"
+    if overwrite or not confusion_path.exists():
+        validation["confusion_matrix"].to_csv(confusion_path)
+    written["confusion_matrix"] = confusion_path
+
+    epoch_predictions = validation.get("epoch_predictions")
+    if epoch_predictions is not None:
+        prediction_path = output_path / "validation_epoch_predictions.csv"
+        if overwrite or not prediction_path.exists():
+            epoch_predictions.to_csv(prediction_path, index=False)
+        written["epoch_predictions"] = prediction_path
+
+    sequence_position_predictions = validation.get("sequence_position_predictions")
+    if sequence_position_predictions is not None:
+        sequence_path = output_path / "validation_sequence_position_predictions.csv"
+        if overwrite or not sequence_path.exists():
+            sequence_position_predictions.to_csv(sequence_path, index=False)
+        written["sequence_position_predictions"] = sequence_path
+
+    for method, predictions in validation.get(
+        "aggregated_epoch_predictions",
+        {},
+    ).items():
+        prediction_path = (
+            output_path / f"validation_aggregated_epoch_predictions_{method}.csv"
+        )
+        if overwrite or not prediction_path.exists():
+            predictions.to_csv(prediction_path, index=False)
+        written[f"aggregated_epoch_predictions_{method}"] = prediction_path
+
+    for method, confusion in validation.get("extra_confusion_matrices", {}).items():
+        confusion_path = output_path / f"validation_confusion_matrix_{method}.csv"
+        if overwrite or not confusion_path.exists():
+            confusion.to_csv(confusion_path)
+        written[f"confusion_matrix_{method}"] = confusion_path
+
+    return written
+
+
 def _save_json(payload: Mapping[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
@@ -1491,6 +1730,7 @@ def train_model(
     best_confusion: pd.DataFrame | None = None
     best_sequence_position_confusion: pd.DataFrame | None = None
     best_extra_confusions: dict[str, pd.DataFrame] = {}
+    best_epoch_predictions: pd.DataFrame | None = None
     best_sequence_position_predictions: pd.DataFrame | None = None
     best_aggregated_epoch_predictions: dict[str, pd.DataFrame] = {}
     best_checkpoint = checkpoints_dir / "best.pt"
@@ -1621,6 +1861,7 @@ def train_model(
                 "sequence_position_confusion_matrix"
             )
             best_extra_confusions = dict(validation.get("extra_confusion_matrices", {}))
+            best_epoch_predictions = validation.get("epoch_predictions")
             best_sequence_position_predictions = validation.get(
                 "sequence_position_predictions"
             )
@@ -1669,6 +1910,11 @@ def train_model(
         )
     for method, confusion in best_extra_confusions.items():
         confusion.to_csv(output_dir / f"validation_confusion_matrix_{method}.csv")
+    if best_epoch_predictions is not None:
+        best_epoch_predictions.to_csv(
+            output_dir / "validation_epoch_predictions.csv",
+            index=False,
+        )
     if best_sequence_position_predictions is not None:
         best_sequence_position_predictions.to_csv(
             output_dir / "validation_sequence_position_predictions.csv",
