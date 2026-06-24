@@ -293,13 +293,15 @@ context windows to explicit epoch sequences. `SleepStageCNNGRU` encodes each
 epoch with the CNN trunk, passes epoch embeddings through a GRU, and predicts
 sleep-stage labels from the sequence representation.
 
-Stage 11 trains many-to-one CNN-GRU models and compares default sequence
-lengths of 5 and 11, predicting the center epoch label. Stage 12 trains
-many-to-many CNN-GRU models that predict a label for every epoch in each input
-sequence. Because overlapping sequences can produce multiple probability
-predictions for the same sleep epoch, Stage 12 aggregates probabilities back to
-one prediction per epoch and can compare uniform and center-weighted
-aggregation from the same trained checkpoint.
+Stage 11 trains many-to-one CNN-GRU models that predict the center epoch label.
+Its follow-up workflow can diagnose an inverse-frequency-weighted checkpoint by
+applying powered training priors to saved validation probabilities without
+retraining. It also supports a controlled comparison between unweighted
+cross-entropy and square-root inverse-frequency weighting through
+`class_weight_power`. Stage 12 trains many-to-many CNN-GRU models that predict a
+label for every epoch in each input sequence. Because overlapping sequences can
+produce multiple probability predictions for the same sleep epoch, Stage 12
+aggregates probabilities back to one prediction per epoch.
 
 These stages are available through guarded cells in
 `notebooks/04_cnn_training.ipynb` and reusable functions in `src/train.py`.
@@ -313,6 +315,8 @@ When run locally, these stages write artifacts under:
 - `results/stage11_cnn_gru/best_by_sequence_length.csv`
 - `results/stage11_cnn_gru/best_config.json`
 - `results/stage11_cnn_gru/best_validation_confusion_matrix.csv`
+- `results/stage11_cnn_gru/prior_correction_summary.csv`
+- `results/stage11_cnn_gru_loss_comparison/experiment_summary.csv`
 - `results/stage12_cnn_gru_many_to_many/experiment_summary.csv`
 - `results/stage12_cnn_gru_many_to_many/all_history.csv`
 - `results/stage12_cnn_gru_many_to_many/best_by_sequence_length.csv`

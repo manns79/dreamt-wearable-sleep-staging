@@ -15,6 +15,7 @@ from src.train import (  # noqa: E402
     build_stage9_screening_configs,
     build_stage10_comparison_configs,
     build_stage10_paired_dataloaders,
+    build_stage11_loss_comparison_configs,
     build_stage11_sequence_configs,
     build_stage12_many_to_many_configs,
     build_train_validation_datasets,
@@ -706,6 +707,16 @@ def test_class_weights_are_inverse_frequency_and_train_only():
     assert weights == pytest.approx([6 / 9, 6 / 6, 6 / 3])
 
 
+def test_class_weights_support_square_root_softening():
+    counts = {"Wake": 3, "Non-REM": 2, "REM": 1}
+
+    weights = class_weights_from_counts(counts, power=0.5)
+
+    assert weights == pytest.approx(
+        [(6 / 9) ** 0.5, (6 / 6) ** 0.5, (6 / 3) ** 0.5]
+    )
+
+
 def test_class_counts_for_context_dataset_use_center_labels_only():
     class SyntheticContextDataset(torch.utils.data.Dataset):
         context_radius = 1
@@ -754,6 +765,19 @@ def test_build_loss_function_adds_weights_when_requested():
     criterion = build_loss_function(loader, config, torch.device("cpu"))
 
     assert criterion.weight.tolist() == pytest.approx([6 / 9, 6 / 6, 6 / 3])
+
+
+def test_build_loss_function_uses_configured_class_weight_power():
+    dataset = SyntheticEpochDataset(n_examples=6)
+    dataset.y = torch.tensor([0, 0, 0, 1, 1, 2])
+    loader = _loader(dataset, batch_size=2, shuffle=False)
+    config = TrainConfig(class_weighting=True, class_weight_power=0.5)
+
+    criterion = build_loss_function(loader, config, torch.device("cpu"))
+
+    assert criterion.weight.tolist() == pytest.approx(
+        [(6 / 9) ** 0.5, (6 / 6) ** 0.5, (6 / 3) ** 0.5]
+    )
 
 
 def test_stage9_screening_grid_includes_zero_dropout(tmp_path):
@@ -942,6 +966,27 @@ def test_stage11_sequence_configs_compare_sequence_lengths(tmp_path):
     assert all(config.sequence_target_position == "center" for config in configs)
     assert all(config.class_weighting for config in configs)
     assert all(config.epochs == 3 for config in configs)
+    assert stage11_experiment_id(configs[0]) != stage11_experiment_id(configs[1])
+
+
+def test_stage11_loss_configs_compare_unweighted_and_sqrt_weighted(tmp_path):
+    configs = build_stage11_loss_comparison_configs(
+        base_config=TrainConfig(
+            output_dir=tmp_path,
+            epochs=15,
+            patience=4,
+            gru_bidirectional=True,
+        ),
+        output_dir=tmp_path,
+        sequence_length=5,
+    )
+
+    assert [config.class_weighting for config in configs] == [False, True]
+    assert [config.class_weight_power for config in configs] == [1.0, 0.5]
+    assert all(config.sequence_length == 5 for config in configs)
+    assert all(config.gru_bidirectional for config in configs)
+    assert all(config.epochs == 15 for config in configs)
+    assert all(config.patience == 4 for config in configs)
     assert stage11_experiment_id(configs[0]) != stage11_experiment_id(configs[1])
 
 

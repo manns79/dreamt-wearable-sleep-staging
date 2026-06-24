@@ -4,6 +4,8 @@ import pandas as pd
 import pytest
 
 from src.error_analysis import (
+    apply_class_prior_correction,
+    class_prior_correction_sweep,
     confidence_diagnostics,
     discover_validation_prediction_files,
     error_type_summary,
@@ -55,6 +57,31 @@ def test_normalize_prediction_frame_adds_error_and_confidence_columns():
     assert normalized.loc[1, "error_type"] == "Non-REM -> REM"
     assert normalized.loc[0, "confidence"] == pytest.approx(0.8)
     assert normalized.loc[0, "margin"] == pytest.approx(0.7)
+
+
+def test_class_prior_correction_reduces_overweighted_minority_predictions():
+    predictions = pd.DataFrame(
+        {
+            "true_label": ["Non-REM", "REM"],
+            "pred_label": ["REM", "REM"],
+            "prob_Wake": [0.1, 0.1],
+            "prob_Non_REM": [0.4, 0.05],
+            "prob_REM": [0.5, 0.85],
+        }
+    )
+    counts = {"Wake": 20, "Non-REM": 70, "REM": 10}
+
+    corrected = apply_class_prior_correction(predictions, counts, alpha=1.0)
+    sweep = class_prior_correction_sweep(
+        predictions,
+        counts,
+        alphas=(0.0, 1.0),
+    )
+
+    assert corrected.loc[0, "pred_label"] == "Non-REM"
+    assert corrected.loc[1, "pred_label"] == "REM"
+    assert set(sweep["alpha"]) == {0.0, 1.0}
+    assert sweep.iloc[0]["macro_f1"] >= sweep.iloc[1]["macro_f1"]
 
 
 def test_stage13_error_analysis_summaries_and_outputs(tmp_path):

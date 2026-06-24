@@ -202,6 +202,112 @@ def normalize_prediction_frame(
     return output[[*ordered_columns, *extra_columns]]
 
 
+def apply_class_prior_correction(
+    predictions: pd.DataFrame,
+    class_counts: Mapping[str, int],
+    alpha: float,
+) -> pd.DataFrame:
+    """Adjust class probabilities by powered training priors."""
+
+    if alpha < 0:
+        raise ValueError("alpha must be non-negative.")
+    normalized = normalize_prediction_frame(predictions)
+    probability_columns = list(PROBABILITY_COLUMNS.values())
+    probabilities = normalized[probability_columns].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    if probabilities.isna().any().any():
+        raise ValueError("Class-prior correction requires complete probabilities.")
+    probability_values = probabilities.to_numpy(dtype=float)
+    if not np.isfinite(probability_values).all() or (probability_values < 0).any():
+        raise ValueError("Probabilities must be finite and non-negative.")
+
+    missing_labels = [
+        label for label in TARGET_SLEEP_STAGE_LABELS if label not in class_counts
+    ]
+    if missing_labels:
+        raise ValueError(f"Class counts are missing label(s): {missing_labels}")
+    counts = np.asarray(
+        [float(class_counts[label]) for label in TARGET_SLEEP_STAGE_LABELS],
+        dtype=float,
+    )
+    if not np.isfinite(counts).all() or (counts <= 0).any():
+        raise ValueError("Class counts must be finite and positive.")
+
+    priors = counts / counts.sum()
+    adjusted = probability_values * np.power(priors, float(alpha))
+    row_sums = adjusted.sum(axis=1, keepdims=True)
+    if (row_sums <= 0).any():
+        raise ValueError("Adjusted probabilities must have positive row sums.")
+    adjusted /= row_sums
+
+    output = normalized.copy()
+    output.loc[:, probability_columns] = adjusted
+    predicted_indices = adjusted.argmax(axis=1)
+    output["pred_label"] = [
+        TARGET_SLEEP_STAGE_LABELS[int(index)] for index in predicted_indices
+    ]
+    return normalize_prediction_frame(output)
+
+
+def class_prior_correction_sweep(
+    predictions: pd.DataFrame,
+    class_counts: Mapping[str, int],
+    alphas: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
+) -> pd.DataFrame:
+    """Evaluate powered-prior corrections without retraining a model."""
+
+    if not alphas:
+        raise ValueError("At least one alpha is required.")
+
+    rows: list[dict[str, Any]] = []
+    total_count = float(
+        sum(float(class_counts[label]) for label in TARGET_SLEEP_STAGE_LABELS)
+    )
+    for alpha in alphas:
+        corrected = apply_class_prior_correction(
+            predictions,
+            class_counts,
+            alpha=float(alpha),
+        )
+        metrics, _ = evaluate_predictions(
+            corrected["true_label"],
+            corrected["pred_label"],
+            model_name="class_prior_corrected",
+            split="validation",
+            labels=TARGET_SLEEP_STAGE_LABELS,
+        )
+        predicted_fractions = corrected["pred_label"].value_counts(normalize=True)
+        rows.append(
+            {
+                "alpha": float(alpha),
+                "n_predictions": int(len(corrected)),
+                **{
+                    f"train_prior_{_safe_name(label)}": (
+                        float(class_counts[label]) / total_count
+                    )
+                    for label in TARGET_SLEEP_STAGE_LABELS
+                },
+                **{
+                    f"predicted_fraction_{_safe_name(label)}": float(
+                        predicted_fractions.get(label, 0.0)
+                    )
+                    for label in TARGET_SLEEP_STAGE_LABELS
+                },
+                **{
+                    key: value
+                    for key, value in metrics.items()
+                    if key not in {"model", "split"}
+                },
+            }
+        )
+    return pd.DataFrame(rows).sort_values(
+        ["macro_f1", "balanced_accuracy", "alpha"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+
 def load_prediction_csv(
     path: str | Path,
     *,

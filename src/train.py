@@ -39,6 +39,7 @@ DEFAULT_STAGE8_OUTPUT_DIR = Path("results/stage8_single_epoch_cnn")
 DEFAULT_STAGE9_OUTPUT_DIR = Path("results/stage9_training_choices")
 DEFAULT_STAGE10_OUTPUT_DIR = Path("results/stage10_temporal_context_cnn")
 DEFAULT_STAGE11_OUTPUT_DIR = Path("results/stage11_cnn_gru")
+DEFAULT_STAGE11_LOSS_OUTPUT_DIR = Path("results/stage11_cnn_gru_loss_comparison")
 DEFAULT_STAGE12_OUTPUT_DIR = Path("results/stage12_cnn_gru_many_to_many")
 
 
@@ -73,6 +74,7 @@ class TrainConfig:
     gru_dropout: float = 0.0
     gru_bidirectional: bool = False
     class_weighting: bool = False
+    class_weight_power: float = 1.0
     max_grad_norm: float | None = None
     patience: int = 5
     min_delta: float = 0.0
@@ -350,6 +352,8 @@ def _validate_training_config(config: TrainConfig) -> None:
         raise ValueError("gru_num_layers must be positive.")
     if not 0 <= config.gru_dropout < 1:
         raise ValueError("gru_dropout must be in [0, 1).")
+    if config.class_weight_power < 0:
+        raise ValueError("class_weight_power must be non-negative.")
     if config.max_grad_norm is not None and config.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive when provided.")
     if config.patience <= 0:
@@ -799,15 +803,23 @@ def class_counts_from_loader(dataloader: Any) -> dict[str, int]:
     return counts
 
 
-def class_weights_from_counts(counts: Mapping[str, int]) -> list[float]:
-    """Return inverse-frequency class weights ordered by ``TARGET_LABELS``."""
+def class_weights_from_counts(
+    counts: Mapping[str, int],
+    power: float = 1.0,
+) -> list[float]:
+    """Return powered inverse-frequency weights ordered by ``TARGET_LABELS``."""
 
     total = sum(int(counts[label]) for label in TARGET_LABELS)
     if total <= 0:
         raise ValueError("Class counts must include at least one example.")
+    if power < 0:
+        raise ValueError("power must be non-negative.")
 
     n_classes = len(TARGET_LABELS)
-    return [total / (n_classes * int(counts[label])) for label in TARGET_LABELS]
+    inverse_frequency = [
+        total / (n_classes * int(counts[label])) for label in TARGET_LABELS
+    ]
+    return [weight**power for weight in inverse_frequency]
 
 
 def build_loss_function(
@@ -824,7 +836,7 @@ def build_loss_function(
 
     counts = class_counts_from_loader(train_loader)
     weights = torch.as_tensor(
-        class_weights_from_counts(counts),
+        class_weights_from_counts(counts, power=config.class_weight_power),
         dtype=torch.float32,
         device=device,
     )
@@ -1960,6 +1972,7 @@ def stage9_experiment_id(config: TrainConfig) -> str:
         "kernel_size",
         "dropout",
         "class_weighting",
+        "class_weight_power",
         "max_grad_norm",
         "patience",
         "min_delta",
@@ -2125,6 +2138,7 @@ def stage10_experiment_id(config: TrainConfig) -> str:
         "context_radius",
         "comparison_context_radius",
         "class_weighting",
+        "class_weight_power",
         "max_grad_norm",
         "patience",
         "min_delta",
@@ -2306,6 +2320,7 @@ def stage11_experiment_id(config: TrainConfig) -> str:
         "gru_dropout",
         "gru_bidirectional",
         "class_weighting",
+        "class_weight_power",
         "max_grad_norm",
         "patience",
         "min_delta",
@@ -2370,6 +2385,62 @@ def build_stage11_sequence_configs(
             )
         )
     return configs
+
+
+def build_stage11_loss_comparison_configs(
+    base_config: TrainConfig | None = None,
+    output_dir: str | Path = DEFAULT_STAGE11_LOSS_OUTPUT_DIR,
+    sequence_length: int = 5,
+) -> list[TrainConfig]:
+    """Create unweighted and square-root-weighted Stage 11 configs."""
+
+    if sequence_length <= 1:
+        raise ValueError("sequence_length must be greater than 1.")
+
+    base = base_config or TrainConfig(
+        output_dir=output_dir,
+        model_name="cnn_gru_stage11_loss",
+        batch_size=16,
+        epochs=15,
+        learning_rate=3e-4,
+        weight_decay=1e-4,
+        dropout=0.0,
+        max_grad_norm=1.0,
+        patience=4,
+        train_eval_interval=None,
+        participant_array_cache_dir=DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
+        sequence_stride=1,
+        sequence_label_mode="many_to_one",
+        sequence_target_position="center",
+        gru_hidden_size=64,
+        gru_num_layers=1,
+        gru_dropout=0.0,
+        gru_bidirectional=True,
+    )
+    common = {
+        "output_dir": output_dir,
+        "context_radius": 0,
+        "comparison_context_radius": None,
+        "sequence_length": int(sequence_length),
+        "sequence_label_mode": "many_to_one",
+        "sequence_target_position": "center",
+    }
+    return [
+        replace(
+            base,
+            **common,
+            model_name=f"cnn_gru_stage11_s{sequence_length}_unweighted",
+            class_weighting=False,
+            class_weight_power=1.0,
+        ),
+        replace(
+            base,
+            **common,
+            model_name=f"cnn_gru_stage11_s{sequence_length}_sqrt_weighted",
+            class_weighting=True,
+            class_weight_power=0.5,
+        ),
+    ]
 
 
 def run_stage11_experiments(
@@ -2491,6 +2562,7 @@ def stage12_experiment_id(config: TrainConfig) -> str:
         "gru_dropout",
         "gru_bidirectional",
         "class_weighting",
+        "class_weight_power",
         "max_grad_norm",
         "patience",
         "min_delta",
