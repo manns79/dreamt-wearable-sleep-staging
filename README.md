@@ -4,7 +4,7 @@
 
 This repository contains an in-progress, reproducible Python workflow for wearable-based sleep stage classification using the DREAMT dataset. The current target is three-class sleep staging: `Wake`, `Non-REM`, and `REM`.
 
-It now includes reusable source modules, staged notebooks, automated tests, engineered feature baselines, PyTorch dataset utilities, 1D CNN training workflows, temporal-context CNN comparisons, and CNN-GRU sequence-model utilities. Raw data, trained checkpoints, and final held-out test results are not committed.
+It now includes reusable source modules, staged notebooks, automated tests, engineered feature baselines, PyTorch dataset utilities, 1D CNN training workflows, temporal-context CNN comparisons, CNN-GRU sequence-model utilities, and a multiscale raw/engineered-feature fusion CNN. Raw data, trained checkpoints, and final held-out test results are not committed.
 
 ## Current Status
 
@@ -23,6 +23,7 @@ It now includes reusable source modules, staged notebooks, automated tests, engi
 | 11. Many-to-one CNN-GRU comparison | Implemented as guarded validation runs | `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
 | 12. Many-to-many CNN-GRU aggregation | Implemented as guarded validation runs | `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
 | 13. Validation error analysis | Implemented as guarded validation diagnostics | `src/error_analysis.py`, `notebooks/05_error_analysis.ipynb` |
+| 14. Multiscale residual feature-fusion CNN | Implemented as one guarded validation run | `src/data.py`, `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
 
 The guarded training cells are disabled by default so routine notebook
 execution does not launch long experiments. When enabled locally, they write
@@ -173,9 +174,14 @@ imputation and per-channel standardization, then saved locally at:
 
 - `data/processed/preprocessing_metadata.json`
 
+Stage 14 separately fits chunked, training-only mean imputation and
+standardization for the engineered feature columns, saved at:
+
+- `data/processed/feature_preprocessing_metadata.json`
+
 For repeated CNN training, raw participant CSVs can be converted once into
 per-participant `.npy` arrays under `data/processed/deep/participants/`.
-Stage 9 through Stage 12 notebook configs opt into this processed cache with
+Stage 9 through Stage 12 and Stage 14 notebook configs opt into this processed cache with
 `participant_array_cache_dir`; the first configured run builds the cache if its
 manifest is missing, and later runs memory-map the arrays instead of reparsing
 CSV files.
@@ -323,6 +329,35 @@ When run locally, these stages write artifacts under:
 - `results/stage12_cnn_gru_many_to_many/best_config.json`
 - `results/stage12_cnn_gru_many_to_many/best_validation_confusion_matrix.csv`
 
+## Multiscale Residual Feature-Fusion CNN
+
+Stage 14 returns to single-epoch prediction with a stronger representation.
+`DreamtFeatureFusionDataset` aligns each raw epoch with its Stage 6 engineered
+feature row by `(participant_id, epoch_id)`, rejects split or label
+disagreement, and exposes the raw epoch index so participant-block sampling
+continues to work.
+
+Engineered preprocessing is fit from `features_train.csv` only. It computes
+column means and standard deviations in CSV chunks, uses mean imputation, and
+stores the transformed matrix as `float32` to avoid the memory-heavy median
+path. Validation rows reuse the saved training metadata.
+
+`MultiscaleResidualFusionCNN` uses three raw-signal convolution branches,
+GroupNorm residual blocks, and adaptive pooling to 12 temporal bins rather than
+collapsing an epoch immediately to one value per channel. A compact MLP encodes
+the 72 engineered features before fusion. The fixed configuration uses
+unweighted cross-entropy with `label_smoothing=0.05`, AdamW at `3e-4`, gradient
+clipping at `1.0`, up to 25 epochs, patience 5, and validation macro F1 for
+checkpoint selection. Its notebook launch flag is disabled by default.
+
+When run locally, Stage 14 writes artifacts under:
+
+- `results/stage14_multiscale_fusion_cnn/experiment_summary.csv`
+- `results/stage14_multiscale_fusion_cnn/all_history.csv`
+- `results/stage14_multiscale_fusion_cnn/best_config.json`
+- `results/stage14_multiscale_fusion_cnn/best_validation_confusion_matrix.csv`
+- `results/stage14_multiscale_fusion_cnn/runs/<experiment_id>/`
+
 ## Validation Error Analysis
 
 Stage 13 is implemented in `notebooks/05_error_analysis.ipynb`, with reusable
@@ -366,8 +401,8 @@ Implemented methods include:
 - Signal preprocessing and label mapping
 - Traditional machine learning baselines using engineered epoch-level features
 - PyTorch tensor datasets for single-epoch CNNs, temporal-context CNNs, and
-  CNN-GRU sequence models
-- PyTorch 1D CNN and CNN-GRU models
+  CNN-GRU sequence models, plus aligned raw/engineered-feature fusion
+- PyTorch 1D CNN, CNN-GRU, and multiscale residual fusion models
 - Validation monitoring with accuracy, balanced accuracy, macro F1,
   class-specific precision/recall/F1, and confusion matrices
 - Validation error analysis across model families, participants, transition
@@ -457,7 +492,9 @@ workflow is:
     CNN-GRU sequence comparisons on the validation split only.
 11. Run `notebooks/05_error_analysis.ipynb` to generate Stage 13 validation
     error-analysis diagnostics from available validation prediction artifacts.
-12. Save generated metrics, figures, summaries, and checkpoints under
+12. In `notebooks/04_cnn_training.ipynb`, enable the guarded Stage 14 cell to
+    run the fixed multiscale residual feature-fusion CNN on validation only.
+13. Save generated metrics, figures, summaries, and checkpoints under
     stage-specific local `results/` folders.
 
 The dataset overview notebook writes these local intermediate summaries when raw
@@ -480,6 +517,7 @@ The CNN training notebook and training utilities write train-only preprocessing
 metadata when local deep-learning datasets are built:
 
 - `data/processed/preprocessing_metadata.json`
+- `data/processed/feature_preprocessing_metadata.json`
 
 Generate the epoch index locally after placing DREAMT participant files under
 `data/raw/` and creating `data/interim/split_assignments.csv`:
@@ -522,6 +560,7 @@ validation diagnostics and training artifacts such as:
 - `results/stage11_cnn_gru/experiment_summary.csv`
 - `results/stage12_cnn_gru_many_to_many/experiment_summary.csv`
 - `results/stage13_error_analysis/model_validation_metrics.csv`
+- `results/stage14_multiscale_fusion_cnn/experiment_summary.csv`
 
 The feature-group correlation matrix reports mean absolute pairwise feature
 correlations. Same-group diagonal cells summarize redundancy among distinct
@@ -531,8 +570,9 @@ features in the group and exclude each feature's self-correlation.
 
 The repository includes automated tests for the reusable code in `src/`,
 including participant splitting, label mapping, epoch preprocessing, engineered
-features, PyTorch dataset shapes, CNN/CNN-GRU models, training utilities, and
-staged experiment-summary writers.
+features, PyTorch dataset shapes, CNN/CNN-GRU/fusion models, paired-input
+training utilities, checkpoint restoration, and staged experiment-summary
+writers.
 
 Run the test suite with:
 
@@ -549,12 +589,12 @@ ruff check .
 ## Limitations
 
 This repository does not include raw data, trained models, or final held-out
-test results. Stage 6 through Stage 12 report validation diagnostics for model
+test results. Stage 6 through Stage 14 report validation diagnostics for model
 development, not final benchmark claims. Final comparisons should wait until
 model choices are fixed and each selected model class is evaluated once on the
 held-out test split.
 
-Known next steps include completing the error-analysis notebook, selecting the
+Known next steps include running the guarded Stage 14 experiment, selecting the
 final model families to evaluate, documenting final test-set results, and
 continuing to account for participant-level splitting, class imbalance, missing
 data, wearable signal quality, and privacy requirements.

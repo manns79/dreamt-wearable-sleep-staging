@@ -22,6 +22,7 @@ data/
     features_val.csv
     features_test.csv
     preprocessing_metadata.json
+    feature_preprocessing_metadata.json
 ```
 
 Use `data/raw/` for local copies of real DREAMT participant CSV files. Use
@@ -269,11 +270,12 @@ Normalization statistics are fit from training participants only with
 
 - `data/processed/preprocessing_metadata.json`
 
-The first version uses median imputation for missing values and per-channel
-standardization. Validation datasets should load and apply the saved training
-metadata, never fit their own normalization parameters. The held-out test split
-should not be used for model prediction or performance reporting until the final
-project comparison.
+The current implementation streams participant-level summaries and uses mean
+imputation for missing values plus per-channel standardization. This avoids
+materializing all raw samples to compute medians. Validation datasets should
+load and apply the saved training metadata, never fit their own normalization
+parameters. The held-out test split should not be used for model prediction or
+performance reporting until the final project comparison.
 
 ## First 1D CNN Training Artifacts
 
@@ -311,3 +313,18 @@ Expected local Stage 13 outputs are written under:
 - `results/stage13_error_analysis/participant_error_summary.csv`
 - `results/stage13_error_analysis/model_disagreement_summary.csv`
 - `results/stage13_error_analysis/figures/`
+
+## Stage 14 Feature-Fusion Inputs
+
+Stage 14 aligns raw epochs with `features_train.csv` and `features_val.csv` by
+`participant_id` and `epoch_id`. Dataset construction verifies one-to-one
+identity coverage and rejects split or label disagreements.
+
+Engineered preprocessing is fit from the training feature CSV only. It computes
+per-feature means and standard deviations in chunks, uses mean imputation, and
+saves the reusable metadata to:
+
+- `data/processed/feature_preprocessing_metadata.json`
+
+Validation feature vectors reuse those training statistics. The held-out
+`features_test.csv` remains unused during Stage 14 model development.

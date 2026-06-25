@@ -8,9 +8,12 @@ import pytest
 from src.data import (
     DreamtContextDataset,
     DreamtEpochDataset,
+    DreamtFeatureFusionDataset,
     DreamtSequenceDataset,
+    apply_engineered_feature_preprocessing,
     check_epoch_split_leakage,
     create_dataloaders,
+    fit_engineered_feature_preprocessing,
     fit_normalization_stats,
     load_preprocessing_metadata,
     save_preprocessing_metadata,
@@ -154,6 +157,125 @@ def test_fit_normalization_stats_uses_training_participants_only_and_imputes():
     assert not torch.isnan(x).any()
     assert x[0, 1].item() == pytest.approx(0.0)
     assert loaded_stats["mean"]["BVP"] < 10
+
+
+def test_engineered_feature_preprocessing_streams_train_mean_only(tmp_path):
+    train_features = pd.DataFrame(
+        {
+            "participant_id": ["S001", "S001"],
+            "epoch_id": [0, 1],
+            "split": ["train", "train"],
+            "label": ["Wake", "REM"],
+            "feature_a": [1.0, 3.0],
+            "feature_b": [np.nan, 4.0],
+        }
+    )
+    validation_features = pd.DataFrame(
+        {
+            "participant_id": ["S002"],
+            "epoch_id": [0],
+            "split": ["validation"],
+            "label": ["Wake"],
+            "feature_a": [100.0],
+            "feature_b": [100.0],
+        }
+    )
+    train_path = tmp_path / "features_train.csv"
+    train_features.to_csv(train_path, index=False)
+
+    stats = fit_engineered_feature_preprocessing(train_path, chunksize=1)
+    transformed_validation = apply_engineered_feature_preprocessing(
+        validation_features,
+        stats,
+    )
+
+    assert stats["imputation_strategy"] == "mean"
+    assert stats["fit_scope"] == "train"
+    assert stats["n_rows_fit"] == 2
+    assert stats["source_participants"] == ["S001"]
+    assert stats["mean"]["feature_a"] == pytest.approx(2.0)
+    assert stats["mean"]["feature_b"] == pytest.approx(4.0)
+    assert transformed_validation.dtype == np.float32
+    assert transformed_validation[0, 0] > 90
+
+
+def test_feature_fusion_dataset_aligns_raw_and_engineered_epochs():
+    output_dir = _test_output_dir("test-feature-fusion-dataset")
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    _raw_frame(list(range(8))).to_csv(raw_dir / "S001_whole_df.csv", index=False)
+    epoch_index = _epoch_index("S001", "train", ["Wake", "REM"])
+    features = pd.DataFrame(
+        {
+            "participant_id": ["S001", "S001"],
+            "epoch_id": [1, 0],
+            "split": ["train", "train"],
+            "label": ["REM", "Wake"],
+            "feature_a": [3.0, 1.0],
+            "feature_b": [4.0, np.nan],
+        }
+    )
+    stats = fit_engineered_feature_preprocessing(features)
+
+    dataset = DreamtFeatureFusionDataset(
+        raw_dir=raw_dir,
+        epoch_index=epoch_index,
+        feature_table=features,
+        split="train",
+        channels=["BVP"],
+        feature_preprocessing_stats=stats,
+    )
+    raw_x, engineered_x, y = dataset[0]
+
+    assert len(dataset) == 2
+    assert dataset.feature_columns == ["feature_a", "feature_b"]
+    assert raw_x.shape == (1, 4)
+    assert raw_x.dtype == torch.float32
+    assert engineered_x.shape == (2,)
+    assert engineered_x.dtype == torch.float32
+    assert engineered_x.tolist() == pytest.approx([-1.0, 0.0])
+    assert y.item() == 0
+    assert list(dataset.epoch_index["epoch_id"]) == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "message"),
+    [
+        ("split", "validation", "requested split"),
+        ("label", "REM", "label values do not agree"),
+    ],
+)
+def test_feature_fusion_dataset_rejects_split_or_label_mismatch(
+    column,
+    value,
+    message,
+):
+    output_dir = _test_output_dir(f"test-feature-fusion-{column}-mismatch")
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    _raw_frame(list(range(4))).to_csv(raw_dir / "S001_whole_df.csv", index=False)
+    epoch_index = _epoch_index("S001", "train", ["Wake"])
+    features = pd.DataFrame(
+        {
+            "participant_id": ["S001"],
+            "epoch_id": [0],
+            "split": ["train"],
+            "label": ["Wake"],
+            "feature_a": [1.0],
+        }
+    )
+    stats = fit_engineered_feature_preprocessing(features)
+    features.loc[0, column] = value
+
+    with pytest.raises(ValueError, match=message):
+        DreamtFeatureFusionDataset(
+            raw_dir=raw_dir,
+            epoch_index=epoch_index,
+            feature_table=features,
+            split="train",
+            channels=["BVP"],
+            feature_preprocessing_stats=stats,
+        )
 
 
 def test_context_dataset_drops_edges_and_does_not_cross_participants():

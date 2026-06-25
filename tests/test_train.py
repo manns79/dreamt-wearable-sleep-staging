@@ -6,11 +6,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from src.models import SleepStageCNN  # noqa: E402
+from src.models import MultiscaleResidualFusionCNN, SleepStageCNN  # noqa: E402
 from src.train import (  # noqa: E402
     ParticipantBlockSampler,
     TrainConfig,
     TrainingResult,
+    _new_model_for_config,
     build_loss_function,
     build_stage9_screening_configs,
     build_stage10_comparison_configs,
@@ -18,24 +19,28 @@ from src.train import (  # noqa: E402
     build_stage11_loss_comparison_configs,
     build_stage11_sequence_configs,
     build_stage12_many_to_many_configs,
+    build_stage14_fusion_config,
     build_train_validation_datasets,
     class_counts_from_loader,
     class_weights_from_counts,
     evaluate_model,
     export_validation_predictions_from_checkpoint,
     load_checkpoint,
+    load_train_config,
     plot_training_curves,
     resolve_device,
     run_stage9_experiments,
     run_stage10_experiments,
     run_stage11_experiments,
     run_stage12_experiments,
+    run_stage14_experiment,
     run_tiny_overfit_test,
     save_checkpoint,
     stage9_experiment_id,
     stage10_experiment_id,
     stage11_experiment_id,
     stage12_experiment_id,
+    stage14_experiment_id,
     train_model,
     train_one_epoch,
 )
@@ -156,6 +161,38 @@ class SyntheticManyToManySequenceDataset(SyntheticSequenceDataset):
         return x, y, weights
 
 
+class SyntheticFusionDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        n_examples=12,
+        channels=2,
+        timepoints=64,
+        engineered_features=72,
+    ):
+        self.channels = [f"CH{index}" for index in range(channels)]
+        self.epoch_index = pd.DataFrame(
+            {
+                "participant_id": [
+                    f"S{index // 4:03d}" for index in range(n_examples)
+                ],
+                "epoch_id": list(range(n_examples)),
+                "mapped_label": [
+                    ["Wake", "Non-REM", "REM"][index % 3]
+                    for index in range(n_examples)
+                ],
+            }
+        )
+        self.raw = torch.randn(n_examples, channels, timepoints)
+        self.features = torch.randn(n_examples, engineered_features)
+        self.labels = torch.arange(n_examples) % 3
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        return self.raw[index], self.features[index], self.labels[index]
+
+
 def _loader(dataset, batch_size=4, shuffle=False):
     return torch.utils.data.DataLoader(
         dataset,
@@ -230,6 +267,58 @@ def test_train_one_epoch_and_evaluate_model_return_metrics():
     assert "prob_Wake" in validation["epoch_predictions"].columns
 
 
+def test_train_and_evaluate_support_paired_fusion_inputs():
+    dataset = SyntheticFusionDataset(n_examples=9)
+    loader = _loader(dataset, batch_size=3)
+    model = MultiscaleResidualFusionCNN(
+        in_channels=2,
+        num_engineered_features=72,
+        kernel_sizes=(5, 9, 15),
+        branch_channels=4,
+        raw_channels=8,
+        residual_blocks=1,
+        temporal_bins=3,
+        raw_embedding_dim=12,
+        feature_hidden_dims=(8,),
+        fusion_hidden_dim=8,
+        dropout=0.0,
+    )
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.05)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    device = torch.device("cpu")
+
+    train_loss = train_one_epoch(model, loader, criterion, optimizer, device)
+    validation = evaluate_model(
+        model,
+        loader,
+        torch.nn.CrossEntropyLoss(),
+        device,
+        model_name="synthetic_fusion",
+    )
+
+    assert train_loss > 0
+    assert validation["loss"] > 0
+    assert len(validation["epoch_predictions"]) == len(dataset)
+
+
+def test_participant_block_sampler_supports_fusion_dataset_epoch_index():
+    dataset = SyntheticFusionDataset(n_examples=8)
+    sampler = ParticipantBlockSampler(dataset, seed=5)
+
+    sampled_indices = list(sampler)
+    sampled_participants = [
+        dataset.epoch_index.iloc[index]["participant_id"] for index in sampled_indices
+    ]
+
+    assert sorted(sampled_indices) == list(range(8))
+    assert all(
+        sampled_participants[index] == sampled_participants[index + 1]
+        or sampled_participants[index]
+        not in sampled_participants[index + 1 :]
+        for index in range(len(sampled_participants) - 1)
+    )
+
+
 def test_evaluate_model_aggregates_many_to_many_sequence_probabilities():
     class FixedManyToManyModel(torch.nn.Module):
         def forward(self, x):
@@ -284,6 +373,37 @@ def test_save_and_load_checkpoint_round_trip(tmp_path):
     assert checkpoint["epoch"] == 3
     assert checkpoint["metrics"]["macro_f1"] == 0.5
     assert "model_state_dict" in checkpoint
+
+
+def test_fusion_checkpoint_restores_model_and_config(tmp_path):
+    config = TrainConfig(
+        output_dir=tmp_path,
+        model_name="test_fusion",
+        model_type="multiscale_fusion",
+        channels=("CH0", "CH1"),
+        engineered_feature_count=4,
+        multiscale_kernel_sizes=(5, 9),
+        multiscale_branch_channels=2,
+        multiscale_raw_channels=4,
+        multiscale_residual_blocks=1,
+        multiscale_temporal_bins=2,
+        multiscale_raw_embedding_dim=6,
+        feature_hidden_dims=(4,),
+        fusion_hidden_dim=4,
+        dropout=0.0,
+    )
+    model = _new_model_for_config(config)
+    checkpoint_path = tmp_path / "fusion.pt"
+    save_checkpoint(checkpoint_path, model, config=config, epoch=2)
+
+    restored_config = load_train_config(checkpoint_path=checkpoint_path)
+    checkpoint = load_checkpoint(checkpoint_path)
+    restored_model = _new_model_for_config(restored_config)
+    restored_model.load_state_dict(checkpoint["model_state_dict"])
+    logits = restored_model(torch.randn(2, 2, 32), torch.randn(2, 4))
+
+    assert restored_config.model_type == "multiscale_fusion"
+    assert logits.shape == (2, 3)
 
 
 def test_tiny_overfit_smoke_test_decreases_loss(tmp_path):
@@ -780,6 +900,16 @@ def test_build_loss_function_uses_configured_class_weight_power():
     )
 
 
+def test_build_loss_function_uses_label_smoothing():
+    dataset = SyntheticEpochDataset(n_examples=6)
+    loader = _loader(dataset, batch_size=2)
+    config = TrainConfig(label_smoothing=0.05)
+
+    criterion = build_loss_function(loader, config, torch.device("cpu"))
+
+    assert criterion.label_smoothing == pytest.approx(0.05)
+
+
 def test_stage9_screening_grid_includes_zero_dropout(tmp_path):
     base_config = TrainConfig(output_dir=tmp_path, epochs=3, patience=2)
 
@@ -1145,3 +1275,72 @@ def test_run_stage12_experiments_writes_aggregation_summary(tmp_path, monkeypatc
     assert (Path(tmp_path) / "all_history.csv").exists()
     assert (Path(tmp_path) / "best_by_sequence_length.csv").exists()
     assert (Path(tmp_path) / "best_config.json").exists()
+
+
+def test_stage14_config_is_fixed_unweighted_fusion(tmp_path):
+    config = build_stage14_fusion_config(output_dir=tmp_path)
+
+    assert config.model_type == "multiscale_fusion"
+    assert config.multiscale_kernel_sizes == (15, 63, 255)
+    assert config.multiscale_temporal_bins == 12
+    assert config.class_weighting is False
+    assert config.label_smoothing == pytest.approx(0.05)
+    assert config.train_eval_interval is None
+    assert stage14_experiment_id(config).startswith("stage14_multiscale_fusion_")
+
+
+def test_run_stage14_experiment_writes_summary(tmp_path, monkeypatch):
+    dataset = SyntheticFusionDataset(n_examples=6)
+    loader = _loader(dataset, batch_size=3)
+
+    def fake_build_train_validation_dataloaders(config):
+        return {"train": loader, "validation": loader}
+
+    def fake_train_model(train_loader, val_loader, config):
+        output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            index=["true_Wake", "true_Non-REM", "true_REM"],
+            columns=["pred_Wake", "pred_Non-REM", "pred_REM"],
+        ).to_csv(output_dir / "validation_confusion_matrix.csv")
+        history = pd.DataFrame(
+            {
+                "epoch": [1],
+                "train_objective_loss": [1.0],
+                "validation_loss": [0.5],
+                "macro_f1": [0.7],
+                "balanced_accuracy": [0.7],
+            }
+        )
+        return TrainingResult(
+            history=history,
+            best_metrics=history.iloc[0].to_dict(),
+            best_epoch=1,
+            best_checkpoint_path=output_dir / "checkpoints" / "best.pt",
+            last_checkpoint_path=output_dir / "checkpoints" / "last.pt",
+            output_dir=output_dir,
+        )
+
+    monkeypatch.setattr(
+        "src.train.build_train_validation_dataloaders",
+        fake_build_train_validation_dataloaders,
+    )
+    monkeypatch.setattr("src.train.train_model", fake_train_model)
+    monkeypatch.setattr(
+        "src.train._prefit_preprocessing_metadata",
+        lambda configs: None,
+    )
+    config = build_stage14_fusion_config(
+        base_config=TrainConfig(epochs=3, patience=2),
+        output_dir=tmp_path,
+    )
+
+    summary = run_stage14_experiment(config, output_dir=tmp_path)
+
+    assert summary.loc[0, "model_family"] == "multiscale_residual_fusion"
+    assert summary.loc[0, "macro_f1"] == pytest.approx(0.7)
+    assert (Path(tmp_path) / "experiment_summary.csv").exists()
+    assert (Path(tmp_path) / "all_history.csv").exists()
+    assert (Path(tmp_path) / "best_config.json").exists()
+    assert (Path(tmp_path) / "best_validation_confusion_matrix.csv").exists()

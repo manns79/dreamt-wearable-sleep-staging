@@ -302,6 +302,7 @@ class MultiscaleResidualFusionCNN(nn.Module):
         if not 0 <= dropout < 1:
             raise ValueError("dropout must be in [0, 1).")
 
+        self.expects_paired_input = True
         self.num_engineered_features = int(num_engineered_features)
         self.temporal_bins = int(temporal_bins)
         self.raw_branches = nn.ModuleList(

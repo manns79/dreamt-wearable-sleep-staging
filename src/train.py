@@ -16,19 +16,24 @@ import numpy as np
 import pandas as pd
 from src.data import (
     DEFAULT_EPOCH_INDEX_PATH,
+    DEFAULT_FEATURE_PREPROCESSING_METADATA_PATH,
     DEFAULT_MAX_CACHED_PARTICIPANTS,
     DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
-    PARTICIPANT_ARRAY_CACHE_MANIFEST,
     DEFAULT_PREPROCESSING_METADATA_PATH,
     DEFAULT_RAW_DATA_DIR,
+    DEFAULT_TRAIN_FEATURES_PATH,
+    DEFAULT_VALIDATION_FEATURES_PATH,
     EXPECTED_SIGNAL_COLUMNS,
     ID_TO_LABEL,
     LABEL_TO_ID,
+    PARTICIPANT_ARRAY_CACHE_MANIFEST,
     TARGET_LABELS,
     DreamtContextDataset,
     DreamtEpochDataset,
+    DreamtFeatureFusionDataset,
     DreamtSequenceDataset,
     build_participant_array_cache,
+    fit_engineered_feature_preprocessing,
     fit_normalization_stats,
     load_preprocessing_metadata,
     save_preprocessing_metadata,
@@ -41,6 +46,7 @@ DEFAULT_STAGE10_OUTPUT_DIR = Path("results/stage10_temporal_context_cnn")
 DEFAULT_STAGE11_OUTPUT_DIR = Path("results/stage11_cnn_gru")
 DEFAULT_STAGE11_LOSS_OUTPUT_DIR = Path("results/stage11_cnn_gru_loss_comparison")
 DEFAULT_STAGE12_OUTPUT_DIR = Path("results/stage12_cnn_gru_many_to_many")
+DEFAULT_STAGE14_OUTPUT_DIR = Path("results/stage14_multiscale_fusion_cnn")
 
 
 @dataclass(frozen=True)
@@ -53,6 +59,7 @@ class TrainConfig:
     output_dir: str | Path = DEFAULT_STAGE8_OUTPUT_DIR
     channels: Sequence[str] = tuple(EXPECTED_SIGNAL_COLUMNS)
     model_name: str = "single_epoch_cnn"
+    model_type: str = "auto"
     batch_size: int = 32
     epochs: int = 1
     learning_rate: float = 1e-3
@@ -75,6 +82,21 @@ class TrainConfig:
     gru_bidirectional: bool = False
     class_weighting: bool = False
     class_weight_power: float = 1.0
+    label_smoothing: float = 0.0
+    train_feature_path: str | Path = DEFAULT_TRAIN_FEATURES_PATH
+    validation_feature_path: str | Path = DEFAULT_VALIDATION_FEATURES_PATH
+    feature_preprocessing_metadata_path: str | Path = (
+        DEFAULT_FEATURE_PREPROCESSING_METADATA_PATH
+    )
+    engineered_feature_count: int = 72
+    multiscale_kernel_sizes: Sequence[int] = (15, 63, 255)
+    multiscale_branch_channels: int = 16
+    multiscale_raw_channels: int = 64
+    multiscale_residual_blocks: int = 2
+    multiscale_temporal_bins: int = 12
+    multiscale_raw_embedding_dim: int = 128
+    feature_hidden_dims: Sequence[int] = (64, 32)
+    fusion_hidden_dim: int = 64
     max_grad_norm: float | None = None
     patience: int = 5
     min_delta: float = 0.0
@@ -200,6 +222,12 @@ def _uses_sequence_model(config: TrainConfig) -> bool:
     return int(config.sequence_length) > 1
 
 
+def _uses_fusion_model(config: TrainConfig) -> bool:
+    """Return whether a config uses paired raw and engineered feature inputs."""
+
+    return config.model_type == "multiscale_fusion"
+
+
 def _new_sleep_stage_cnn_gru(
     in_channels: int,
     config: TrainConfig,
@@ -221,9 +249,30 @@ def _new_sleep_stage_cnn_gru(
     )
 
 
+def _new_multiscale_fusion_cnn(config: TrainConfig) -> Any:
+    from src.models import MultiscaleResidualFusionCNN
+
+    return MultiscaleResidualFusionCNN(
+        in_channels=len(config.channels),
+        num_engineered_features=config.engineered_feature_count,
+        num_classes=len(TARGET_LABELS),
+        kernel_sizes=config.multiscale_kernel_sizes,
+        branch_channels=config.multiscale_branch_channels,
+        raw_channels=config.multiscale_raw_channels,
+        residual_blocks=config.multiscale_residual_blocks,
+        temporal_bins=config.multiscale_temporal_bins,
+        raw_embedding_dim=config.multiscale_raw_embedding_dim,
+        feature_hidden_dims=config.feature_hidden_dims,
+        fusion_hidden_dim=config.fusion_hidden_dim,
+        dropout=config.dropout,
+    )
+
+
 def _new_model_for_config(config: TrainConfig) -> Any:
     """Construct the model implied by a training configuration."""
 
+    if _uses_fusion_model(config):
+        return _new_multiscale_fusion_cnn(config)
     if _uses_sequence_model(config):
         return _new_sleep_stage_cnn_gru(
             in_channels=len(config.channels),
@@ -277,6 +326,16 @@ def resolve_device(device: str = "auto") -> Any:
 def _validate_training_config(config: TrainConfig) -> None:
     """Validate config values shared by all CNN training stages."""
 
+    if config.model_type not in {
+        "auto",
+        "cnn",
+        "cnn_gru",
+        "multiscale_fusion",
+    }:
+        raise ValueError(
+            "model_type must be 'auto', 'cnn', 'cnn_gru', or "
+            "'multiscale_fusion'."
+        )
     if config.epochs <= 0:
         raise ValueError("epochs must be positive.")
     if config.batch_size <= 0:
@@ -354,6 +413,38 @@ def _validate_training_config(config: TrainConfig) -> None:
         raise ValueError("gru_dropout must be in [0, 1).")
     if config.class_weight_power < 0:
         raise ValueError("class_weight_power must be non-negative.")
+    if not 0 <= config.label_smoothing < 1:
+        raise ValueError("label_smoothing must be in [0, 1).")
+    if config.engineered_feature_count <= 0:
+        raise ValueError("engineered_feature_count must be positive.")
+    if len(config.multiscale_kernel_sizes) < 2:
+        raise ValueError("At least two multiscale kernel sizes are required.")
+    if any(
+        int(kernel_size) <= 0 or int(kernel_size) % 2 == 0
+        for kernel_size in config.multiscale_kernel_sizes
+    ):
+        raise ValueError("Multiscale kernel sizes must be positive odd integers.")
+    if config.multiscale_branch_channels <= 0:
+        raise ValueError("multiscale_branch_channels must be positive.")
+    if config.multiscale_raw_channels <= 0:
+        raise ValueError("multiscale_raw_channels must be positive.")
+    if config.multiscale_residual_blocks <= 0:
+        raise ValueError("multiscale_residual_blocks must be positive.")
+    if config.multiscale_temporal_bins <= 0:
+        raise ValueError("multiscale_temporal_bins must be positive.")
+    if config.multiscale_raw_embedding_dim <= 0:
+        raise ValueError("multiscale_raw_embedding_dim must be positive.")
+    if not config.feature_hidden_dims or any(
+        int(hidden_dim) <= 0 for hidden_dim in config.feature_hidden_dims
+    ):
+        raise ValueError("feature_hidden_dims must contain positive values.")
+    if config.fusion_hidden_dim <= 0:
+        raise ValueError("fusion_hidden_dim must be positive.")
+    if _uses_fusion_model(config):
+        if config.context_radius != 0 or config.sequence_length != 1:
+            raise ValueError(
+                "multiscale_fusion requires context_radius=0 and sequence_length=1."
+            )
     if config.max_grad_norm is not None and config.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive when provided.")
     if config.patience <= 0:
@@ -464,6 +555,51 @@ def _preprocessing_stats_match_dataset(
     return True
 
 
+def _feature_preprocessing_stats_match_config(
+    stats: Mapping[str, object],
+    config: TrainConfig,
+) -> bool:
+    """Return whether saved engineered-feature stats match a fusion config."""
+
+    if stats.get("imputation_strategy") != "mean":
+        return False
+    if stats.get("fit_scope") != "train":
+        return False
+    feature_columns = stats.get("feature_columns")
+    if not isinstance(feature_columns, list):
+        return False
+    if len(feature_columns) != config.engineered_feature_count:
+        return False
+    for key in ["mean", "std"]:
+        values = stats.get(key)
+        if not isinstance(values, Mapping):
+            return False
+        if set(str(column) for column in values) != set(feature_columns):
+            return False
+    return True
+
+
+def _load_or_fit_feature_preprocessing_stats(
+    config: TrainConfig,
+) -> dict[str, object]:
+    """Load or fit chunked train-only engineered-feature preprocessing."""
+
+    metadata_path = Path(config.feature_preprocessing_metadata_path)
+    if metadata_path.exists():
+        stats = load_preprocessing_metadata(metadata_path)
+        if _feature_preprocessing_stats_match_config(stats, config):
+            return stats
+
+    stats = fit_engineered_feature_preprocessing(config.train_feature_path)
+    if len(stats["feature_columns"]) != config.engineered_feature_count:
+        raise ValueError(
+            "Engineered feature count does not match configuration: "
+            f"{len(stats['feature_columns'])} != {config.engineered_feature_count}."
+        )
+    save_preprocessing_metadata(stats, metadata_path)
+    return stats
+
+
 def _preprocessing_signature_value(value: object) -> tuple[str, object]:
     """Return a stable-enough key for path-like or in-memory data sources."""
     if isinstance(value, str | Path):
@@ -486,16 +622,29 @@ def _preprocessing_config_signature(config: TrainConfig) -> tuple[object, ...]:
 def _prefit_preprocessing_metadata(configs: Sequence[TrainConfig]) -> None:
     """Fit or validate preprocessing metadata once per unique data signature."""
     seen: set[tuple[object, ...]] = set()
+    seen_feature_signatures: set[tuple[object, ...]] = set()
     for config in configs:
         _validate_training_config(config)
         signature = _preprocessing_config_signature(config)
-        if signature in seen:
-            continue
-        _load_or_fit_preprocessing_stats(config)
-        seen.add(signature)
+        if signature not in seen:
+            _load_or_fit_preprocessing_stats(config)
+            seen.add(signature)
+        if _uses_fusion_model(config):
+            feature_signature = (
+                _preprocessing_signature_value(config.train_feature_path),
+                _preprocessing_signature_value(
+                    config.feature_preprocessing_metadata_path
+                ),
+                config.engineered_feature_count,
+            )
+            if feature_signature not in seen_feature_signatures:
+                _load_or_fit_feature_preprocessing_stats(config)
+                seen_feature_signatures.add(feature_signature)
 
 
-def _dataset_class_for_config(config: TrainConfig) -> type[DreamtEpochDataset]:
+def _dataset_class_for_config(config: TrainConfig) -> type[Any]:
+    if _uses_fusion_model(config):
+        return DreamtFeatureFusionDataset
     if _uses_sequence_model(config):
         return DreamtSequenceDataset
     if config.context_radius > 0:
@@ -511,6 +660,9 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
     stats = _load_or_fit_preprocessing_stats(config)
     dataset_class = _dataset_class_for_config(config)
     dataset_kwargs: dict[str, Any] = {}
+    feature_stats: dict[str, object] | None = None
+    if _uses_fusion_model(config):
+        feature_stats = _load_or_fit_feature_preprocessing_stats(config)
     if config.context_radius > 0:
         dataset_kwargs["context_radius"] = config.context_radius
     if _uses_sequence_model(config):
@@ -528,6 +680,22 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
             }
         )
 
+    train_kwargs = dict(dataset_kwargs)
+    validation_kwargs = dict(dataset_kwargs)
+    if _uses_fusion_model(config):
+        train_kwargs.update(
+            {
+                "feature_table": config.train_feature_path,
+                "feature_preprocessing_stats": feature_stats,
+            }
+        )
+        validation_kwargs.update(
+            {
+                "feature_table": config.validation_feature_path,
+                "feature_preprocessing_stats": feature_stats,
+            }
+        )
+
     train_dataset = dataset_class(
         raw_dir=config.raw_dir,
         epoch_index=config.epoch_index_path,
@@ -538,7 +706,7 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
         max_cached_participants=config.max_cached_participants,
         participant_array_cache_dir=config.participant_array_cache_dir,
         dtype=config.dataset_dtype,
-        **dataset_kwargs,
+        **train_kwargs,
     )
     val_dataset = dataset_class(
         raw_dir=config.raw_dir,
@@ -550,7 +718,7 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
         max_cached_participants=config.max_cached_participants,
         participant_array_cache_dir=config.participant_array_cache_dir,
         dtype=config.dataset_dtype,
-        **dataset_kwargs,
+        **validation_kwargs,
     )
 
     if len(train_dataset) == 0:
@@ -639,7 +807,7 @@ def _sequence_target_index(dataset: Any) -> int:
         return int(dataset._target_index())
 
     target_position = getattr(dataset, "target_position", "last")
-    sequence_length = int(getattr(dataset, "sequence_length"))
+    sequence_length = int(dataset.sequence_length)
     if target_position == "first":
         return 0
     if target_position == "center":
@@ -832,7 +1000,10 @@ def build_loss_function(
     torch = _require_torch()
     reduction = "none" if config.sequence_label_mode == "many_to_many" else "mean"
     if not config.class_weighting:
-        return torch.nn.CrossEntropyLoss(reduction=reduction)
+        return torch.nn.CrossEntropyLoss(
+            reduction=reduction,
+            label_smoothing=config.label_smoothing,
+        )
 
     counts = class_counts_from_loader(train_loader)
     weights = torch.as_tensor(
@@ -840,10 +1011,18 @@ def build_loss_function(
         dtype=torch.float32,
         device=device,
     )
-    return torch.nn.CrossEntropyLoss(weight=weights, reduction=reduction)
+    return torch.nn.CrossEntropyLoss(
+        weight=weights,
+        reduction=reduction,
+        label_smoothing=config.label_smoothing,
+    )
 
 
-def _unpack_training_batch(batch: Any) -> tuple[Any, Any, Any | None]:
+def _unpack_training_batch(
+    batch: Any,
+    *,
+    paired_input: bool = False,
+) -> tuple[Any, Any, Any | None]:
     """Return ``x``, ``y``, and optional per-target loss weights from a batch."""
 
     if not isinstance(batch, list | tuple):
@@ -852,9 +1031,31 @@ def _unpack_training_batch(batch: Any) -> tuple[Any, Any, Any | None]:
         x_batch, y_batch = batch
         return x_batch, y_batch, None
     if len(batch) == 3:
+        if paired_input:
+            raw_batch, engineered_batch, y_batch = batch
+            return (raw_batch, engineered_batch), y_batch, None
         x_batch, y_batch, sample_weight_batch = batch
         return x_batch, y_batch, sample_weight_batch
     raise ValueError("Expected dataloader batches to contain 2 or 3 items.")
+
+
+def _move_model_input_to_device(model_input: Any, device: Any) -> Any:
+    """Move a tensor or paired tensor input to a training device as float32."""
+
+    torch = _require_torch()
+    if isinstance(model_input, list | tuple):
+        return tuple(
+            _move_model_input_to_device(item, device) for item in model_input
+        )
+    return model_input.to(device=device, dtype=torch.float32)
+
+
+def _forward_model(model: Any, model_input: Any) -> Any:
+    """Invoke a single-input or paired-input model."""
+
+    if isinstance(model_input, list | tuple):
+        return model(*model_input)
+    return model(model_input)
 
 
 def _classification_loss(
@@ -910,16 +1111,20 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
     total_examples = 0
+    paired_input = bool(getattr(model, "expects_paired_input", False))
 
     for batch in dataloader:
-        x_batch, y_batch, sample_weight_batch = _unpack_training_batch(batch)
-        x_batch = x_batch.to(device=device, dtype=_require_torch().float32)
+        x_batch, y_batch, sample_weight_batch = _unpack_training_batch(
+            batch,
+            paired_input=paired_input,
+        )
+        x_batch = _move_model_input_to_device(x_batch, device)
         y_batch = y_batch.to(device=device)
         if sample_weight_batch is not None:
             sample_weight_batch = sample_weight_batch.to(device=device)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x_batch)
+        logits = _forward_model(model, x_batch)
         loss, batch_denominator = _classification_loss(
             logits,
             y_batch,
@@ -1242,15 +1447,19 @@ def evaluate_model(
     sequence_probability_batches: list[np.ndarray] = []
     sequence_indices: list[int] = []
     sequence_offset = 0
+    paired_input = bool(getattr(model, "expects_paired_input", False))
 
     with torch.no_grad():
         for batch in dataloader:
-            x_batch, y_batch, sample_weight_batch = _unpack_training_batch(batch)
-            x_batch = x_batch.to(device=device, dtype=torch.float32)
+            x_batch, y_batch, sample_weight_batch = _unpack_training_batch(
+                batch,
+                paired_input=paired_input,
+            )
+            x_batch = _move_model_input_to_device(x_batch, device)
             y_batch = y_batch.to(device=device)
             if sample_weight_batch is not None:
                 sample_weight_batch = sample_weight_batch.to(device=device)
-            logits = model(x_batch)
+            logits = _forward_model(model, x_batch)
             loss, batch_denominator = _classification_loss(
                 logits,
                 y_batch,
@@ -2823,6 +3032,184 @@ def run_stage12_experiments(
     return summary
 
 
+def stage14_experiment_id(config: TrainConfig) -> str:
+    """Return a stable short ID for the fixed Stage 14 fusion configuration."""
+
+    config_dict = config_to_dict(config)
+    stable_keys = [
+        "model_name",
+        "model_type",
+        "channels",
+        "batch_size",
+        "dataset_dtype",
+        "participant_array_cache_dir",
+        "train_feature_path",
+        "validation_feature_path",
+        "feature_preprocessing_metadata_path",
+        "engineered_feature_count",
+        "epochs",
+        "learning_rate",
+        "weight_decay",
+        "dropout",
+        "label_smoothing",
+        "multiscale_kernel_sizes",
+        "multiscale_branch_channels",
+        "multiscale_raw_channels",
+        "multiscale_residual_blocks",
+        "multiscale_temporal_bins",
+        "multiscale_raw_embedding_dim",
+        "feature_hidden_dims",
+        "fusion_hidden_dim",
+        "max_grad_norm",
+        "patience",
+        "min_delta",
+        "train_eval_interval",
+        "random_seed",
+        "max_train_participants",
+        "max_val_participants",
+    ]
+    payload = {key: config_dict.get(key) for key in stable_keys}
+    digest = sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:10]
+    return f"stage14_multiscale_fusion_{digest}"
+
+
+def build_stage14_fusion_config(
+    base_config: TrainConfig | None = None,
+    output_dir: str | Path = DEFAULT_STAGE14_OUTPUT_DIR,
+) -> TrainConfig:
+    """Create the single fixed Stage 14 multiscale fusion configuration."""
+
+    base = base_config or TrainConfig(
+        output_dir=output_dir,
+        model_name="multiscale_residual_fusion_cnn_stage14",
+        model_type="multiscale_fusion",
+        batch_size=32,
+        epochs=25,
+        learning_rate=3e-4,
+        weight_decay=1e-4,
+        dropout=0.10,
+        class_weighting=False,
+        label_smoothing=0.05,
+        max_grad_norm=1.0,
+        patience=5,
+        train_eval_interval=None,
+        participant_array_cache_dir=DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
+        train_feature_path=DEFAULT_TRAIN_FEATURES_PATH,
+        validation_feature_path=DEFAULT_VALIDATION_FEATURES_PATH,
+        feature_preprocessing_metadata_path=(
+            DEFAULT_FEATURE_PREPROCESSING_METADATA_PATH
+        ),
+        engineered_feature_count=72,
+        multiscale_kernel_sizes=(15, 63, 255),
+        multiscale_branch_channels=16,
+        multiscale_raw_channels=64,
+        multiscale_residual_blocks=2,
+        multiscale_temporal_bins=12,
+        multiscale_raw_embedding_dim=128,
+        feature_hidden_dims=(64, 32),
+        fusion_hidden_dim=64,
+    )
+    return replace(
+        base,
+        output_dir=output_dir,
+        model_name="multiscale_residual_fusion_cnn_stage14",
+        model_type="multiscale_fusion",
+        batch_size=32,
+        epochs=25,
+        learning_rate=3e-4,
+        weight_decay=1e-4,
+        dropout=0.10,
+        context_radius=0,
+        comparison_context_radius=None,
+        sequence_length=1,
+        sequence_label_mode="many_to_one",
+        sequence_loss_weighting="none",
+        sequence_aggregation="none",
+        sequence_extra_aggregations=(),
+        class_weighting=False,
+        class_weight_power=1.0,
+        label_smoothing=0.05,
+        engineered_feature_count=72,
+        multiscale_kernel_sizes=(15, 63, 255),
+        multiscale_branch_channels=16,
+        multiscale_raw_channels=64,
+        multiscale_residual_blocks=2,
+        multiscale_temporal_bins=12,
+        multiscale_raw_embedding_dim=128,
+        feature_hidden_dims=(64, 32),
+        fusion_hidden_dim=64,
+        max_grad_norm=1.0,
+        patience=5,
+        train_eval_interval=None,
+    )
+
+
+def run_stage14_experiment(
+    config: TrainConfig,
+    output_dir: str | Path = DEFAULT_STAGE14_OUTPUT_DIR,
+) -> pd.DataFrame:
+    """Run the single Stage 14 fusion model and save an aggregate summary."""
+
+    _validate_training_config(config)
+    if not _uses_fusion_model(config):
+        raise ValueError("Stage 14 requires model_type='multiscale_fusion'.")
+    if config.class_weighting:
+        raise ValueError("Stage 14 uses unweighted cross-entropy.")
+
+    stage_dir = Path(output_dir)
+    runs_dir = stage_dir / "runs"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    _prefit_preprocessing_metadata([config])
+
+    experiment_id = stage14_experiment_id(config)
+    run_dir = runs_dir / experiment_id
+    run_config = replace(config, output_dir=run_dir)
+    loaders = build_train_validation_dataloaders(run_config)
+    result = train_model(
+        loaders["train"],
+        loaders["validation"],
+        run_config,
+    )
+
+    summary = pd.DataFrame(
+        [
+            {
+                "experiment_id": experiment_id,
+                "model_family": "multiscale_residual_fusion",
+                "train_examples": len(loaders["train"].dataset),
+                "validation_examples": len(loaders["validation"].dataset),
+                "best_epoch": result.best_epoch,
+                "output_dir": str(result.output_dir),
+                **config_to_dict(run_config),
+                **dict(result.best_metrics),
+            }
+        ]
+    )
+    sort_columns, ascending = _summary_sort_columns(summary)
+    summary = summary.sort_values(sort_columns, ascending=ascending).reset_index(
+        drop=True
+    )
+    summary.to_csv(stage_dir / "experiment_summary.csv", index=False)
+
+    if not result.history.empty:
+        history = result.history.copy()
+        history.insert(0, "experiment_id", experiment_id)
+        history.insert(1, "model_family", "multiscale_residual_fusion")
+        history.to_csv(stage_dir / "all_history.csv", index=False)
+
+    best_row = summary.iloc[0].to_dict()
+    _save_json(best_row, stage_dir / "best_config.json")
+    best_confusion_path = result.output_dir / "validation_confusion_matrix.csv"
+    if best_confusion_path.exists():
+        best_confusion = pd.read_csv(best_confusion_path, index_col=0)
+        best_confusion.to_csv(stage_dir / "best_validation_confusion_matrix.csv")
+
+    return summary
+
+
 def run_tiny_overfit_test(
     dataset: Any,
     config: TrainConfig,
@@ -2844,14 +3231,20 @@ def run_tiny_overfit_test(
         batch_size=subset_size,
         shuffle=True,
     )
-    x_batch, y_batch = next(iter(loader))
-    x_batch = x_batch.to(device=device, dtype=torch.float32)
+    if model is None:
+        model = _new_model_for_config(config)
+    model = model.to(device)
+    paired_input = bool(getattr(model, "expects_paired_input", False))
+    x_batch, y_batch, _ = _unpack_training_batch(
+        next(iter(loader)),
+        paired_input=paired_input,
+    )
+    x_batch = _move_model_input_to_device(x_batch, device)
     y_batch = y_batch.to(device=device)
 
-    if model is None:
-        model = _new_sleep_stage_cnn(in_channels=len(dataset.channels), config=config)
-    model = model.to(device)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss(
+        label_smoothing=config.label_smoothing,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.overfit_learning_rate,
@@ -2862,7 +3255,7 @@ def run_tiny_overfit_test(
     for step in range(1, config.overfit_steps + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x_batch)
+        logits = _forward_model(model, x_batch)
         loss = criterion(logits, y_batch)
         loss.backward()
         optimizer.step()

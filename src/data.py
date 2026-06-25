@@ -31,6 +31,11 @@ DEFAULT_PROCESSED_DATA_DIR = Path("data/processed")
 DEFAULT_PREPROCESSING_METADATA_PATH = (
     DEFAULT_PROCESSED_DATA_DIR / "preprocessing_metadata.json"
 )
+DEFAULT_TRAIN_FEATURES_PATH = DEFAULT_PROCESSED_DATA_DIR / "features_train.csv"
+DEFAULT_VALIDATION_FEATURES_PATH = DEFAULT_PROCESSED_DATA_DIR / "features_val.csv"
+DEFAULT_FEATURE_PREPROCESSING_METADATA_PATH = (
+    DEFAULT_PROCESSED_DATA_DIR / "feature_preprocessing_metadata.json"
+)
 DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR = (
     DEFAULT_PROCESSED_DATA_DIR / "deep" / "participants"
 )
@@ -39,6 +44,8 @@ DEFAULT_INVENTORY_CHUNKSIZE = 500_000
 DEFAULT_EPOCH_INDEX_CHUNKSIZE = 500_000
 DEFAULT_MAX_CACHED_PARTICIPANTS = 4
 DEFAULT_DATASET_DTYPE = np.float32
+DEFAULT_FEATURE_PREPROCESSING_CHUNKSIZE = 10_000
+FEATURE_ID_COLUMNS = ["participant_id", "epoch_id", "split", "label"]
 
 TIME_COLUMN = "TIMESTAMP"
 LABEL_COLUMN = "Sleep_Stage"
@@ -800,6 +807,163 @@ def _label_to_id(label: object) -> int:
     return LABEL_TO_ID[label_text]
 
 
+def _feature_columns_from_frame(feature_frame: pd.DataFrame) -> list[str]:
+    """Return engineered feature columns after validating identity fields."""
+
+    missing_columns = sorted(set(FEATURE_ID_COLUMNS) - set(feature_frame.columns))
+    if missing_columns:
+        raise ValueError(
+            f"Engineered feature table is missing column(s): {missing_columns}"
+        )
+    feature_columns = [
+        column for column in feature_frame.columns if column not in FEATURE_ID_COLUMNS
+    ]
+    if not feature_columns:
+        raise ValueError("Engineered feature table has no feature columns.")
+    return feature_columns
+
+
+def _iter_feature_chunks(
+    feature_source: str | Path | pd.DataFrame,
+    chunksize: int,
+) -> Iterable[pd.DataFrame]:
+    """Yield feature-table chunks without materializing a full CSV during fitting."""
+
+    if isinstance(feature_source, pd.DataFrame):
+        yield feature_source
+        return
+
+    feature_path = Path(feature_source)
+    if not feature_path.exists():
+        raise FileNotFoundError(
+            f"Engineered feature CSV does not exist: {feature_path}"
+        )
+    yield from pd.read_csv(
+        feature_path,
+        dtype={"participant_id": str},
+        chunksize=chunksize,
+    )
+
+
+def fit_engineered_feature_preprocessing(
+    feature_source: str | Path | pd.DataFrame,
+    *,
+    expected_split: str = "train",
+    chunksize: int = DEFAULT_FEATURE_PREPROCESSING_CHUNKSIZE,
+    epsilon: float = 1e-8,
+) -> dict[str, object]:
+    """Fit train-only mean imputation and standardization for engineered features.
+
+    CSV inputs are processed in chunks and only scalar per-feature summaries are
+    retained. This avoids the memory-heavy median/materialization path that was
+    unsuitable for local training.
+    """
+
+    if chunksize <= 0:
+        raise ValueError("chunksize must be positive.")
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive.")
+
+    feature_columns: list[str] | None = None
+    accumulators: dict[str, dict[str, float | int]] = {}
+    row_count = 0
+    source_participants: set[str] = set()
+
+    for chunk in _iter_feature_chunks(feature_source, chunksize=chunksize):
+        current_columns = _feature_columns_from_frame(chunk)
+        if feature_columns is None:
+            feature_columns = current_columns
+            accumulators = _new_channel_summary_accumulator(feature_columns)
+        elif current_columns != feature_columns:
+            raise ValueError("Engineered feature columns changed between CSV chunks.")
+
+        split_values = set(chunk["split"].astype(str).str.strip())
+        if split_values != {expected_split}:
+            raise ValueError(
+                "Engineered preprocessing must be fit on the expected split only: "
+                f"expected {expected_split!r}, found {sorted(split_values)}."
+            )
+
+        row_count += len(chunk)
+        source_participants.update(
+            chunk["participant_id"].astype(str).str.strip().tolist()
+        )
+        for column in feature_columns:
+            _update_channel_summary(accumulators[column], chunk[column])
+
+    if not feature_columns or row_count == 0:
+        raise ValueError("Cannot fit engineered preprocessing on an empty table.")
+
+    stats = _finalize_streaming_channel_preprocessing_stats(
+        accumulators,
+        epsilon=epsilon,
+    )
+    stats.update(
+        {
+            "feature_columns": feature_columns,
+            "fit_scope": expected_split,
+            "source_participants": sorted(source_participants),
+            "n_rows_fit": int(row_count),
+        }
+    )
+    stats.pop("channels", None)
+    return stats
+
+
+def apply_engineered_feature_preprocessing(
+    feature_frame: pd.DataFrame,
+    stats: Mapping[str, object],
+    *,
+    dtype: Any = np.float32,
+) -> np.ndarray:
+    """Apply fitted mean imputation and standardization to engineered features."""
+
+    feature_columns = [str(column) for column in stats.get("feature_columns", [])]
+    if not feature_columns:
+        raise ValueError("Feature preprocessing metadata has no feature_columns.")
+    if stats.get("imputation_strategy") != "mean":
+        raise ValueError("Engineered feature preprocessing must use mean imputation.")
+
+    missing_columns = sorted(set(feature_columns) - set(feature_frame.columns))
+    if missing_columns:
+        raise ValueError(
+            f"Engineered feature table is missing fitted column(s): {missing_columns}"
+        )
+    unexpected_columns = [
+        column
+        for column in _feature_columns_from_frame(feature_frame)
+        if column not in feature_columns
+    ]
+    if unexpected_columns:
+        raise ValueError(
+            "Engineered feature table has unexpected feature column(s): "
+            f"{unexpected_columns}"
+        )
+
+    means = stats.get("mean")
+    stds = stats.get("std")
+    if not isinstance(means, Mapping) or not isinstance(stds, Mapping):
+        raise ValueError("Feature preprocessing metadata must contain mean and std.")
+
+    matrix = np.empty(
+        (len(feature_frame), len(feature_columns)),
+        dtype=np.dtype(dtype),
+    )
+    for column_index, column in enumerate(feature_columns):
+        values = pd.to_numeric(feature_frame[column], errors="coerce").to_numpy(
+            dtype=np.float64,
+            copy=True,
+        )
+        mean = float(means[column])
+        std = float(stds[column])
+        values[np.isnan(values)] = mean
+        matrix[:, column_index] = ((values - mean) / std).astype(
+            matrix.dtype,
+            copy=False,
+        )
+    return matrix
+
+
 class DreamtEpochDataset:
     """PyTorch dataset for single DREAMT sleep epochs.
 
@@ -872,6 +1036,181 @@ class DreamtEpochDataset:
             torch.as_tensor(x),
             torch.tensor(y, dtype=torch.long),
         )
+
+
+class DreamtFeatureFusionDataset:
+    """Pair one raw DREAMT epoch with its aligned engineered feature vector."""
+
+    def __init__(
+        self,
+        raw_dir: str | Path = DEFAULT_RAW_DATA_DIR,
+        epoch_index: str | Path | pd.DataFrame = DEFAULT_EPOCH_INDEX_PATH,
+        feature_table: str | Path | pd.DataFrame = DEFAULT_TRAIN_FEATURES_PATH,
+        split: str | None = None,
+        channels: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
+        preprocessing_stats: dict[str, object] | None = None,
+        feature_preprocessing_stats: Mapping[str, object] | None = None,
+        participant_ids: Iterable[str] | None = None,
+        max_participants: int | None = None,
+        max_cached_participants: int | None = DEFAULT_MAX_CACHED_PARTICIPANTS,
+        participant_array_cache_dir: str | Path | None = None,
+        dtype: Any = DEFAULT_DATASET_DTYPE,
+    ):
+        if feature_preprocessing_stats is None:
+            raise ValueError("feature_preprocessing_stats are required.")
+
+        self.raw_dataset = DreamtEpochDataset(
+            raw_dir=raw_dir,
+            epoch_index=epoch_index,
+            split=split,
+            channels=channels,
+            preprocessing_stats=preprocessing_stats,
+            participant_ids=participant_ids,
+            max_participants=max_participants,
+            max_cached_participants=max_cached_participants,
+            participant_array_cache_dir=participant_array_cache_dir,
+            dtype=dtype,
+        )
+        self.channels = self.raw_dataset.channels
+        self.epoch_index = self.raw_dataset.epoch_index
+        self.signal_cache = self.raw_dataset.signal_cache
+        self.dtype = self.raw_dataset.dtype
+        self.feature_preprocessing_stats = dict(feature_preprocessing_stats)
+
+        if isinstance(feature_table, pd.DataFrame):
+            feature_frame = feature_table.copy()
+        else:
+            feature_path = Path(feature_table)
+            if not feature_path.exists():
+                raise FileNotFoundError(
+                    f"Engineered feature CSV does not exist: {feature_path}"
+                )
+            feature_header = pd.read_csv(feature_path, nrows=0)
+            feature_dtypes = {
+                column: np.float32
+                for column in _feature_columns_from_frame(feature_header)
+            }
+            feature_dtypes["participant_id"] = str
+            feature_frame = pd.read_csv(
+                feature_path,
+                dtype=feature_dtypes,
+            )
+
+        table_feature_columns = _feature_columns_from_frame(feature_frame)
+        feature_frame["participant_id"] = (
+            feature_frame["participant_id"].astype(str).str.strip()
+        )
+        feature_frame["epoch_id"] = pd.to_numeric(
+            feature_frame["epoch_id"],
+            errors="raise",
+        ).astype(int)
+        feature_frame["split"] = feature_frame["split"].astype(str).str.strip()
+        feature_frame["label"] = feature_frame["label"].astype(str).str.strip()
+
+        duplicate_mask = feature_frame.duplicated(
+            ["participant_id", "epoch_id"],
+            keep=False,
+        )
+        if duplicate_mask.any():
+            duplicates = feature_frame.loc[
+                duplicate_mask,
+                ["participant_id", "epoch_id"],
+            ].to_dict("records")
+            raise ValueError(
+                f"Engineered feature identities are duplicated: {duplicates}"
+            )
+
+        if split is not None:
+            found_splits = set(feature_frame["split"])
+            if found_splits != {split}:
+                raise ValueError(
+                    "Engineered feature split does not match the requested split: "
+                    f"expected {split!r}, found {sorted(found_splits)}."
+                )
+
+        raw_identity = self.epoch_index[
+            ["participant_id", "epoch_id", "split", "mapped_label"]
+        ].copy()
+        raw_identity["participant_id"] = (
+            raw_identity["participant_id"].astype(str).str.strip()
+        )
+        raw_identity["epoch_id"] = pd.to_numeric(
+            raw_identity["epoch_id"],
+            errors="raise",
+        ).astype(int)
+        raw_identity = raw_identity.rename(
+            columns={
+                "split": "raw_split",
+                "mapped_label": "raw_label",
+            }
+        )
+
+        selected_participants = set(raw_identity["participant_id"])
+        selected_features = feature_frame[
+            feature_frame["participant_id"].isin(selected_participants)
+        ].copy()
+        aligned = raw_identity.merge(
+            selected_features,
+            on=["participant_id", "epoch_id"],
+            how="outer",
+            indicator=True,
+            validate="one_to_one",
+            sort=False,
+        )
+        missing_features = aligned.loc[
+            aligned["_merge"] == "left_only",
+            ["participant_id", "epoch_id"],
+        ]
+        extra_features = aligned.loc[
+            aligned["_merge"] == "right_only",
+            ["participant_id", "epoch_id"],
+        ]
+        if not missing_features.empty or not extra_features.empty:
+            raise ValueError(
+                "Raw and engineered epoch identities do not align: "
+                f"missing_features={missing_features.to_dict('records')}, "
+                f"extra_features={extra_features.to_dict('records')}."
+            )
+
+        aligned = aligned.loc[aligned["_merge"] == "both"].drop(columns="_merge")
+        split_mismatch = aligned["raw_split"].astype(str) != aligned["split"]
+        if split_mismatch.any():
+            raise ValueError("Raw and engineered split values do not agree.")
+        label_mismatch = aligned["raw_label"].astype(str) != aligned["label"]
+        if label_mismatch.any():
+            raise ValueError("Raw and engineered label values do not agree.")
+
+        aligned_lookup = aligned.set_index(["participant_id", "epoch_id"])
+        ordered_identity = pd.MultiIndex.from_frame(
+            raw_identity[["participant_id", "epoch_id"]]
+        )
+        aligned_feature_frame = aligned_lookup.loc[ordered_identity].reset_index()
+        aligned_feature_frame = aligned_feature_frame[
+            ["participant_id", "epoch_id", "split", "label", *table_feature_columns]
+        ]
+        self.engineered_features = apply_engineered_feature_preprocessing(
+            aligned_feature_frame,
+            self.feature_preprocessing_stats,
+            dtype=np.float32,
+        )
+        self.feature_columns = [
+            str(column)
+            for column in self.feature_preprocessing_stats["feature_columns"]
+        ]
+
+    def __len__(self) -> int:
+        return len(self.raw_dataset)
+
+    @property
+    def participants(self) -> set[str]:
+        return self.raw_dataset.participants
+
+    def __getitem__(self, index: int) -> tuple[Any, Any, Any]:
+        import torch
+
+        raw_x, y = self.raw_dataset[index]
+        engineered_x = torch.as_tensor(self.engineered_features[index])
+        return raw_x, engineered_x, y
 
 
 class DreamtContextDataset(DreamtEpochDataset):
