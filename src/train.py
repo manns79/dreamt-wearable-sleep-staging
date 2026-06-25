@@ -21,14 +21,17 @@ from src.data import (
     DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR,
     DEFAULT_PREPROCESSING_METADATA_PATH,
     DEFAULT_RAW_DATA_DIR,
+    DEFAULT_STAGE15_EMBEDDING_DIR,
     DEFAULT_TRAIN_FEATURES_PATH,
     DEFAULT_VALIDATION_FEATURES_PATH,
     EXPECTED_SIGNAL_COLUMNS,
     ID_TO_LABEL,
     LABEL_TO_ID,
     PARTICIPANT_ARRAY_CACHE_MANIFEST,
+    STAGE15_EMBEDDING_MANIFEST,
     TARGET_LABELS,
     DreamtContextDataset,
+    DreamtEmbeddingSequenceDataset,
     DreamtEpochDataset,
     DreamtFeatureFusionDataset,
     DreamtSequenceDataset,
@@ -50,6 +53,7 @@ DEFAULT_STAGE14_OUTPUT_DIR = Path("results/stage14_multiscale_fusion_cnn")
 DEFAULT_STAGE14_WEIGHTED_OUTPUT_DIR = Path(
     "results/stage14_multiscale_fusion_cnn_sqrt_weighted"
 )
+DEFAULT_STAGE15_OUTPUT_DIR = Path("results/stage15_temporal_fusion_tcn")
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,13 @@ class TrainConfig:
     multiscale_raw_embedding_dim: int = 128
     feature_hidden_dims: Sequence[int] = (64, 32)
     fusion_hidden_dim: int = 64
+    stage15_encoder_checkpoint_path: str | Path | None = None
+    stage15_embedding_dir: str | Path = DEFAULT_STAGE15_EMBEDDING_DIR
+    stage15_embedding_batch_size: int = 64
+    stage15_embedding_dim: int = 160
+    tcn_hidden_channels: int = 96
+    tcn_kernel_size: int = 3
+    tcn_dilations: Sequence[int] = (1, 2, 4, 8)
     max_grad_norm: float | None = None
     patience: int = 5
     min_delta: float = 0.0
@@ -231,6 +242,12 @@ def _uses_fusion_model(config: TrainConfig) -> bool:
     return config.model_type == "multiscale_fusion"
 
 
+def _uses_temporal_fusion_tcn(config: TrainConfig) -> bool:
+    """Return whether a config uses cached Stage 14 embeddings and a TCN."""
+
+    return config.model_type == "temporal_fusion_tcn"
+
+
 def _new_sleep_stage_cnn_gru(
     in_channels: int,
     config: TrainConfig,
@@ -271,9 +288,24 @@ def _new_multiscale_fusion_cnn(config: TrainConfig) -> Any:
     )
 
 
+def _new_sleep_stage_embedding_tcn(config: TrainConfig) -> Any:
+    from src.models import SleepStageEmbeddingTCN
+
+    return SleepStageEmbeddingTCN(
+        embedding_dim=config.stage15_embedding_dim,
+        num_classes=len(TARGET_LABELS),
+        hidden_channels=config.tcn_hidden_channels,
+        kernel_size=config.tcn_kernel_size,
+        dilations=config.tcn_dilations,
+        dropout=config.dropout,
+    )
+
+
 def _new_model_for_config(config: TrainConfig) -> Any:
     """Construct the model implied by a training configuration."""
 
+    if _uses_temporal_fusion_tcn(config):
+        return _new_sleep_stage_embedding_tcn(config)
     if _uses_fusion_model(config):
         return _new_multiscale_fusion_cnn(config)
     if _uses_sequence_model(config):
@@ -334,10 +366,11 @@ def _validate_training_config(config: TrainConfig) -> None:
         "cnn",
         "cnn_gru",
         "multiscale_fusion",
+        "temporal_fusion_tcn",
     }:
         raise ValueError(
-            "model_type must be 'auto', 'cnn', 'cnn_gru', or "
-            "'multiscale_fusion'."
+            "model_type must be 'auto', 'cnn', 'cnn_gru', "
+            "'multiscale_fusion', or 'temporal_fusion_tcn'."
         )
     if config.epochs <= 0:
         raise ValueError("epochs must be positive.")
@@ -443,10 +476,40 @@ def _validate_training_config(config: TrainConfig) -> None:
         raise ValueError("feature_hidden_dims must contain positive values.")
     if config.fusion_hidden_dim <= 0:
         raise ValueError("fusion_hidden_dim must be positive.")
+    if config.stage15_embedding_batch_size <= 0:
+        raise ValueError("stage15_embedding_batch_size must be positive.")
+    if config.stage15_embedding_dim <= 0:
+        raise ValueError("stage15_embedding_dim must be positive.")
+    if config.tcn_hidden_channels <= 0:
+        raise ValueError("tcn_hidden_channels must be positive.")
+    if config.tcn_kernel_size <= 0 or config.tcn_kernel_size % 2 == 0:
+        raise ValueError("tcn_kernel_size must be a positive odd integer.")
+    if not config.tcn_dilations or any(
+        int(dilation) <= 0 for dilation in config.tcn_dilations
+    ):
+        raise ValueError("tcn_dilations must contain positive values.")
     if _uses_fusion_model(config):
         if config.context_radius != 0 or config.sequence_length != 1:
             raise ValueError(
                 "multiscale_fusion requires context_radius=0 and sequence_length=1."
+            )
+    if _uses_temporal_fusion_tcn(config):
+        if config.stage15_encoder_checkpoint_path is None:
+            raise ValueError(
+                "temporal_fusion_tcn requires stage15_encoder_checkpoint_path."
+            )
+        if config.context_radius != 0 or config.sequence_length <= 1:
+            raise ValueError(
+                "temporal_fusion_tcn requires context_radius=0 and "
+                "sequence_length > 1."
+            )
+        if config.sequence_label_mode != "many_to_many":
+            raise ValueError(
+                "temporal_fusion_tcn requires sequence_label_mode='many_to_many'."
+            )
+        if config.sequence_loss_weighting != "inverse_epoch_coverage":
+            raise ValueError(
+                "temporal_fusion_tcn requires inverse_epoch_coverage loss weighting."
             )
     if config.max_grad_norm is not None and config.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive when provided.")
@@ -628,6 +691,9 @@ def _prefit_preprocessing_metadata(configs: Sequence[TrainConfig]) -> None:
     seen_feature_signatures: set[tuple[object, ...]] = set()
     for config in configs:
         _validate_training_config(config)
+        if _uses_temporal_fusion_tcn(config):
+            export_stage15_frozen_embeddings(config)
+            continue
         signature = _preprocessing_config_signature(config)
         if signature not in seen:
             _load_or_fit_preprocessing_stats(config)
@@ -645,6 +711,245 @@ def _prefit_preprocessing_metadata(configs: Sequence[TrainConfig]) -> None:
                 seen_feature_signatures.add(feature_signature)
 
 
+def _stage15_embedding_paths(config: TrainConfig) -> dict[str, Path]:
+    embedding_dir = Path(config.stage15_embedding_dir)
+    return {
+        "directory": embedding_dir,
+        "manifest": embedding_dir / STAGE15_EMBEDDING_MANIFEST,
+        "train_embeddings": embedding_dir / "train_embeddings.npy",
+        "train_index": embedding_dir / "train_epoch_index.csv",
+        "validation_embeddings": embedding_dir / "validation_embeddings.npy",
+        "validation_index": embedding_dir / "validation_epoch_index.csv",
+    }
+
+
+def _stage15_embedding_signature(config: TrainConfig) -> dict[str, Any]:
+    def file_signature(value: str | Path | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        path = Path(value)
+        if not path.exists():
+            return {"path": str(path.resolve()), "exists": False}
+        stat = path.stat()
+        return {
+            "path": str(path.resolve()),
+            "exists": True,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    checkpoint_path = Path(str(config.stage15_encoder_checkpoint_path))
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Stage 15 encoder checkpoint does not exist: {checkpoint_path}"
+        )
+    checkpoint_stat = checkpoint_path.stat()
+    return {
+        "encoder_checkpoint_path": str(checkpoint_path.resolve()),
+        "encoder_checkpoint_size": int(checkpoint_stat.st_size),
+        "encoder_checkpoint_mtime_ns": int(checkpoint_stat.st_mtime_ns),
+        "embedding_dim": int(config.stage15_embedding_dim),
+        "max_train_participants": config.max_train_participants,
+        "max_val_participants": config.max_val_participants,
+        "epoch_index": file_signature(config.epoch_index_path),
+        "train_features": file_signature(config.train_feature_path),
+        "validation_features": file_signature(config.validation_feature_path),
+        "raw_preprocessing": file_signature(config.preprocessing_metadata_path),
+        "feature_preprocessing": file_signature(
+            config.feature_preprocessing_metadata_path
+        ),
+        "participant_cache_manifest": file_signature(
+            (
+                Path(config.participant_array_cache_dir)
+                / PARTICIPANT_ARRAY_CACHE_MANIFEST
+            )
+            if config.participant_array_cache_dir is not None
+            else None
+        ),
+    }
+
+
+def _stage15_embedding_cache_matches(config: TrainConfig) -> bool:
+    paths = _stage15_embedding_paths(config)
+    required_paths = [
+        paths["manifest"],
+        paths["train_embeddings"],
+        paths["train_index"],
+        paths["validation_embeddings"],
+        paths["validation_index"],
+    ]
+    if not all(path.exists() for path in required_paths):
+        return False
+
+    try:
+        with paths["manifest"].open("r", encoding="utf-8") as file:
+            manifest = json.load(file)
+        if manifest.get("signature") != _stage15_embedding_signature(config):
+            return False
+        for split in ["train", "validation"]:
+            embeddings = np.load(paths[f"{split}_embeddings"], mmap_mode="r")
+            epoch_index = pd.read_csv(paths[f"{split}_index"])
+            if embeddings.ndim != 2:
+                return False
+            if embeddings.shape[1] != config.stage15_embedding_dim:
+                return False
+            if len(embeddings) != len(epoch_index):
+                return False
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _stage15_source_encoder_config(config: TrainConfig) -> TrainConfig:
+    checkpoint_path = Path(str(config.stage15_encoder_checkpoint_path))
+    source_config = load_train_config(checkpoint_path=checkpoint_path)
+    if not _uses_fusion_model(source_config):
+        raise ValueError("Stage 15 requires a Stage 14 fusion encoder checkpoint.")
+    return replace(
+        source_config,
+        raw_dir=config.raw_dir,
+        epoch_index_path=config.epoch_index_path,
+        preprocessing_metadata_path=config.preprocessing_metadata_path,
+        train_feature_path=config.train_feature_path,
+        validation_feature_path=config.validation_feature_path,
+        feature_preprocessing_metadata_path=(
+            config.feature_preprocessing_metadata_path
+        ),
+        participant_array_cache_dir=config.participant_array_cache_dir,
+        max_train_participants=config.max_train_participants,
+        max_val_participants=config.max_val_participants,
+        max_cached_participants=config.max_cached_participants,
+        device=config.device,
+        num_workers=config.num_workers,
+        batch_size=config.stage15_embedding_batch_size,
+    )
+
+
+def export_stage15_frozen_embeddings(
+    config: TrainConfig,
+    *,
+    overwrite: bool = False,
+) -> dict[str, Path]:
+    """Cache fused epoch embeddings from a frozen Stage 14 checkpoint."""
+
+    torch = _require_torch()
+    _validate_training_config(config)
+    if not _uses_temporal_fusion_tcn(config):
+        raise ValueError("Embedding export requires a temporal_fusion_tcn config.")
+
+    paths = _stage15_embedding_paths(config)
+    if not overwrite and _stage15_embedding_cache_matches(config):
+        return paths
+
+    source_config = _stage15_source_encoder_config(config)
+    datasets = build_train_validation_datasets(source_config)
+    device = resolve_device(config.device)
+    model = _new_model_for_config(source_config)
+    checkpoint = load_checkpoint(
+        config.stage15_encoder_checkpoint_path,
+        map_location="cpu",
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+
+    expected_embedding_dim = (
+        int(source_config.multiscale_raw_embedding_dim)
+        + int(source_config.feature_hidden_dims[-1])
+    )
+    if expected_embedding_dim != config.stage15_embedding_dim:
+        raise ValueError(
+            "Stage 15 embedding dimension does not match the source encoder: "
+            f"{config.stage15_embedding_dim} != {expected_embedding_dim}."
+        )
+
+    paths["directory"].mkdir(parents=True, exist_ok=True)
+    split_rows: dict[str, int] = {}
+    for split, dataset in datasets.items():
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=config.stage15_embedding_batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+        )
+        output = np.lib.format.open_memmap(
+            paths[f"{split}_embeddings"],
+            mode="w+",
+            dtype=np.float32,
+            shape=(len(dataset), config.stage15_embedding_dim),
+        )
+        offset = 0
+        with torch.no_grad():
+            for raw_x, engineered_x, _ in loader:
+                raw_x = raw_x.to(device=device, dtype=torch.float32)
+                engineered_x = engineered_x.to(
+                    device=device,
+                    dtype=torch.float32,
+                )
+                embeddings = model.encode_embeddings(raw_x, engineered_x)
+                batch_array = (
+                    embeddings.detach().cpu().numpy().astype(np.float32, copy=False)
+                )
+                stop = offset + len(batch_array)
+                output[offset:stop] = batch_array
+                offset = stop
+        output.flush()
+        if offset != len(dataset):
+            raise RuntimeError(
+                f"Stage 15 embedding export wrote {offset} of {len(dataset)} rows."
+            )
+        del output
+
+        epoch_index = dataset.epoch_index[
+            ["participant_id", "epoch_id", "split", "mapped_label"]
+        ].copy()
+        epoch_index.to_csv(paths[f"{split}_index"], index=False)
+        split_rows[split] = len(epoch_index)
+
+    _save_json(
+        {
+            "signature": _stage15_embedding_signature(config),
+            "source_checkpoint_epoch": checkpoint.get("epoch"),
+            "source_model_name": source_config.model_name,
+            "embedding_rows": split_rows,
+        },
+        paths["manifest"],
+    )
+    return paths
+
+
+def _build_stage15_embedding_datasets(config: TrainConfig) -> dict[str, Any]:
+    paths = export_stage15_frozen_embeddings(config)
+    dataset_kwargs = {
+        "sequence_length": config.sequence_length,
+        "stride": config.sequence_stride,
+        "label_mode": config.sequence_label_mode,
+        "target_position": config.sequence_target_position,
+        "return_sample_weights": (
+            config.sequence_label_mode == "many_to_many"
+            and config.sequence_loss_weighting != "none"
+        ),
+        "sample_weight_mode": config.sequence_loss_weighting,
+    }
+    datasets = {
+        "train": DreamtEmbeddingSequenceDataset(
+            paths["train_embeddings"],
+            paths["train_index"],
+            **dataset_kwargs,
+        ),
+        "validation": DreamtEmbeddingSequenceDataset(
+            paths["validation_embeddings"],
+            paths["validation_index"],
+            **dataset_kwargs,
+        ),
+    }
+    if len(datasets["train"]) == 0:
+        raise ValueError("Stage 15 training sequence dataset is empty.")
+    if len(datasets["validation"]) == 0:
+        raise ValueError("Stage 15 validation sequence dataset is empty.")
+    return datasets
+
+
 def _dataset_class_for_config(config: TrainConfig) -> type[Any]:
     if _uses_fusion_model(config):
         return DreamtFeatureFusionDataset
@@ -659,6 +964,9 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
     """Build train and validation datasets without touching the test split."""
 
     _validate_training_config(config)
+    if _uses_temporal_fusion_tcn(config):
+        return _build_stage15_embedding_datasets(config)
+
     channels = list(config.channels)
     stats = _load_or_fit_preprocessing_stats(config)
     dataset_class = _dataset_class_for_config(config)
@@ -3225,6 +3533,174 @@ def run_stage14_experiment(
     best_row = summary.iloc[0].to_dict()
     _save_json(best_row, stage_dir / "best_config.json")
     best_confusion_path = result.output_dir / "validation_confusion_matrix.csv"
+    if best_confusion_path.exists():
+        best_confusion = pd.read_csv(best_confusion_path, index_col=0)
+        best_confusion.to_csv(stage_dir / "best_validation_confusion_matrix.csv")
+
+    return summary
+
+
+def stage15_experiment_id(config: TrainConfig) -> str:
+    """Return a stable short ID for the frozen-embedding Stage 15 TCN."""
+
+    config_dict = config_to_dict(config)
+    stable_keys = [
+        "model_name",
+        "model_type",
+        "stage15_encoder_checkpoint_path",
+        "stage15_embedding_dim",
+        "sequence_length",
+        "sequence_stride",
+        "sequence_label_mode",
+        "sequence_loss_weighting",
+        "sequence_aggregation",
+        "sequence_extra_aggregations",
+        "batch_size",
+        "epochs",
+        "learning_rate",
+        "weight_decay",
+        "dropout",
+        "class_weighting",
+        "class_weight_power",
+        "label_smoothing",
+        "tcn_hidden_channels",
+        "tcn_kernel_size",
+        "tcn_dilations",
+        "max_grad_norm",
+        "patience",
+        "min_delta",
+        "train_eval_interval",
+        "random_seed",
+    ]
+    payload = {key: config_dict.get(key) for key in stable_keys}
+    digest = sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:10]
+    return f"stage15_frozen_tcn_s{config.sequence_length}_{digest}"
+
+
+def build_stage15_temporal_tcn_config(
+    encoder_checkpoint_path: str | Path,
+    base_config: TrainConfig | None = None,
+    output_dir: str | Path = DEFAULT_STAGE15_OUTPUT_DIR,
+    embedding_dir: str | Path = DEFAULT_STAGE15_EMBEDDING_DIR,
+) -> TrainConfig:
+    """Create the fixed Stage 15 frozen-embedding many-to-many TCN config."""
+
+    base = base_config or TrainConfig()
+    return replace(
+        base,
+        output_dir=output_dir,
+        model_name="stage15_frozen_stage14_embedding_tcn",
+        model_type="temporal_fusion_tcn",
+        batch_size=128,
+        epochs=30,
+        learning_rate=3e-4,
+        weight_decay=1e-4,
+        dropout=0.15,
+        context_radius=0,
+        comparison_context_radius=None,
+        sequence_length=31,
+        sequence_stride=1,
+        sequence_label_mode="many_to_many",
+        sequence_target_position="center",
+        sequence_loss_weighting="inverse_epoch_coverage",
+        sequence_aggregation="center_weighted",
+        sequence_extra_aggregations=("uniform",),
+        class_weighting=True,
+        class_weight_power=0.5,
+        label_smoothing=0.05,
+        stage15_encoder_checkpoint_path=encoder_checkpoint_path,
+        stage15_embedding_dir=embedding_dir,
+        stage15_embedding_batch_size=64,
+        stage15_embedding_dim=160,
+        tcn_hidden_channels=96,
+        tcn_kernel_size=3,
+        tcn_dilations=(1, 2, 4, 8),
+        max_grad_norm=1.0,
+        patience=6,
+        train_eval_interval=None,
+    )
+
+
+def run_stage15_experiment(
+    config: TrainConfig,
+    output_dir: str | Path = DEFAULT_STAGE15_OUTPUT_DIR,
+) -> pd.DataFrame:
+    """Run the fixed frozen-embedding Stage 15 many-to-many TCN."""
+
+    _validate_training_config(config)
+    if not _uses_temporal_fusion_tcn(config):
+        raise ValueError("Stage 15 requires model_type='temporal_fusion_tcn'.")
+
+    stage_dir = Path(output_dir)
+    runs_dir = stage_dir / "runs"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    _prefit_preprocessing_metadata([config])
+
+    experiment_id = stage15_experiment_id(config)
+    run_dir = runs_dir / experiment_id
+    run_config = replace(config, output_dir=run_dir)
+    loaders = build_train_validation_dataloaders(run_config)
+    result = train_model(
+        loaders["train"],
+        loaders["validation"],
+        run_config,
+    )
+
+    methods = _sequence_aggregation_methods(run_config)
+    summary_rows: list[dict[str, Any]] = []
+    config_row = config_to_dict(run_config)
+    for method in methods:
+        metric_row = _stage12_metric_row_for_aggregation(
+            result.best_metrics,
+            method=method,
+            primary_method=methods[0],
+        )
+        summary_rows.append(
+            {
+                "experiment_id": experiment_id,
+                "model_family": "frozen_stage14_embedding_tcn",
+                "aggregation_method": method,
+                "train_sequences": len(loaders["train"].dataset),
+                "validation_sequences": len(loaders["validation"].dataset),
+                "train_covered_epochs": len(
+                    _sequence_label_positions(loaders["train"].dataset)
+                ),
+                "validation_covered_epochs": len(
+                    _sequence_label_positions(loaders["validation"].dataset)
+                ),
+                "best_epoch": result.best_epoch,
+                "output_dir": str(result.output_dir),
+                **config_row,
+                **metric_row,
+            }
+        )
+
+    summary = pd.DataFrame(summary_rows)
+    sort_columns, ascending = _summary_sort_columns(summary)
+    summary = summary.sort_values(sort_columns, ascending=ascending).reset_index(
+        drop=True
+    )
+    summary.to_csv(stage_dir / "experiment_summary.csv", index=False)
+
+    if not result.history.empty:
+        history = result.history.copy()
+        history.insert(0, "experiment_id", experiment_id)
+        history.insert(1, "sequence_length", run_config.sequence_length)
+        history.insert(2, "model_family", "frozen_stage14_embedding_tcn")
+        history.to_csv(stage_dir / "all_history.csv", index=False)
+
+    best_row = summary.iloc[0].to_dict()
+    _save_json(best_row, stage_dir / "best_config.json")
+    method = str(best_row["aggregation_method"])
+    if method == str(best_row["sequence_aggregation"]):
+        best_confusion_path = result.output_dir / "validation_confusion_matrix.csv"
+    else:
+        best_confusion_path = (
+            result.output_dir / f"validation_confusion_matrix_{method}.csv"
+        )
     if best_confusion_path.exists():
         best_confusion = pd.read_csv(best_confusion_path, index_col=0)
         best_confusion.to_csv(stage_dir / "best_validation_confusion_matrix.csv")

@@ -370,7 +370,7 @@ class MultiscaleResidualFusionCNN(nn.Module):
             nn.Linear(fusion_hidden_dim, num_classes),
         )
 
-    def forward(
+    def encode_embeddings(
         self,
         raw_x: torch.Tensor,
         engineered_x: torch.Tensor,
@@ -397,4 +397,123 @@ class MultiscaleResidualFusionCNN(nn.Module):
         raw_features = self.raw_encoder(torch.cat(branch_features, dim=1))
         raw_embedding = self.raw_projection(self.raw_pool(raw_features))
         feature_embedding = self.feature_encoder(engineered_x)
-        return self.classifier(torch.cat([raw_embedding, feature_embedding], dim=1))
+        return torch.cat([raw_embedding, feature_embedding], dim=1)
+
+    def forward(
+        self,
+        raw_x: torch.Tensor,
+        engineered_x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.classifier(self.encode_embeddings(raw_x, engineered_x))
+
+
+class TemporalResidualBlock1d(nn.Module):
+    """Non-causal dilated residual block for offline sleep-stage sequences."""
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+        dilation: int,
+        dropout: float,
+    ):
+        super().__init__()
+        if channels <= 0:
+            raise ValueError("channels must be positive.")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer.")
+        if dilation <= 0:
+            raise ValueError("dilation must be positive.")
+        if not 0 <= dropout < 1:
+            raise ValueError("dropout must be in [0, 1).")
+
+        padding = dilation * (kernel_size // 2)
+        groups = _group_count(channels)
+        self.block = nn.Sequential(
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                dilation=dilation,
+                bias=False,
+            ),
+            nn.GroupNorm(groups, channels),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout else nn.Identity(),
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                dilation=dilation,
+                bias=False,
+            ),
+            nn.GroupNorm(groups, channels),
+        )
+        self.activation = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(x + self.block(x))
+
+
+class SleepStageEmbeddingTCN(nn.Module):
+    """Many-to-many TCN over frozen Stage 14 epoch embeddings."""
+
+    def __init__(
+        self,
+        embedding_dim: int = 160,
+        num_classes: int = 3,
+        hidden_channels: int = 96,
+        kernel_size: int = 3,
+        dilations: Sequence[int] = (1, 2, 4, 8),
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        if embedding_dim <= 0:
+            raise ValueError("embedding_dim must be positive.")
+        if num_classes <= 1:
+            raise ValueError("num_classes must be greater than 1.")
+        if hidden_channels <= 0:
+            raise ValueError("hidden_channels must be positive.")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer.")
+        if not dilations or any(int(dilation) <= 0 for dilation in dilations):
+            raise ValueError("dilations must contain positive values.")
+        if not 0 <= dropout < 1:
+            raise ValueError("dropout must be in [0, 1).")
+
+        self.embedding_dim = int(embedding_dim)
+        self.input_projection = nn.Sequential(
+            nn.Linear(self.embedding_dim, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.GELU(),
+        )
+        self.temporal_blocks = nn.Sequential(
+            *[
+                TemporalResidualBlock1d(
+                    hidden_channels,
+                    kernel_size=kernel_size,
+                    dilation=int(dilation),
+                    dropout=dropout,
+                )
+                for dilation in dilations
+            ]
+        )
+        self.classifier = nn.Linear(hidden_channels, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(
+                "SleepStageEmbeddingTCN expects input shaped "
+                "(batch, sequence, embedding)."
+            )
+        if x.shape[-1] != self.embedding_dim:
+            raise ValueError(
+                "Embedding input has an unexpected feature count: "
+                f"{x.shape[-1]} != {self.embedding_dim}."
+            )
+
+        projected = self.input_projection(x)
+        temporal = self.temporal_blocks(projected.transpose(1, 2)).transpose(1, 2)
+        return self.classifier(temporal)

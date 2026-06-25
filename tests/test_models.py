@@ -6,6 +6,7 @@ from src.models import (  # noqa: E402
     MultiscaleResidualFusionCNN,
     SleepStageCNN,
     SleepStageCNNGRU,
+    SleepStageEmbeddingTCN,
 )
 
 
@@ -138,3 +139,47 @@ def test_multiscale_residual_fusion_cnn_rejects_invalid_paired_inputs():
         model(torch.randn(2, 8, 1920), torch.randn(1, 72))
     with pytest.raises(ValueError, match="unexpected feature count"):
         model(torch.randn(1, 8, 1920), torch.randn(1, 71))
+
+
+def test_multiscale_residual_fusion_cnn_exposes_frozen_epoch_embeddings():
+    model = MultiscaleResidualFusionCNN(
+        in_channels=4,
+        num_engineered_features=12,
+        raw_embedding_dim=20,
+        feature_hidden_dims=(10, 6),
+        dropout=0.0,
+    )
+    raw_x = torch.randn(3, 4, 128)
+    engineered_x = torch.randn(3, 12)
+
+    embeddings = model.encode_embeddings(raw_x, engineered_x)
+    logits = model(raw_x, engineered_x)
+
+    assert embeddings.shape == (3, 26)
+    assert torch.allclose(logits, model.classifier(embeddings))
+
+
+def test_sleep_stage_embedding_tcn_returns_many_to_many_logits():
+    model = SleepStageEmbeddingTCN(
+        embedding_dim=16,
+        hidden_channels=12,
+        dilations=(1, 2, 4),
+        dropout=0.0,
+    )
+    x = torch.randn(5, 31, 16, requires_grad=True)
+
+    logits = model(x)
+    logits.square().mean().backward()
+
+    assert logits.shape == (5, 31, 3)
+    assert x.grad is not None
+    assert all(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_sleep_stage_embedding_tcn_rejects_invalid_input():
+    model = SleepStageEmbeddingTCN(embedding_dim=16)
+
+    with pytest.raises(ValueError, match="expects input shaped"):
+        model(torch.randn(5, 16))
+    with pytest.raises(ValueError, match="unexpected feature count"):
+        model(torch.randn(5, 31, 15))

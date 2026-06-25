@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -21,10 +22,12 @@ from src.train import (  # noqa: E402
     build_stage12_many_to_many_configs,
     build_stage14_fusion_config,
     build_stage14_weighted_followup_config,
+    build_stage15_temporal_tcn_config,
     build_train_validation_datasets,
     class_counts_from_loader,
     class_weights_from_counts,
     evaluate_model,
+    export_stage15_frozen_embeddings,
     export_validation_predictions_from_checkpoint,
     load_checkpoint,
     load_train_config,
@@ -35,6 +38,7 @@ from src.train import (  # noqa: E402
     run_stage11_experiments,
     run_stage12_experiments,
     run_stage14_experiment,
+    run_stage15_experiment,
     run_tiny_overfit_test,
     save_checkpoint,
     stage9_experiment_id,
@@ -42,6 +46,7 @@ from src.train import (  # noqa: E402
     stage11_experiment_id,
     stage12_experiment_id,
     stage14_experiment_id,
+    stage15_experiment_id,
     train_model,
     train_one_epoch,
 )
@@ -169,6 +174,7 @@ class SyntheticFusionDataset(torch.utils.data.Dataset):
         channels=2,
         timepoints=64,
         engineered_features=72,
+        split="train",
     ):
         self.channels = [f"CH{index}" for index in range(channels)]
         self.epoch_index = pd.DataFrame(
@@ -177,6 +183,7 @@ class SyntheticFusionDataset(torch.utils.data.Dataset):
                     f"S{index // 4:03d}" for index in range(n_examples)
                 ],
                 "epoch_id": list(range(n_examples)),
+                "split": [split] * n_examples,
                 "mapped_label": [
                     ["Wake", "Non-REM", "REM"][index % 3]
                     for index in range(n_examples)
@@ -1367,3 +1374,180 @@ def test_run_stage14_weighted_experiment_writes_summary(tmp_path, monkeypatch):
     assert (Path(tmp_path) / "all_history.csv").exists()
     assert (Path(tmp_path) / "best_config.json").exists()
     assert (Path(tmp_path) / "best_validation_confusion_matrix.csv").exists()
+
+
+def test_stage15_config_is_fixed_frozen_many_to_many_tcn(tmp_path):
+    checkpoint_path = tmp_path / "stage14_best.pt"
+    config = build_stage15_temporal_tcn_config(
+        checkpoint_path,
+        output_dir=tmp_path / "results",
+        embedding_dir=tmp_path / "embeddings",
+    )
+
+    assert config.model_type == "temporal_fusion_tcn"
+    assert config.sequence_length == 31
+    assert config.sequence_label_mode == "many_to_many"
+    assert config.sequence_loss_weighting == "inverse_epoch_coverage"
+    assert config.sequence_aggregation == "center_weighted"
+    assert config.sequence_extra_aggregations == ("uniform",)
+    assert config.class_weighting is True
+    assert config.class_weight_power == pytest.approx(0.5)
+    assert config.stage15_embedding_dim == 160
+    assert config.tcn_dilations == (1, 2, 4, 8)
+    assert stage15_experiment_id(config).startswith("stage15_frozen_tcn_s31_")
+
+
+def test_stage15_model_factory_returns_many_to_many_tcn(tmp_path):
+    config = TrainConfig(
+        model_type="temporal_fusion_tcn",
+        stage15_encoder_checkpoint_path=tmp_path / "encoder.pt",
+        stage15_embedding_dim=16,
+        tcn_hidden_channels=12,
+        tcn_dilations=(1, 2),
+        sequence_length=5,
+        sequence_label_mode="many_to_many",
+        sequence_loss_weighting="inverse_epoch_coverage",
+        sequence_aggregation="center_weighted",
+    )
+
+    model = _new_model_for_config(config)
+    logits = model(torch.randn(3, 5, 16))
+
+    assert logits.shape == (3, 5, 3)
+
+
+def test_export_stage15_frozen_embeddings_writes_aligned_cache(
+    tmp_path,
+    monkeypatch,
+):
+    source_config = TrainConfig(
+        model_name="small_stage14",
+        model_type="multiscale_fusion",
+        channels=("CH0", "CH1"),
+        engineered_feature_count=4,
+        multiscale_kernel_sizes=(5, 9),
+        multiscale_branch_channels=2,
+        multiscale_raw_channels=4,
+        multiscale_residual_blocks=1,
+        multiscale_temporal_bins=2,
+        multiscale_raw_embedding_dim=6,
+        feature_hidden_dims=(4,),
+        fusion_hidden_dim=4,
+        dropout=0.0,
+    )
+    source_model = _new_model_for_config(source_config)
+    checkpoint_path = tmp_path / "stage14_best.pt"
+    save_checkpoint(checkpoint_path, source_model, config=source_config, epoch=2)
+
+    datasets = {
+        "train": SyntheticFusionDataset(
+            n_examples=6,
+            channels=2,
+            engineered_features=4,
+            split="train",
+        ),
+        "validation": SyntheticFusionDataset(
+            n_examples=3,
+            channels=2,
+            engineered_features=4,
+            split="validation",
+        ),
+    }
+    monkeypatch.setattr(
+        "src.train.build_train_validation_datasets",
+        lambda config: datasets,
+    )
+    config = TrainConfig(
+        model_type="temporal_fusion_tcn",
+        stage15_encoder_checkpoint_path=checkpoint_path,
+        stage15_embedding_dir=tmp_path / "embeddings",
+        stage15_embedding_batch_size=2,
+        stage15_embedding_dim=10,
+        sequence_length=3,
+        sequence_label_mode="many_to_many",
+        sequence_loss_weighting="inverse_epoch_coverage",
+        sequence_aggregation="center_weighted",
+        device="cpu",
+    )
+
+    paths = export_stage15_frozen_embeddings(config)
+    train_embeddings = np.load(paths["train_embeddings"])
+    validation_embeddings = np.load(paths["validation_embeddings"])
+    train_index = pd.read_csv(paths["train_index"])
+
+    assert train_embeddings.shape == (6, 10)
+    assert validation_embeddings.shape == (3, 10)
+    assert list(train_index["participant_id"]) == list(
+        datasets["train"].epoch_index["participant_id"]
+    )
+    assert paths["manifest"].exists()
+
+
+def test_run_stage15_experiment_writes_aggregation_summary(
+    tmp_path,
+    monkeypatch,
+):
+    dataset = SyntheticManyToManySequenceDataset(return_sample_weights=True)
+    loader = _loader(dataset, batch_size=2)
+
+    monkeypatch.setattr(
+        "src.train.build_train_validation_dataloaders",
+        lambda config: {"train": loader, "validation": loader},
+    )
+    monkeypatch.setattr(
+        "src.train._prefit_preprocessing_metadata",
+        lambda configs: None,
+    )
+
+    def fake_train_model(train_loader, val_loader, config):
+        output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        confusion = pd.DataFrame(
+            [[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            index=["true_Wake", "true_Non-REM", "true_REM"],
+            columns=["pred_Wake", "pred_Non-REM", "pred_REM"],
+        )
+        confusion.to_csv(output_dir / "validation_confusion_matrix.csv")
+        confusion.to_csv(
+            output_dir / "validation_confusion_matrix_uniform.csv"
+        )
+        history = pd.DataFrame(
+            {
+                "epoch": [1],
+                "train_objective_loss": [1.0],
+                "validation_loss": [0.5],
+                "macro_f1": [0.51],
+                "balanced_accuracy": [0.50],
+                "aggregation_method": ["center_weighted"],
+                "uniform_macro_f1": [0.49],
+                "uniform_balanced_accuracy": [0.48],
+            }
+        )
+        return TrainingResult(
+            history=history,
+            best_metrics=history.iloc[0].to_dict(),
+            best_epoch=1,
+            best_checkpoint_path=output_dir / "checkpoints" / "best.pt",
+            last_checkpoint_path=output_dir / "checkpoints" / "last.pt",
+            output_dir=output_dir,
+        )
+
+    monkeypatch.setattr("src.train.train_model", fake_train_model)
+    config = build_stage15_temporal_tcn_config(
+        tmp_path / "stage14_best.pt",
+        output_dir=tmp_path,
+        embedding_dir=tmp_path / "embeddings",
+    )
+
+    summary = run_stage15_experiment(config, output_dir=tmp_path)
+
+    assert set(summary["aggregation_method"]) == {
+        "center_weighted",
+        "uniform",
+    }
+    assert summary.loc[0, "macro_f1"] == pytest.approx(0.51)
+    assert summary.loc[0, "model_family"] == "frozen_stage14_embedding_tcn"
+    assert (tmp_path / "experiment_summary.csv").exists()
+    assert (tmp_path / "all_history.csv").exists()
+    assert (tmp_path / "best_config.json").exists()
+    assert (tmp_path / "best_validation_confusion_matrix.csv").exists()

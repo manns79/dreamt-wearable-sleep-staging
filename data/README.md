@@ -23,6 +23,12 @@ data/
     features_test.csv
     preprocessing_metadata.json
     feature_preprocessing_metadata.json
+    stage15_embeddings/
+      manifest.json
+      train_embeddings.npy
+      train_epoch_index.csv
+      validation_embeddings.npy
+      validation_epoch_index.csv
 ```
 
 Use `data/raw/` for local copies of real DREAMT participant CSV files. Use
@@ -328,3 +334,16 @@ saves the reusable metadata to:
 
 Validation feature vectors reuse those training statistics. The held-out
 `features_test.csv` remains unused during Stage 14 model development.
+
+## Stage 15 Frozen Embeddings
+
+Stage 15 loads the selected Stage 14 checkpoint in evaluation mode and exports
+the concatenated raw-signal and engineered-feature embedding for each training
+and validation epoch. Arrays are stored as `float32` `.npy` files so the
+many-to-many temporal model can memory-map them without repeatedly loading raw
+signals or recomputing the Stage 14 encoder.
+
+The accompanying epoch-index CSVs preserve participant, epoch, split, and label
+identity. The manifest records checkpoint and source-artifact signatures; the
+cache is regenerated when those inputs change. Test embeddings are not created
+during validation-stage development.

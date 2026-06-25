@@ -4,7 +4,7 @@
 
 This repository contains an in-progress, reproducible Python workflow for wearable-based sleep stage classification using the DREAMT dataset. The current target is three-class sleep staging: `Wake`, `Non-REM`, and `REM`.
 
-It now includes reusable source modules, staged notebooks, automated tests, engineered feature baselines, PyTorch dataset utilities, 1D CNN training workflows, temporal-context CNN comparisons, CNN-GRU sequence-model utilities, and a multiscale raw/engineered-feature fusion CNN. Raw data, trained checkpoints, and final held-out test results are not committed.
+It now includes reusable source modules, staged notebooks, automated tests, engineered feature baselines, PyTorch dataset utilities, 1D CNN training workflows, temporal-context CNN comparisons, CNN-GRU sequence-model utilities, a multiscale raw/engineered-feature fusion CNN, and a frozen-embedding many-to-many temporal convolutional model. Raw data, trained checkpoints, and final held-out test results are not committed.
 
 ## Current Status
 
@@ -24,6 +24,7 @@ It now includes reusable source modules, staged notebooks, automated tests, engi
 | 12. Many-to-many CNN-GRU aggregation | Implemented as guarded validation runs | `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
 | 13. Validation error analysis | Implemented as guarded validation diagnostics | `src/error_analysis.py`, `notebooks/05_error_analysis.ipynb` |
 | 14. Multiscale residual feature-fusion CNN | Implemented as one guarded validation run | `src/data.py`, `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
+| 15. Frozen Stage 14 embedding TCN | Implemented as one guarded many-to-many validation run | `src/data.py`, `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
 
 The guarded training cells are disabled by default so routine notebook
 execution does not launch long experiments. When enabled locally, they write
@@ -365,6 +366,38 @@ When run locally, Stage 14 writes artifacts under:
 - `results/stage14_multiscale_fusion_cnn/runs/<experiment_id>/`
 - `results/stage14_multiscale_fusion_cnn_sqrt_weighted/`
 
+## Frozen-Embedding Many-To-Many TCN
+
+Stage 15 reuses the best square-root-weighted Stage 14 checkpoint as a frozen
+epoch encoder. It caches the 160-dimensional concatenated raw and engineered
+embedding for every training and validation epoch, then trains a compact
+non-causal temporal convolutional network over consecutive 31-epoch windows.
+The encoder is not updated during this first temporal experiment.
+
+The TCN uses four residual dilation levels `(1, 2, 4, 8)` and predicts one
+sleep-stage label at every sequence position. Overlapping windows use
+inverse-epoch-coverage loss weights, preventing central epochs from contributing
+more total training loss merely because they occur in more windows. Validation
+probabilities are aggregated back to one prediction per epoch. Center-weighted
+aggregation is the primary checkpoint metric, with uniform aggregation saved as
+a secondary diagnostic.
+
+The first run creates a reusable local embedding cache under:
+
+- `data/processed/stage15_embeddings/train_embeddings.npy`
+- `data/processed/stage15_embeddings/train_epoch_index.csv`
+- `data/processed/stage15_embeddings/validation_embeddings.npy`
+- `data/processed/stage15_embeddings/validation_epoch_index.csv`
+- `data/processed/stage15_embeddings/manifest.json`
+
+Stage 15 result artifacts are written under:
+
+- `results/stage15_temporal_fusion_tcn/experiment_summary.csv`
+- `results/stage15_temporal_fusion_tcn/all_history.csv`
+- `results/stage15_temporal_fusion_tcn/best_config.json`
+- `results/stage15_temporal_fusion_tcn/best_validation_confusion_matrix.csv`
+- `results/stage15_temporal_fusion_tcn/runs/<experiment_id>/`
+
 ## Validation Error Analysis
 
 Stage 13 is implemented in `notebooks/05_error_analysis.ipynb`, with reusable
@@ -410,6 +443,8 @@ Implemented methods include:
 - PyTorch tensor datasets for single-epoch CNNs, temporal-context CNNs, and
   CNN-GRU sequence models, plus aligned raw/engineered-feature fusion
 - PyTorch 1D CNN, CNN-GRU, and multiscale residual fusion models
+- Frozen-embedding many-to-many temporal convolution with overlap-aware loss
+  weighting and epoch-level probability aggregation
 - Validation monitoring with accuracy, balanced accuracy, macro F1,
   class-specific precision/recall/F1, and confusion matrices
 - Validation error analysis across model families, participants, transition
@@ -501,7 +536,9 @@ workflow is:
     error-analysis diagnostics from available validation prediction artifacts.
 12. In `notebooks/04_cnn_training.ipynb`, enable the guarded Stage 14 cell to
     run the fixed multiscale residual feature-fusion CNN on validation only.
-13. Save generated metrics, figures, summaries, and checkpoints under
+13. After the weighted Stage 14 checkpoint exists, enable the guarded Stage 15
+    cell to cache frozen embeddings and train the many-to-many TCN.
+14. Save generated metrics, figures, summaries, and checkpoints under
     stage-specific local `results/` folders.
 
 The dataset overview notebook writes these local intermediate summaries when raw
@@ -568,6 +605,7 @@ validation diagnostics and training artifacts such as:
 - `results/stage12_cnn_gru_many_to_many/experiment_summary.csv`
 - `results/stage13_error_analysis/model_validation_metrics.csv`
 - `results/stage14_multiscale_fusion_cnn/experiment_summary.csv`
+- `results/stage15_temporal_fusion_tcn/experiment_summary.csv`
 
 The feature-group correlation matrix reports mean absolute pairwise feature
 correlations. Same-group diagonal cells summarize redundancy among distinct

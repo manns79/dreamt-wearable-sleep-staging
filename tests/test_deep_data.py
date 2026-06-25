@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 from src.data import (
     DreamtContextDataset,
+    DreamtEmbeddingSequenceDataset,
     DreamtEpochDataset,
     DreamtFeatureFusionDataset,
     DreamtSequenceDataset,
@@ -358,6 +359,53 @@ def test_sequence_dataset_supports_many_to_one_and_many_to_many_labels():
     assert x_many.shape == (3, 1, 4)
     assert x_many.dtype == torch.float32
     assert y_many.tolist() == [0, 1, 2]
+    assert weights.tolist() == [1.0, 0.5, 0.5]
+
+
+def test_embedding_sequence_dataset_returns_many_to_many_windows_and_weights(
+    tmp_path,
+):
+    embeddings = np.arange(8 * 6, dtype=np.float32).reshape(8, 6)
+    embedding_path = tmp_path / "embeddings.npy"
+    index_path = tmp_path / "epoch_index.csv"
+    np.save(embedding_path, embeddings)
+    pd.DataFrame(
+        {
+            "participant_id": ["S001"] * 4 + ["S002"] * 4,
+            "epoch_id": [0, 1, 2, 3, 0, 1, 2, 3],
+            "split": ["train"] * 8,
+            "mapped_label": [
+                "Wake",
+                "Non-REM",
+                "REM",
+                "Wake",
+                "REM",
+                "Wake",
+                "Non-REM",
+                "REM",
+            ],
+        }
+    ).to_csv(index_path, index=False)
+
+    dataset = DreamtEmbeddingSequenceDataset(
+        embedding_path,
+        index_path,
+        sequence_length=3,
+        stride=1,
+    )
+    x, y, weights = dataset[0]
+
+    assert len(dataset) == 4
+    assert dataset.embedding_dim == 6
+    assert dataset.sequence_positions == [
+        [0, 1, 2],
+        [1, 2, 3],
+        [4, 5, 6],
+        [5, 6, 7],
+    ]
+    assert x.shape == (3, 6)
+    assert x.dtype == torch.float32
+    assert y.tolist() == [0, 1, 2]
     assert weights.tolist() == [1.0, 0.5, 0.5]
 
 

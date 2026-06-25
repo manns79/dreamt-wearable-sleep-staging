@@ -36,6 +36,8 @@ DEFAULT_VALIDATION_FEATURES_PATH = DEFAULT_PROCESSED_DATA_DIR / "features_val.cs
 DEFAULT_FEATURE_PREPROCESSING_METADATA_PATH = (
     DEFAULT_PROCESSED_DATA_DIR / "feature_preprocessing_metadata.json"
 )
+DEFAULT_STAGE15_EMBEDDING_DIR = DEFAULT_PROCESSED_DATA_DIR / "stage15_embeddings"
+STAGE15_EMBEDDING_MANIFEST = "manifest.json"
 DEFAULT_PARTICIPANT_ARRAY_CACHE_DIR = (
     DEFAULT_PROCESSED_DATA_DIR / "deep" / "participants"
 )
@@ -1425,6 +1427,165 @@ class DreamtSequenceDataset(DreamtEpochDataset):
             for position in positions
         ]
         return torch.as_tensor(x), y, torch.as_tensor(weights, dtype=torch.float32)
+
+
+class DreamtEmbeddingSequenceDataset:
+    """Many-to-many sequences over cached frozen epoch embeddings."""
+
+    def __init__(
+        self,
+        embedding_path: str | Path,
+        epoch_index_path: str | Path,
+        sequence_length: int = 31,
+        stride: int = 1,
+        label_mode: str = "many_to_many",
+        target_position: str = "center",
+        return_sample_weights: bool = True,
+        sample_weight_mode: str = "inverse_epoch_coverage",
+    ):
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive.")
+        if stride <= 0:
+            raise ValueError("stride must be positive.")
+        if label_mode not in {"many_to_one", "many_to_many"}:
+            raise ValueError("label_mode must be 'many_to_one' or 'many_to_many'.")
+        if target_position not in {"first", "center", "last"}:
+            raise ValueError("target_position must be 'first', 'center', or 'last'.")
+        if sample_weight_mode not in {"none", "inverse_epoch_coverage"}:
+            raise ValueError(
+                "sample_weight_mode must be 'none' or 'inverse_epoch_coverage'."
+            )
+        if return_sample_weights and label_mode != "many_to_many":
+            raise ValueError(
+                "return_sample_weights is only supported for many_to_many labels."
+            )
+
+        embedding_file = Path(embedding_path)
+        index_file = Path(epoch_index_path)
+        if not embedding_file.exists():
+            raise FileNotFoundError(
+                f"Embedding array does not exist: {embedding_file}"
+            )
+        if not index_file.exists():
+            raise FileNotFoundError(
+                f"Embedding epoch index does not exist: {index_file}"
+            )
+
+        self.embeddings = np.load(embedding_file, mmap_mode="r")
+        if self.embeddings.ndim != 2:
+            raise ValueError("Embedding array must have shape (epochs, features).")
+        self.epoch_index = pd.read_csv(
+            index_file,
+            dtype={"participant_id": str},
+        )
+        required_columns = {
+            "participant_id",
+            "epoch_id",
+            "split",
+            "mapped_label",
+        }
+        missing_columns = sorted(required_columns - set(self.epoch_index.columns))
+        if missing_columns:
+            raise ValueError(
+                f"Embedding epoch index is missing column(s): {missing_columns}"
+            )
+        if len(self.epoch_index) != len(self.embeddings):
+            raise ValueError(
+                "Embedding rows and epoch-index rows do not match: "
+                f"{len(self.embeddings)} != {len(self.epoch_index)}."
+            )
+        if self.epoch_index.duplicated(["participant_id", "epoch_id"]).any():
+            raise ValueError("Embedding epoch identities must be unique.")
+        invalid_labels = sorted(
+            set(self.epoch_index["mapped_label"]) - set(TARGET_LABELS)
+        )
+        if invalid_labels:
+            raise ValueError(
+                f"Embedding epoch index has invalid label(s): {invalid_labels}"
+            )
+
+        self.sequence_length = int(sequence_length)
+        self.stride = int(stride)
+        self.label_mode = label_mode
+        self.target_position = target_position
+        self.return_sample_weights = bool(return_sample_weights)
+        self.sample_weight_mode = sample_weight_mode
+        self.sequence_positions = self._build_sequence_positions()
+        self._sample_weights_by_position = self._build_sample_weights_by_position()
+
+    @property
+    def embedding_dim(self) -> int:
+        return int(self.embeddings.shape[1])
+
+    @property
+    def participants(self) -> set[str]:
+        return set(self.epoch_index["participant_id"].astype(str))
+
+    def _build_sequence_positions(self) -> list[list[int]]:
+        sequences: list[list[int]] = []
+        for _, group in self.epoch_index.groupby("participant_id", sort=False):
+            positions = group.index.to_numpy(dtype=int)
+            epoch_ids = group["epoch_id"].to_numpy(dtype=int)
+            for start in range(
+                0,
+                len(group) - self.sequence_length + 1,
+                self.stride,
+            ):
+                stop = start + self.sequence_length
+                window_epoch_ids = epoch_ids[start:stop]
+                expected_ids = np.arange(
+                    window_epoch_ids[0],
+                    window_epoch_ids[0] + self.sequence_length,
+                )
+                if np.array_equal(window_epoch_ids, expected_ids):
+                    sequences.append(positions[start:stop].tolist())
+        return sequences
+
+    def _target_index(self) -> int:
+        if self.target_position == "first":
+            return 0
+        if self.target_position == "center":
+            return self.sequence_length // 2
+        return self.sequence_length - 1
+
+    def _build_sample_weights_by_position(self) -> dict[int, float]:
+        if self.sample_weight_mode == "none":
+            return {}
+        counts: Counter[int] = Counter(
+            int(position)
+            for positions in self.sequence_positions
+            for position in positions
+        )
+        return {position: 1.0 / count for position, count in counts.items()}
+
+    def __len__(self) -> int:
+        return len(self.sequence_positions)
+
+    def __getitem__(self, index: int) -> tuple[Any, ...]:
+        import torch
+
+        positions = self.sequence_positions[index]
+        x = np.array(self.embeddings[positions], dtype=np.float32, copy=True)
+        labels = [
+            _label_to_id(self.epoch_index.iloc[position]["mapped_label"])
+            for position in positions
+        ]
+        if self.label_mode == "many_to_many":
+            y: Any = torch.as_tensor(labels, dtype=torch.long)
+        else:
+            y = torch.tensor(labels[self._target_index()], dtype=torch.long)
+        if not self.return_sample_weights:
+            return torch.as_tensor(x), y
+
+        weights = [
+            self._sample_weights_by_position[int(position)]
+            for position in positions
+        ]
+        return (
+            torch.as_tensor(x),
+            y,
+            torch.as_tensor(weights, dtype=torch.float32),
+        )
 
 
 def fit_normalization_stats(
