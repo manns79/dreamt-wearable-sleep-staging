@@ -398,6 +398,21 @@ Stage 15 result artifacts are written under:
 - `results/stage15_temporal_fusion_tcn/best_validation_confusion_matrix.csv`
 - `results/stage15_temporal_fusion_tcn/runs/<experiment_id>/`
 
+The Stage 15 replication workflow preserves the completed seed-42 run, trains
+the identical configuration with seeds 43 and 44, and creates an equal-weight
+probability ensemble across all three seeds. It reports every seed rather than
+selecting the best one, plus the across-seed mean and sample standard deviation.
+Replication and ensemble artifacts are written under:
+
+- `results/stage15_temporal_fusion_tcn_seed_replication/seed_43/`
+- `results/stage15_temporal_fusion_tcn_seed_replication/seed_44/`
+- `results/stage15_temporal_fusion_tcn_seed_replication/seed_member_metrics.csv`
+- `results/stage15_temporal_fusion_tcn_seed_replication/seed_metric_statistics.csv`
+- `results/stage15_temporal_fusion_tcn_seed_replication/ensemble_validation_metrics.csv`
+- `results/stage15_temporal_fusion_tcn_seed_replication/ensemble_validation_epoch_predictions.csv`
+- `results/stage15_temporal_fusion_tcn_seed_replication/ensemble_validation_confusion_matrix.csv`
+- `results/stage15_temporal_fusion_tcn_seed_replication/seed_ensemble_summary.csv`
+
 ## Validation Error Analysis
 
 Stage 13 is implemented in `notebooks/05_error_analysis.ipynb`, with reusable
@@ -538,7 +553,9 @@ workflow is:
     run the fixed multiscale residual feature-fusion CNN on validation only.
 13. After the weighted Stage 14 checkpoint exists, enable the guarded Stage 15
     cell to cache frozen embeddings and train the many-to-many TCN.
-14. Save generated metrics, figures, summaries, and checkpoints under
+14. Enable the guarded Stage 15 seed-replication cell to train seeds 43 and 44
+    and create the equal-weight seed ensemble without retraining seed 42.
+15. Save generated metrics, figures, summaries, and checkpoints under
     stage-specific local `results/` folders.
 
 The dataset overview notebook writes these local intermediate summaries when raw

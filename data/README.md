@@ -347,3 +347,7 @@ The accompanying epoch-index CSVs preserve participant, epoch, split, and label
 identity. The manifest records checkpoint and source-artifact signatures; the
 cache is regenerated when those inputs change. Test embeddings are not created
 during validation-stage development.
+
+Stage 15 seed replications reuse this same frozen embedding cache. Changing the
+TCN random seed does not recompute Stage 14 embeddings because the encoder and
+input artifacts remain unchanged.

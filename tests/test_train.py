@@ -22,10 +22,12 @@ from src.train import (  # noqa: E402
     build_stage12_many_to_many_configs,
     build_stage14_fusion_config,
     build_stage14_weighted_followup_config,
+    build_stage15_seed_replication_configs,
     build_stage15_temporal_tcn_config,
     build_train_validation_datasets,
     class_counts_from_loader,
     class_weights_from_counts,
+    ensemble_stage15_predictions,
     evaluate_model,
     export_stage15_frozen_embeddings,
     export_validation_predictions_from_checkpoint,
@@ -39,6 +41,7 @@ from src.train import (  # noqa: E402
     run_stage12_experiments,
     run_stage14_experiment,
     run_stage15_experiment,
+    run_stage15_seed_replications,
     run_tiny_overfit_test,
     save_checkpoint,
     stage9_experiment_id,
@@ -1551,3 +1554,218 @@ def test_run_stage15_experiment_writes_aggregation_summary(
     assert (tmp_path / "all_history.csv").exists()
     assert (tmp_path / "best_config.json").exists()
     assert (tmp_path / "best_validation_confusion_matrix.csv").exists()
+
+
+def test_stage15_seed_replication_configs_change_only_seed_and_output(tmp_path):
+    base = build_stage15_temporal_tcn_config(
+        tmp_path / "stage14_best.pt",
+        output_dir=tmp_path / "original",
+        embedding_dir=tmp_path / "embeddings",
+    )
+
+    configs = build_stage15_seed_replication_configs(
+        base,
+        output_dir=tmp_path / "replications",
+        seeds=(43, 44),
+    )
+
+    assert [config.random_seed for config in configs] == [43, 44]
+    assert all(config.output_dir == tmp_path / "replications" for config in configs)
+    assert all(config.sequence_length == base.sequence_length for config in configs)
+    assert all(config.tcn_dilations == base.tcn_dilations for config in configs)
+    assert all(
+        config.class_weight_power == base.class_weight_power
+        for config in configs
+    )
+    assert len({stage15_experiment_id(config) for config in configs}) == 2
+
+
+def test_ensemble_stage15_predictions_averages_equal_weight_probabilities(
+    tmp_path,
+):
+    labels = ["Wake", "Non-REM", "REM", "Wake", "Non-REM", "REM"]
+    identities = pd.DataFrame(
+        {
+            "participant_id": ["S001"] * 3 + ["S002"] * 3,
+            "epoch_id": [0, 1, 2, 0, 1, 2],
+            "epoch_index_position": list(range(6)),
+            "true_label": labels,
+        }
+    )
+    probability_sets = [
+        np.array(
+            [
+                [0.8, 0.1, 0.1],
+                [0.1, 0.8, 0.1],
+                [0.1, 0.2, 0.7],
+                [0.6, 0.3, 0.1],
+                [0.2, 0.7, 0.1],
+                [0.2, 0.3, 0.5],
+            ]
+        ),
+        np.array(
+            [
+                [0.7, 0.2, 0.1],
+                [0.2, 0.7, 0.1],
+                [0.2, 0.2, 0.6],
+                [0.4, 0.5, 0.1],
+                [0.2, 0.6, 0.2],
+                [0.1, 0.2, 0.7],
+            ]
+        ),
+        np.array(
+            [
+                [0.6, 0.3, 0.1],
+                [0.1, 0.6, 0.3],
+                [0.2, 0.3, 0.5],
+                [0.7, 0.2, 0.1],
+                [0.1, 0.8, 0.1],
+                [0.2, 0.2, 0.6],
+            ]
+        ),
+    ]
+    run_dirs = []
+    for seed, probabilities in zip((42, 43, 44), probability_sets, strict=True):
+        run_dir = tmp_path / f"seed_{seed}"
+        checkpoint_path = run_dir / "checkpoints" / "best.pt"
+        config = TrainConfig(
+            output_dir=run_dir,
+            model_name="stage15_test",
+            model_type="temporal_fusion_tcn",
+            random_seed=seed,
+            stage15_encoder_checkpoint_path=tmp_path / "stage14_best.pt",
+            stage15_embedding_dim=8,
+            tcn_hidden_channels=6,
+            tcn_dilations=(1, 2),
+            sequence_length=3,
+            sequence_label_mode="many_to_many",
+            sequence_loss_weighting="inverse_epoch_coverage",
+            sequence_aggregation="center_weighted",
+        )
+        model = _new_model_for_config(config)
+        save_checkpoint(
+            checkpoint_path,
+            model,
+            config=config,
+            epoch=seed - 40,
+        )
+        predictions = identities.copy()
+        predictions["pred_label"] = [
+            ["Wake", "Non-REM", "REM"][index]
+            for index in probabilities.argmax(axis=1)
+        ]
+        for index, column in enumerate(
+            ["prob_Wake", "prob_Non_REM", "prob_REM"]
+        ):
+            predictions[column] = probabilities[:, index]
+        predictions.to_csv(
+            run_dir
+            / "validation_aggregated_epoch_predictions_center_weighted.csv",
+            index=False,
+        )
+        run_dirs.append(run_dir)
+
+    result = ensemble_stage15_predictions(
+        run_dirs,
+        output_dir=tmp_path / "ensemble",
+    )
+    expected_probabilities = np.mean(np.stack(probability_sets), axis=0)
+
+    assert result["metrics"]["member_seeds"] == [42, 43, 44]
+    assert result["metrics"]["n_ensemble_members"] == 3
+    assert result["predictions"]["prob_Wake"].to_numpy() == pytest.approx(
+        expected_probabilities[:, 0]
+    )
+    assert result["metrics"]["macro_f1"] == pytest.approx(1.0)
+    assert (tmp_path / "ensemble" / "seed_member_metrics.csv").exists()
+    assert (tmp_path / "ensemble" / "seed_metric_statistics.csv").exists()
+    assert (
+        tmp_path / "ensemble" / "ensemble_validation_confusion_matrix.png"
+    ).exists()
+
+
+def test_run_stage15_seed_replications_preserves_reference_and_trains_replicas(
+    tmp_path,
+    monkeypatch,
+):
+    reference_config = build_stage15_temporal_tcn_config(
+        tmp_path / "stage14_best.pt",
+        output_dir=tmp_path / "original",
+        embedding_dir=tmp_path / "embeddings",
+    )
+    configs = build_stage15_seed_replication_configs(
+        reference_config,
+        output_dir=tmp_path / "replications",
+    )
+    trained_seeds = []
+
+    monkeypatch.setattr(
+        "src.train._load_stage15_ensemble_member",
+        lambda run_dir, aggregation: (
+            reference_config,
+            pd.DataFrame(),
+            {"seed": 42},
+        ),
+    )
+
+    def fake_run_stage15_experiment(config, output_dir):
+        trained_seeds.append(config.random_seed)
+        run_dir = Path(output_dir) / "runs" / stage15_experiment_id(config)
+        return pd.DataFrame(
+            [
+                {
+                    "experiment_id": stage15_experiment_id(config),
+                    "aggregation_method": "center_weighted",
+                    "output_dir": str(run_dir),
+                    "macro_f1": 0.48,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        "src.train.run_stage15_experiment",
+        fake_run_stage15_experiment,
+    )
+
+    def fake_ensemble(run_dirs, output_dir, aggregation_method):
+        assert Path(run_dirs[0]) == tmp_path / "seed_42_reference"
+        assert len(run_dirs) == 3
+        assert aggregation_method == "center_weighted"
+        member_metrics = pd.DataFrame(
+            {
+                "seed": [42, 43, 44],
+                "macro_f1": [0.484, 0.481, 0.486],
+                "best_epoch": [12, 10, 11],
+                "output_dir": [str(path) for path in run_dirs],
+            }
+        )
+        return {
+            "metrics": {
+                "model": "stage15_equal_weight_seed_ensemble",
+                "split": "validation",
+                "macro_f1": 0.492,
+                "member_seeds": [42, 43, 44],
+            },
+            "member_metrics": member_metrics,
+        }
+
+    monkeypatch.setattr(
+        "src.train.ensemble_stage15_predictions",
+        fake_ensemble,
+    )
+
+    summary = run_stage15_seed_replications(
+        configs,
+        reference_run_dir=tmp_path / "seed_42_reference",
+        output_dir=tmp_path / "replications",
+    )
+
+    assert trained_seeds == [43, 44]
+    assert summary["summary_type"].tolist() == [
+        "individual_seed",
+        "individual_seed",
+        "individual_seed",
+        "equal_weight_ensemble",
+    ]
+    assert summary.iloc[-1]["macro_f1"] == pytest.approx(0.492)
+    assert (tmp_path / "replications" / "seed_ensemble_summary.csv").exists()

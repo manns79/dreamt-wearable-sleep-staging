@@ -54,6 +54,9 @@ DEFAULT_STAGE14_WEIGHTED_OUTPUT_DIR = Path(
     "results/stage14_multiscale_fusion_cnn_sqrt_weighted"
 )
 DEFAULT_STAGE15_OUTPUT_DIR = Path("results/stage15_temporal_fusion_tcn")
+DEFAULT_STAGE15_REPLICATION_OUTPUT_DIR = Path(
+    "results/stage15_temporal_fusion_tcn_seed_replication"
+)
 
 
 @dataclass(frozen=True)
@@ -3706,6 +3709,331 @@ def run_stage15_experiment(
         best_confusion.to_csv(stage_dir / "best_validation_confusion_matrix.csv")
 
     return summary
+
+
+def build_stage15_seed_replication_configs(
+    base_config: TrainConfig,
+    output_dir: str | Path = DEFAULT_STAGE15_REPLICATION_OUTPUT_DIR,
+    seeds: Sequence[int] = (43, 44),
+) -> list[TrainConfig]:
+    """Create fixed Stage 15 replication configs that differ only by seed."""
+
+    if not _uses_temporal_fusion_tcn(base_config):
+        raise ValueError("Stage 15 seed replication requires a temporal TCN config.")
+    normalized_seeds = [int(seed) for seed in seeds]
+    if not normalized_seeds:
+        raise ValueError("At least one replication seed is required.")
+    if len(set(normalized_seeds)) != len(normalized_seeds):
+        raise ValueError("Replication seeds must be unique.")
+    return [
+        replace(
+            base_config,
+            output_dir=output_dir,
+            random_seed=seed,
+        )
+        for seed in normalized_seeds
+    ]
+
+
+def _stage15_replication_config_signature(config: TrainConfig) -> dict[str, Any]:
+    """Return fields that must match across seed-replication members."""
+
+    payload = config_to_dict(config)
+    payload.pop("output_dir", None)
+    payload.pop("random_seed", None)
+    return payload
+
+
+def _stage15_primary_prediction_path(
+    run_dir: str | Path,
+    aggregation_method: str,
+) -> Path:
+    return (
+        Path(run_dir)
+        / f"validation_aggregated_epoch_predictions_{aggregation_method}.csv"
+    )
+
+
+def _load_stage15_ensemble_member(
+    run_dir: str | Path,
+    expected_aggregation: str,
+) -> tuple[TrainConfig, pd.DataFrame, dict[str, Any]]:
+    """Load one completed Stage 15 member with strict artifact checks."""
+
+    run_path = Path(run_dir)
+    config = load_train_config(
+        config_path=run_path / "config.json",
+        checkpoint_path=run_path / "checkpoints" / "best.pt",
+    )
+    if not _uses_temporal_fusion_tcn(config):
+        raise ValueError(f"Ensemble member is not a Stage 15 TCN: {run_path}")
+    prediction_path = _stage15_primary_prediction_path(
+        run_path,
+        expected_aggregation,
+    )
+    if not prediction_path.exists():
+        raise FileNotFoundError(
+            f"Stage 15 ensemble prediction file does not exist: {prediction_path}"
+        )
+    predictions = pd.read_csv(
+        prediction_path,
+        dtype={"participant_id": str},
+    )
+    required_columns = {
+        "participant_id",
+        "epoch_id",
+        "true_label",
+        "pred_label",
+        *[_probability_column(label) for label in TARGET_LABELS],
+    }
+    missing_columns = sorted(required_columns - set(predictions.columns))
+    if missing_columns:
+        raise ValueError(
+            f"Stage 15 ensemble predictions are missing column(s): {missing_columns}"
+        )
+    if predictions.duplicated(["participant_id", "epoch_id"]).any():
+        raise ValueError("Stage 15 ensemble prediction identities must be unique.")
+
+    checkpoint = load_checkpoint(run_path / "checkpoints" / "best.pt")
+    metrics, _ = evaluate_predictions(
+        predictions["true_label"],
+        predictions["pred_label"],
+        model_name=config.model_name,
+        split="validation",
+        labels=TARGET_LABELS,
+    )
+    metrics.update(
+        {
+            "seed": int(config.random_seed),
+            "best_epoch": checkpoint.get("epoch"),
+            "output_dir": str(run_path),
+            "aggregation_method": expected_aggregation,
+        }
+    )
+    return config, predictions, metrics
+
+
+def ensemble_stage15_predictions(
+    run_dirs: Sequence[str | Path],
+    *,
+    output_dir: str | Path,
+    aggregation_method: str = "center_weighted",
+) -> dict[str, Any]:
+    """Create an equal-weight ensemble from completed Stage 15 seed runs."""
+
+    if len(run_dirs) < 2:
+        raise ValueError("At least two Stage 15 run directories are required.")
+
+    members = [
+        _load_stage15_ensemble_member(run_dir, aggregation_method)
+        for run_dir in run_dirs
+    ]
+    reference_signature = _stage15_replication_config_signature(members[0][0])
+    for config, _, _ in members[1:]:
+        if _stage15_replication_config_signature(config) != reference_signature:
+            raise ValueError(
+                "Stage 15 ensemble members differ in fields other than random_seed."
+            )
+
+    identity_columns = ["participant_id", "epoch_id", "true_label"]
+    probability_columns = [
+        _probability_column(label) for label in TARGET_LABELS
+    ]
+    reference = members[0][1][identity_columns].copy()
+    if "epoch_index_position" in members[0][1].columns:
+        reference["epoch_index_position"] = members[0][1][
+            "epoch_index_position"
+        ]
+
+    probability_arrays: list[np.ndarray] = []
+    member_seeds: list[int] = []
+    member_metrics: list[dict[str, Any]] = []
+    reference_keys = pd.MultiIndex.from_frame(reference[identity_columns])
+    for config, predictions, metrics in members:
+        member_keys = pd.MultiIndex.from_frame(predictions[identity_columns])
+        if not member_keys.equals(reference_keys):
+            raise ValueError(
+                "Stage 15 ensemble members do not contain identical ordered epochs."
+            )
+        probability_arrays.append(
+            predictions[probability_columns].to_numpy(dtype=np.float64)
+        )
+        member_seeds.append(int(config.random_seed))
+        member_metrics.append(metrics)
+
+    averaged_probabilities = np.mean(np.stack(probability_arrays, axis=0), axis=0)
+    pred_ids = averaged_probabilities.argmax(axis=1)
+    ensemble = reference.copy()
+    ensemble["pred_label"] = [
+        ID_TO_LABEL[int(label_id)] for label_id in pred_ids
+    ]
+    for class_index, column in enumerate(probability_columns):
+        ensemble[column] = averaged_probabilities[:, class_index]
+    ensemble["n_ensemble_members"] = len(members)
+
+    metrics, confusion = evaluate_predictions(
+        ensemble["true_label"],
+        ensemble["pred_label"],
+        model_name="stage15_equal_weight_seed_ensemble",
+        split="validation",
+        labels=TARGET_LABELS,
+    )
+    metrics.update(
+        {
+            "aggregation_method": aggregation_method,
+            "ensemble_method": "equal_probability_average",
+            "member_seeds": member_seeds,
+            "n_ensemble_members": len(members),
+        }
+    )
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    ensemble.to_csv(
+        output_path / "ensemble_validation_epoch_predictions.csv",
+        index=False,
+    )
+    pd.DataFrame([metrics]).to_csv(
+        output_path / "ensemble_validation_metrics.csv",
+        index=False,
+    )
+    confusion.to_csv(output_path / "ensemble_validation_confusion_matrix.csv")
+    plot_confusion_matrix(
+        confusion,
+        output_path / "ensemble_validation_confusion_matrix.png",
+    )
+    pd.DataFrame(member_metrics).sort_values("seed").to_csv(
+        output_path / "seed_member_metrics.csv",
+        index=False,
+    )
+
+    numeric_metric_columns = [
+        column
+        for column in member_metrics[0]
+        if column
+        not in {
+            "model",
+            "split",
+            "seed",
+            "best_epoch",
+            "output_dir",
+            "aggregation_method",
+        }
+        and all(
+            isinstance(row.get(column), int | float | np.number)
+            for row in member_metrics
+        )
+    ]
+    metric_frame = pd.DataFrame(member_metrics)
+    seed_statistics = pd.DataFrame(
+        [
+            {
+                "statistic": "mean",
+                **{
+                    column: float(metric_frame[column].mean())
+                    for column in numeric_metric_columns
+                },
+            },
+            {
+                "statistic": "std",
+                **{
+                    column: float(metric_frame[column].std(ddof=1))
+                    for column in numeric_metric_columns
+                },
+            },
+        ]
+    )
+    seed_statistics.to_csv(
+        output_path / "seed_metric_statistics.csv",
+        index=False,
+    )
+    return {
+        "metrics": metrics,
+        "confusion_matrix": confusion,
+        "predictions": ensemble,
+        "member_metrics": pd.DataFrame(member_metrics).sort_values("seed"),
+        "seed_statistics": seed_statistics,
+    }
+
+
+def run_stage15_seed_replications(
+    configs: Sequence[TrainConfig],
+    *,
+    reference_run_dir: str | Path,
+    output_dir: str | Path = DEFAULT_STAGE15_REPLICATION_OUTPUT_DIR,
+) -> pd.DataFrame:
+    """Train fixed Stage 15 seed replicas and ensemble them with seed 42."""
+
+    if not configs:
+        raise ValueError("At least one Stage 15 replication config is required.")
+    seeds = [int(config.random_seed) for config in configs]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("Stage 15 replication seeds must be unique.")
+
+    stage_dir = Path(output_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    reference_config, _, _ = _load_stage15_ensemble_member(
+        reference_run_dir,
+        "center_weighted",
+    )
+    reference_signature = _stage15_replication_config_signature(reference_config)
+
+    run_dirs = [Path(reference_run_dir)]
+    for config in configs:
+        _validate_training_config(config)
+        if _stage15_replication_config_signature(config) != reference_signature:
+            raise ValueError(
+                "Replication configs must match the reference except for seed."
+            )
+
+        seed_dir = stage_dir / f"seed_{config.random_seed}"
+        expected_id = stage15_experiment_id(config)
+        summary_path = seed_dir / "experiment_summary.csv"
+        completed_run_dir: Path | None = None
+        if summary_path.exists():
+            completed = pd.read_csv(summary_path)
+            matching = completed[
+                (completed["experiment_id"] == expected_id)
+                & (completed["aggregation_method"] == config.sequence_aggregation)
+            ]
+            if not matching.empty:
+                candidate = Path(str(matching.iloc[0]["output_dir"]))
+                prediction_path = _stage15_primary_prediction_path(
+                    candidate,
+                    config.sequence_aggregation,
+                )
+                if prediction_path.exists():
+                    completed_run_dir = candidate
+
+        if completed_run_dir is None:
+            summary = run_stage15_experiment(config, output_dir=seed_dir)
+            primary = summary[
+                summary["aggregation_method"] == config.sequence_aggregation
+            ].iloc[0]
+            completed_run_dir = Path(str(primary["output_dir"]))
+        run_dirs.append(completed_run_dir)
+
+    ensemble_result = ensemble_stage15_predictions(
+        run_dirs,
+        output_dir=stage_dir,
+        aggregation_method=reference_config.sequence_aggregation,
+    )
+    member_summary = ensemble_result["member_metrics"].copy()
+    member_summary.insert(0, "summary_type", "individual_seed")
+    ensemble_row = {
+        "summary_type": "equal_weight_ensemble",
+        "seed": None,
+        "best_epoch": None,
+        "output_dir": str(stage_dir),
+        **ensemble_result["metrics"],
+    }
+    combined = pd.concat(
+        [member_summary, pd.DataFrame([ensemble_row])],
+        ignore_index=True,
+        sort=False,
+    )
+    combined.to_csv(stage_dir / "seed_ensemble_summary.csv", index=False)
+    return combined
 
 
 def run_tiny_overfit_test(
