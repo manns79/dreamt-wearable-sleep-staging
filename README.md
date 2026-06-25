@@ -350,6 +350,12 @@ unweighted cross-entropy with `label_smoothing=0.05`, AdamW at `3e-4`, gradient
 clipping at `1.0`, up to 25 epochs, patience 5, and validation macro F1 for
 checkpoint selection. Its notebook launch flag is disabled by default.
 
+After the unweighted run, the notebook also provides one controlled follow-up
+that changes only the loss to square-root inverse-frequency weighting
+(`class_weighting=True`, `class_weight_power=0.5`). It keeps the architecture,
+label smoothing, optimizer settings, seed, and stopping rules fixed, and writes
+to a separate results directory.
+
 When run locally, Stage 14 writes artifacts under:
 
 - `results/stage14_multiscale_fusion_cnn/experiment_summary.csv`
@@ -357,6 +363,7 @@ When run locally, Stage 14 writes artifacts under:
 - `results/stage14_multiscale_fusion_cnn/best_config.json`
 - `results/stage14_multiscale_fusion_cnn/best_validation_confusion_matrix.csv`
 - `results/stage14_multiscale_fusion_cnn/runs/<experiment_id>/`
+- `results/stage14_multiscale_fusion_cnn_sqrt_weighted/`
 
 ## Validation Error Analysis
 

@@ -47,6 +47,9 @@ DEFAULT_STAGE11_OUTPUT_DIR = Path("results/stage11_cnn_gru")
 DEFAULT_STAGE11_LOSS_OUTPUT_DIR = Path("results/stage11_cnn_gru_loss_comparison")
 DEFAULT_STAGE12_OUTPUT_DIR = Path("results/stage12_cnn_gru_many_to_many")
 DEFAULT_STAGE14_OUTPUT_DIR = Path("results/stage14_multiscale_fusion_cnn")
+DEFAULT_STAGE14_WEIGHTED_OUTPUT_DIR = Path(
+    "results/stage14_multiscale_fusion_cnn_sqrt_weighted"
+)
 
 
 @dataclass(frozen=True)
@@ -3051,6 +3054,8 @@ def stage14_experiment_id(config: TrainConfig) -> str:
         "learning_rate",
         "weight_decay",
         "dropout",
+        "class_weighting",
+        "class_weight_power",
         "label_smoothing",
         "multiscale_kernel_sizes",
         "multiscale_branch_channels",
@@ -3146,6 +3151,25 @@ def build_stage14_fusion_config(
     )
 
 
+def build_stage14_weighted_followup_config(
+    base_config: TrainConfig | None = None,
+    output_dir: str | Path = DEFAULT_STAGE14_WEIGHTED_OUTPUT_DIR,
+) -> TrainConfig:
+    """Create the controlled square-root-weighted Stage 14 follow-up."""
+
+    unweighted = build_stage14_fusion_config(
+        base_config=base_config,
+        output_dir=output_dir,
+    )
+    return replace(
+        unweighted,
+        output_dir=output_dir,
+        model_name="multiscale_residual_fusion_cnn_stage14_sqrt_weighted",
+        class_weighting=True,
+        class_weight_power=0.5,
+    )
+
+
 def run_stage14_experiment(
     config: TrainConfig,
     output_dir: str | Path = DEFAULT_STAGE14_OUTPUT_DIR,
@@ -3155,8 +3179,6 @@ def run_stage14_experiment(
     _validate_training_config(config)
     if not _uses_fusion_model(config):
         raise ValueError("Stage 14 requires model_type='multiscale_fusion'.")
-    if config.class_weighting:
-        raise ValueError("Stage 14 uses unweighted cross-entropy.")
 
     stage_dir = Path(output_dir)
     runs_dir = stage_dir / "runs"

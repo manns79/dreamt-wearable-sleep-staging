@@ -20,6 +20,7 @@ from src.train import (  # noqa: E402
     build_stage11_sequence_configs,
     build_stage12_many_to_many_configs,
     build_stage14_fusion_config,
+    build_stage14_weighted_followup_config,
     build_train_validation_datasets,
     class_counts_from_loader,
     class_weights_from_counts,
@@ -1289,7 +1290,27 @@ def test_stage14_config_is_fixed_unweighted_fusion(tmp_path):
     assert stage14_experiment_id(config).startswith("stage14_multiscale_fusion_")
 
 
-def test_run_stage14_experiment_writes_summary(tmp_path, monkeypatch):
+def test_stage14_weighted_followup_changes_only_loss_weighting_and_identity(
+    tmp_path,
+):
+    unweighted = build_stage14_fusion_config(output_dir=tmp_path / "unweighted")
+    weighted = build_stage14_weighted_followup_config(
+        output_dir=tmp_path / "weighted"
+    )
+
+    assert weighted.model_type == unweighted.model_type
+    assert weighted.multiscale_kernel_sizes == unweighted.multiscale_kernel_sizes
+    assert weighted.multiscale_temporal_bins == unweighted.multiscale_temporal_bins
+    assert weighted.label_smoothing == unweighted.label_smoothing
+    assert weighted.learning_rate == unweighted.learning_rate
+    assert weighted.epochs == unweighted.epochs
+    assert weighted.class_weighting is True
+    assert weighted.class_weight_power == pytest.approx(0.5)
+    assert weighted.model_name.endswith("_sqrt_weighted")
+    assert stage14_experiment_id(weighted) != stage14_experiment_id(unweighted)
+
+
+def test_run_stage14_weighted_experiment_writes_summary(tmp_path, monkeypatch):
     dataset = SyntheticFusionDataset(n_examples=6)
     loader = _loader(dataset, batch_size=3)
 
@@ -1331,7 +1352,7 @@ def test_run_stage14_experiment_writes_summary(tmp_path, monkeypatch):
         "src.train._prefit_preprocessing_metadata",
         lambda configs: None,
     )
-    config = build_stage14_fusion_config(
+    config = build_stage14_weighted_followup_config(
         base_config=TrainConfig(epochs=3, patience=2),
         output_dir=tmp_path,
     )
@@ -1339,6 +1360,8 @@ def test_run_stage14_experiment_writes_summary(tmp_path, monkeypatch):
     summary = run_stage14_experiment(config, output_dir=tmp_path)
 
     assert summary.loc[0, "model_family"] == "multiscale_residual_fusion"
+    assert bool(summary.loc[0, "class_weighting"]) is True
+    assert summary.loc[0, "class_weight_power"] == pytest.approx(0.5)
     assert summary.loc[0, "macro_f1"] == pytest.approx(0.7)
     assert (Path(tmp_path) / "experiment_summary.csv").exists()
     assert (Path(tmp_path) / "all_history.csv").exists()
