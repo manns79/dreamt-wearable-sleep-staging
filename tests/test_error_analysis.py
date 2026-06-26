@@ -274,3 +274,38 @@ def test_materialize_deep_predictions_uses_checkpoints_without_training(
 
     assert calls
     assert "exported" in set(summary["status"])
+
+
+def test_materialize_deep_predictions_includes_stage16_and_records_errors(
+    tmp_path,
+    monkeypatch,
+):
+    stage_dir = tmp_path / "stage16_temporal_fusion_tcn_s61"
+    run_dir = stage_dir / "runs" / "best"
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "best.pt").write_text("checkpoint", encoding="utf-8")
+    pd.DataFrame(
+        {
+            "output_dir": [str(run_dir)],
+            "aggregation_method": ["center_weighted"],
+            "macro_f1": [0.5],
+        }
+    ).to_csv(stage_dir / "experiment_summary.csv", index=False)
+
+    def fake_export(run_dir_arg, **kwargs):
+        raise RuntimeError(f"cannot export {run_dir_arg}")
+
+    monkeypatch.setattr(
+        "src.train.export_validation_predictions_from_checkpoint",
+        fake_export,
+    )
+
+    summary = materialize_deep_validation_predictions_from_checkpoints(
+        results_dir=tmp_path,
+    )
+
+    row = summary[summary["model_name"] == "stage16_temporal_fusion_tcn_s61"].iloc[0]
+    assert row["run_dir"] == str(run_dir)
+    assert row["status"] == "error"
+    assert row["error_type"] == "RuntimeError"

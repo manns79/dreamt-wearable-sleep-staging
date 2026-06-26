@@ -1378,6 +1378,36 @@ def materialize_deep_validation_predictions_from_checkpoints(
     ):
         candidate_dirs.append(("stage12_best_cnn_gru_many_to_many", directory))
 
+    stage14_candidates = [
+        (
+            "stage14_multiscale_fusion_cnn",
+            root / "stage14_multiscale_fusion_cnn" / "experiment_summary.csv",
+        ),
+        (
+            "stage14_multiscale_fusion_cnn_sqrt_weighted",
+            root
+            / "stage14_multiscale_fusion_cnn_sqrt_weighted"
+            / "experiment_summary.csv",
+        ),
+    ]
+    for model_name, summary_path in stage14_candidates:
+        for directory in _best_output_dirs_by_group(summary_path):
+            candidate_dirs.append((model_name, directory))
+
+    stage15_stage16_candidates = [
+        (
+            "stage15_temporal_fusion_tcn",
+            root / "stage15_temporal_fusion_tcn" / "experiment_summary.csv",
+        ),
+        (
+            "stage16_temporal_fusion_tcn_s61",
+            root / "stage16_temporal_fusion_tcn_s61" / "experiment_summary.csv",
+        ),
+    ]
+    for model_name, summary_path in stage15_stage16_candidates:
+        for directory in _best_output_dirs_by_group(summary_path):
+            candidate_dirs.append((model_name, directory))
+
     rows: list[dict[str, Any]] = []
     seen_dirs: set[Path] = set()
     for model_name, run_dir in candidate_dirs:
@@ -1415,12 +1445,24 @@ def materialize_deep_validation_predictions_from_checkpoints(
             )
             continue
 
-        written = export_validation_predictions_from_checkpoint(
-            run_dir,
-            config_path=config_path if config_path.exists() else None,
-            checkpoint_path=checkpoint_path,
-            overwrite=overwrite,
-        )
+        try:
+            written = export_validation_predictions_from_checkpoint(
+                run_dir,
+                config_path=config_path if config_path.exists() else None,
+                checkpoint_path=checkpoint_path,
+                overwrite=overwrite,
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "model_name": model_name,
+                    "run_dir": str(run_dir),
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            continue
         rows.append(
             {
                 "model_name": model_name,
