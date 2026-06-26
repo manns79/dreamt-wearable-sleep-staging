@@ -24,10 +24,13 @@ from src.train import (  # noqa: E402
     build_stage14_weighted_followup_config,
     build_stage15_seed_replication_configs,
     build_stage15_temporal_tcn_config,
+    build_stage16_seed_replication_configs,
+    build_stage16_temporal_tcn_config,
     build_train_validation_datasets,
     class_counts_from_loader,
     class_weights_from_counts,
     ensemble_stage15_predictions,
+    ensemble_stage16_predictions,
     evaluate_model,
     export_stage15_frozen_embeddings,
     export_validation_predictions_from_checkpoint,
@@ -42,6 +45,8 @@ from src.train import (  # noqa: E402
     run_stage14_experiment,
     run_stage15_experiment,
     run_stage15_seed_replications,
+    run_stage16_experiment,
+    run_stage16_seed_replications,
     run_tiny_overfit_test,
     save_checkpoint,
     stage9_experiment_id,
@@ -50,6 +55,7 @@ from src.train import (  # noqa: E402
     stage12_experiment_id,
     stage14_experiment_id,
     stage15_experiment_id,
+    stage16_experiment_id,
     train_model,
     train_one_epoch,
 )
@@ -1769,3 +1775,213 @@ def test_run_stage15_seed_replications_preserves_reference_and_trains_replicas(
     ]
     assert summary.iloc[-1]["macro_f1"] == pytest.approx(0.492)
     assert (tmp_path / "replications" / "seed_ensemble_summary.csv").exists()
+
+
+def test_stage16_config_changes_only_temporal_window_identity_and_output(tmp_path):
+    checkpoint_path = tmp_path / "stage14_best.pt"
+    stage15 = build_stage15_temporal_tcn_config(
+        checkpoint_path,
+        output_dir=tmp_path / "stage15",
+        embedding_dir=tmp_path / "embeddings",
+    )
+    stage16 = build_stage16_temporal_tcn_config(
+        checkpoint_path,
+        output_dir=tmp_path / "stage16",
+        embedding_dir=tmp_path / "embeddings",
+    )
+
+    stage15_payload = stage15.__dict__.copy()
+    stage16_payload = stage16.__dict__.copy()
+    for key in ("model_name", "output_dir", "sequence_length"):
+        stage15_payload.pop(key)
+        stage16_payload.pop(key)
+
+    assert stage16_payload == stage15_payload
+    assert stage16.model_name == "stage16_frozen_stage14_embedding_tcn_s61"
+    assert stage16.output_dir == tmp_path / "stage16"
+    assert stage16.sequence_length == 61
+    assert stage16.epochs == 30
+    assert stage16.random_seed == 42
+    assert stage16_experiment_id(stage16).startswith("stage16_frozen_tcn_s61_")
+
+
+def test_run_stage16_experiment_writes_separate_s61_summary(
+    tmp_path,
+    monkeypatch,
+):
+    dataset = SyntheticManyToManySequenceDataset(return_sample_weights=True)
+    loader = _loader(dataset, batch_size=2)
+
+    monkeypatch.setattr(
+        "src.train.build_train_validation_dataloaders",
+        lambda config: {"train": loader, "validation": loader},
+    )
+    monkeypatch.setattr(
+        "src.train._prefit_preprocessing_metadata",
+        lambda configs: None,
+    )
+
+    def fake_train_model(train_loader, val_loader, config):
+        output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        confusion = pd.DataFrame(
+            [[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            index=["true_Wake", "true_Non-REM", "true_REM"],
+            columns=["pred_Wake", "pred_Non-REM", "pred_REM"],
+        )
+        confusion.to_csv(output_dir / "validation_confusion_matrix.csv")
+        confusion.to_csv(
+            output_dir / "validation_confusion_matrix_uniform.csv"
+        )
+        history = pd.DataFrame(
+            {
+                "epoch": [1],
+                "train_objective_loss": [1.0],
+                "validation_loss": [0.5],
+                "macro_f1": [0.52],
+                "balanced_accuracy": [0.51],
+                "aggregation_method": ["center_weighted"],
+                "uniform_macro_f1": [0.50],
+                "uniform_balanced_accuracy": [0.49],
+            }
+        )
+        return TrainingResult(
+            history=history,
+            best_metrics=history.iloc[0].to_dict(),
+            best_epoch=1,
+            best_checkpoint_path=output_dir / "checkpoints" / "best.pt",
+            last_checkpoint_path=output_dir / "checkpoints" / "last.pt",
+            output_dir=output_dir,
+        )
+
+    monkeypatch.setattr("src.train.train_model", fake_train_model)
+    config = build_stage16_temporal_tcn_config(
+        tmp_path / "stage14_best.pt",
+        output_dir=tmp_path,
+        embedding_dir=tmp_path / "embeddings",
+    )
+
+    summary = run_stage16_experiment(config, output_dir=tmp_path)
+
+    assert set(summary["aggregation_method"]) == {
+        "center_weighted",
+        "uniform",
+    }
+    assert summary.loc[0, "model_family"] == "frozen_stage14_embedding_tcn_s61"
+    assert summary.loc[0, "sequence_length"] == 61
+    assert (tmp_path / "experiment_summary.csv").exists()
+    assert (tmp_path / "all_history.csv").exists()
+    assert (tmp_path / "best_config.json").exists()
+
+
+def test_stage16_seed_workflow_uses_42_reference_then_trains_43_and_44(
+    tmp_path,
+    monkeypatch,
+):
+    reference_config = build_stage16_temporal_tcn_config(
+        tmp_path / "stage14_best.pt",
+        output_dir=tmp_path / "original",
+        embedding_dir=tmp_path / "embeddings",
+    )
+    configs = build_stage16_seed_replication_configs(
+        reference_config,
+        output_dir=tmp_path / "replications",
+    )
+    trained_seeds = []
+
+    assert [config.random_seed for config in configs] == [43, 44]
+    assert all(config.sequence_length == 61 for config in configs)
+
+    monkeypatch.setattr(
+        "src.train._load_stage15_ensemble_member",
+        lambda run_dir, aggregation: (
+            reference_config,
+            pd.DataFrame(),
+            {"seed": 42},
+        ),
+    )
+
+    def fake_run_stage16_experiment(config, output_dir):
+        trained_seeds.append(config.random_seed)
+        run_dir = Path(output_dir) / "runs" / stage16_experiment_id(config)
+        return pd.DataFrame(
+            [
+                {
+                    "experiment_id": stage16_experiment_id(config),
+                    "aggregation_method": "center_weighted",
+                    "output_dir": str(run_dir),
+                    "macro_f1": 0.49,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        "src.train.run_stage16_experiment",
+        fake_run_stage16_experiment,
+    )
+
+    def fake_ensemble(run_dirs, output_dir, aggregation_method):
+        assert Path(run_dirs[0]) == tmp_path / "seed_42_reference"
+        assert len(run_dirs) == 3
+        assert aggregation_method == "center_weighted"
+        member_metrics = pd.DataFrame(
+            {
+                "seed": [42, 43, 44],
+                "macro_f1": [0.49, 0.48, 0.50],
+                "best_epoch": [12, 10, 11],
+                "output_dir": [str(path) for path in run_dirs],
+            }
+        )
+        return {
+            "metrics": {
+                "model": "stage16_equal_weight_seed_ensemble",
+                "split": "validation",
+                "macro_f1": 0.505,
+                "member_seeds": [42, 43, 44],
+            },
+            "member_metrics": member_metrics,
+        }
+
+    monkeypatch.setattr(
+        "src.train.ensemble_stage16_predictions",
+        fake_ensemble,
+    )
+
+    summary = run_stage16_seed_replications(
+        configs,
+        reference_run_dir=tmp_path / "seed_42_reference",
+        output_dir=tmp_path / "replications",
+    )
+
+    assert trained_seeds == [43, 44]
+    assert summary["summary_type"].tolist() == [
+        "individual_seed",
+        "individual_seed",
+        "individual_seed",
+        "equal_weight_ensemble",
+    ]
+    assert summary.iloc[-1]["model"] == "stage16_equal_weight_seed_ensemble"
+    assert (tmp_path / "replications" / "seed_ensemble_summary.csv").exists()
+
+
+def test_stage16_ensemble_uses_stage16_model_name(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_stage15_ensemble(run_dirs, **kwargs):
+        captured.update(kwargs)
+        return {"metrics": {"model": kwargs["_ensemble_model_name"]}}
+
+    monkeypatch.setattr(
+        "src.train.ensemble_stage15_predictions",
+        fake_stage15_ensemble,
+    )
+
+    result = ensemble_stage16_predictions(
+        [tmp_path / "seed_42", tmp_path / "seed_43"],
+        output_dir=tmp_path / "ensemble",
+    )
+
+    assert captured["_ensemble_model_name"] == (
+        "stage16_equal_weight_seed_ensemble"
+    )
+    assert result["metrics"]["model"] == "stage16_equal_weight_seed_ensemble"

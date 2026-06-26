@@ -413,6 +413,32 @@ Replication and ensemble artifacts are written under:
 - `results/stage15_temporal_fusion_tcn_seed_replication/ensemble_validation_confusion_matrix.csv`
 - `results/stage15_temporal_fusion_tcn_seed_replication/seed_ensemble_summary.csv`
 
+## 61-Epoch-Window Temporal Follow-Up
+
+Stage 16 repeats the Stage 15 frozen-embedding many-to-many TCN with one
+controlled change: the sequence length increases from 31 to 61 epochs. The
+longer window matches the existing TCN's theoretical receptive field. The
+frozen Stage 14 encoder, reusable Stage 15 embedding cache, TCN architecture,
+loss and aggregation choices, optimizer settings, 30-epoch training limit,
+early stopping, and square-root class weighting remain fixed.
+
+The workflow first trains and reviews the seed-42 model. After that run exists,
+a separate guarded cell trains seeds 43 and 44 and creates an equal-weight
+probability ensemble across seeds 42, 43, and 44 without retraining seed 42.
+
+Stage 16 artifacts are written under:
+
+- `results/stage16_temporal_fusion_tcn_s61/experiment_summary.csv`
+- `results/stage16_temporal_fusion_tcn_s61/all_history.csv`
+- `results/stage16_temporal_fusion_tcn_s61/best_config.json`
+- `results/stage16_temporal_fusion_tcn_s61/runs/<experiment_id>/`
+- `results/stage16_temporal_fusion_tcn_s61_seed_replication/seed_43/`
+- `results/stage16_temporal_fusion_tcn_s61_seed_replication/seed_44/`
+- `results/stage16_temporal_fusion_tcn_s61_seed_replication/seed_member_metrics.csv`
+- `results/stage16_temporal_fusion_tcn_s61_seed_replication/seed_metric_statistics.csv`
+- `results/stage16_temporal_fusion_tcn_s61_seed_replication/ensemble_validation_metrics.csv`
+- `results/stage16_temporal_fusion_tcn_s61_seed_replication/seed_ensemble_summary.csv`
+
 ## Validation Error Analysis
 
 Stage 13 is implemented in `notebooks/05_error_analysis.ipynb`, with reusable
@@ -459,7 +485,7 @@ Implemented methods include:
   CNN-GRU sequence models, plus aligned raw/engineered-feature fusion
 - PyTorch 1D CNN, CNN-GRU, and multiscale residual fusion models
 - Frozen-embedding many-to-many temporal convolution with overlap-aware loss
-  weighting and epoch-level probability aggregation
+  weighting, 31- and 61-epoch windows, and epoch-level probability aggregation
 - Validation monitoring with accuracy, balanced accuracy, macro F1,
   class-specific precision/recall/F1, and confusion matrices
 - Validation error analysis across model families, participants, transition
@@ -555,7 +581,10 @@ workflow is:
     cell to cache frozen embeddings and train the many-to-many TCN.
 14. Enable the guarded Stage 15 seed-replication cell to train seeds 43 and 44
     and create the equal-weight seed ensemble without retraining seed 42.
-15. Save generated metrics, figures, summaries, and checkpoints under
+15. Enable the guarded Stage 16 cell to train the seed-42 61-epoch-window TCN.
+16. After reviewing that run, enable the Stage 16 seed-replication cell to
+    train seeds 43 and 44 and create the three-seed equal-weight ensemble.
+17. Save generated metrics, figures, summaries, and checkpoints under
     stage-specific local `results/` folders.
 
 The dataset overview notebook writes these local intermediate summaries when raw

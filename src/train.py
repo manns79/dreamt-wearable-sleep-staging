@@ -57,6 +57,10 @@ DEFAULT_STAGE15_OUTPUT_DIR = Path("results/stage15_temporal_fusion_tcn")
 DEFAULT_STAGE15_REPLICATION_OUTPUT_DIR = Path(
     "results/stage15_temporal_fusion_tcn_seed_replication"
 )
+DEFAULT_STAGE16_OUTPUT_DIR = Path("results/stage16_temporal_fusion_tcn_s61")
+DEFAULT_STAGE16_REPLICATION_OUTPUT_DIR = Path(
+    "results/stage16_temporal_fusion_tcn_s61_seed_replication"
+)
 
 
 @dataclass(frozen=True)
@@ -3543,9 +3547,11 @@ def run_stage14_experiment(
     return summary
 
 
-def stage15_experiment_id(config: TrainConfig) -> str:
-    """Return a stable short ID for the frozen-embedding Stage 15 TCN."""
-
+def _frozen_tcn_experiment_id(
+    config: TrainConfig,
+    *,
+    stage_number: int,
+) -> str:
     config_dict = config_to_dict(config)
     stable_keys = [
         "model_name",
@@ -3579,7 +3585,21 @@ def stage15_experiment_id(config: TrainConfig) -> str:
     digest = sha1(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:10]
-    return f"stage15_frozen_tcn_s{config.sequence_length}_{digest}"
+    return (
+        f"stage{stage_number}_frozen_tcn_s{config.sequence_length}_{digest}"
+    )
+
+
+def stage15_experiment_id(config: TrainConfig) -> str:
+    """Return a stable short ID for the frozen-embedding Stage 15 TCN."""
+
+    return _frozen_tcn_experiment_id(config, stage_number=15)
+
+
+def stage16_experiment_id(config: TrainConfig) -> str:
+    """Return a stable short ID for the 61-epoch Stage 16 TCN."""
+
+    return _frozen_tcn_experiment_id(config, stage_number=16)
 
 
 def build_stage15_temporal_tcn_config(
@@ -3626,15 +3646,42 @@ def build_stage15_temporal_tcn_config(
     )
 
 
-def run_stage15_experiment(
+def build_stage16_temporal_tcn_config(
+    encoder_checkpoint_path: str | Path,
+    base_config: TrainConfig | None = None,
+    output_dir: str | Path = DEFAULT_STAGE16_OUTPUT_DIR,
+    embedding_dir: str | Path = DEFAULT_STAGE15_EMBEDDING_DIR,
+) -> TrainConfig:
+    """Create the fixed Stage 16 61-epoch-window TCN config."""
+
+    stage15_config = build_stage15_temporal_tcn_config(
+        encoder_checkpoint_path,
+        base_config=base_config,
+        output_dir=output_dir,
+        embedding_dir=embedding_dir,
+    )
+    return replace(
+        stage15_config,
+        model_name="stage16_frozen_stage14_embedding_tcn_s61",
+        sequence_length=61,
+    )
+
+
+def _run_frozen_embedding_tcn_experiment(
     config: TrainConfig,
-    output_dir: str | Path = DEFAULT_STAGE15_OUTPUT_DIR,
+    *,
+    output_dir: str | Path,
+    experiment_id: str,
+    model_family: str,
+    stage_label: str,
 ) -> pd.DataFrame:
-    """Run the fixed frozen-embedding Stage 15 many-to-many TCN."""
+    """Run one frozen-embedding many-to-many TCN experiment."""
 
     _validate_training_config(config)
     if not _uses_temporal_fusion_tcn(config):
-        raise ValueError("Stage 15 requires model_type='temporal_fusion_tcn'.")
+        raise ValueError(
+            f"{stage_label} requires model_type='temporal_fusion_tcn'."
+        )
 
     stage_dir = Path(output_dir)
     runs_dir = stage_dir / "runs"
@@ -3642,7 +3689,6 @@ def run_stage15_experiment(
     runs_dir.mkdir(parents=True, exist_ok=True)
     _prefit_preprocessing_metadata([config])
 
-    experiment_id = stage15_experiment_id(config)
     run_dir = runs_dir / experiment_id
     run_config = replace(config, output_dir=run_dir)
     loaders = build_train_validation_dataloaders(run_config)
@@ -3664,7 +3710,7 @@ def run_stage15_experiment(
         summary_rows.append(
             {
                 "experiment_id": experiment_id,
-                "model_family": "frozen_stage14_embedding_tcn",
+                "model_family": model_family,
                 "aggregation_method": method,
                 "train_sequences": len(loaders["train"].dataset),
                 "validation_sequences": len(loaders["validation"].dataset),
@@ -3692,7 +3738,7 @@ def run_stage15_experiment(
         history = result.history.copy()
         history.insert(0, "experiment_id", experiment_id)
         history.insert(1, "sequence_length", run_config.sequence_length)
-        history.insert(2, "model_family", "frozen_stage14_embedding_tcn")
+        history.insert(2, "model_family", model_family)
         history.to_csv(stage_dir / "all_history.csv", index=False)
 
     best_row = summary.iloc[0].to_dict()
@@ -3709,6 +3755,36 @@ def run_stage15_experiment(
         best_confusion.to_csv(stage_dir / "best_validation_confusion_matrix.csv")
 
     return summary
+
+
+def run_stage15_experiment(
+    config: TrainConfig,
+    output_dir: str | Path = DEFAULT_STAGE15_OUTPUT_DIR,
+) -> pd.DataFrame:
+    """Run the fixed frozen-embedding Stage 15 many-to-many TCN."""
+
+    return _run_frozen_embedding_tcn_experiment(
+        config,
+        output_dir=output_dir,
+        experiment_id=stage15_experiment_id(config),
+        model_family="frozen_stage14_embedding_tcn",
+        stage_label="Stage 15",
+    )
+
+
+def run_stage16_experiment(
+    config: TrainConfig,
+    output_dir: str | Path = DEFAULT_STAGE16_OUTPUT_DIR,
+) -> pd.DataFrame:
+    """Run the fixed Stage 16 61-epoch-window TCN."""
+
+    return _run_frozen_embedding_tcn_experiment(
+        config,
+        output_dir=output_dir,
+        experiment_id=stage16_experiment_id(config),
+        model_family="frozen_stage14_embedding_tcn_s61",
+        stage_label="Stage 16",
+    )
 
 
 def build_stage15_seed_replication_configs(
@@ -3733,6 +3809,22 @@ def build_stage15_seed_replication_configs(
         )
         for seed in normalized_seeds
     ]
+
+
+def build_stage16_seed_replication_configs(
+    base_config: TrainConfig,
+    output_dir: str | Path = DEFAULT_STAGE16_REPLICATION_OUTPUT_DIR,
+    seeds: Sequence[int] = (43, 44),
+) -> list[TrainConfig]:
+    """Create Stage 16 replication configs that differ only by seed."""
+
+    if base_config.sequence_length != 61:
+        raise ValueError("Stage 16 seed replication requires sequence_length=61.")
+    return build_stage15_seed_replication_configs(
+        base_config,
+        output_dir=output_dir,
+        seeds=seeds,
+    )
 
 
 def _stage15_replication_config_signature(config: TrainConfig) -> dict[str, Any]:
@@ -3818,6 +3910,7 @@ def ensemble_stage15_predictions(
     *,
     output_dir: str | Path,
     aggregation_method: str = "center_weighted",
+    _ensemble_model_name: str = "stage15_equal_weight_seed_ensemble",
 ) -> dict[str, Any]:
     """Create an equal-weight ensemble from completed Stage 15 seed runs."""
 
@@ -3874,7 +3967,7 @@ def ensemble_stage15_predictions(
     metrics, confusion = evaluate_predictions(
         ensemble["true_label"],
         ensemble["pred_label"],
-        model_name="stage15_equal_weight_seed_ensemble",
+        model_name=_ensemble_model_name,
         split="validation",
         labels=TARGET_LABELS,
     )
@@ -3956,6 +4049,22 @@ def ensemble_stage15_predictions(
     }
 
 
+def ensemble_stage16_predictions(
+    run_dirs: Sequence[str | Path],
+    *,
+    output_dir: str | Path,
+    aggregation_method: str = "center_weighted",
+) -> dict[str, Any]:
+    """Create an equal-weight ensemble from completed Stage 16 seed runs."""
+
+    return ensemble_stage15_predictions(
+        run_dirs,
+        output_dir=output_dir,
+        aggregation_method=aggregation_method,
+        _ensemble_model_name="stage16_equal_weight_seed_ensemble",
+    )
+
+
 def run_stage15_seed_replications(
     configs: Sequence[TrainConfig],
     *,
@@ -4014,6 +4123,88 @@ def run_stage15_seed_replications(
         run_dirs.append(completed_run_dir)
 
     ensemble_result = ensemble_stage15_predictions(
+        run_dirs,
+        output_dir=stage_dir,
+        aggregation_method=reference_config.sequence_aggregation,
+    )
+    member_summary = ensemble_result["member_metrics"].copy()
+    member_summary.insert(0, "summary_type", "individual_seed")
+    ensemble_row = {
+        "summary_type": "equal_weight_ensemble",
+        "seed": None,
+        "best_epoch": None,
+        "output_dir": str(stage_dir),
+        **ensemble_result["metrics"],
+    }
+    combined = pd.concat(
+        [member_summary, pd.DataFrame([ensemble_row])],
+        ignore_index=True,
+        sort=False,
+    )
+    combined.to_csv(stage_dir / "seed_ensemble_summary.csv", index=False)
+    return combined
+
+
+def run_stage16_seed_replications(
+    configs: Sequence[TrainConfig],
+    *,
+    reference_run_dir: str | Path,
+    output_dir: str | Path = DEFAULT_STAGE16_REPLICATION_OUTPUT_DIR,
+) -> pd.DataFrame:
+    """Train Stage 16 seed replicas and ensemble them with seed 42."""
+
+    if not configs:
+        raise ValueError("At least one Stage 16 replication config is required.")
+    seeds = [int(config.random_seed) for config in configs]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("Stage 16 replication seeds must be unique.")
+
+    stage_dir = Path(output_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    reference_config, _, _ = _load_stage15_ensemble_member(
+        reference_run_dir,
+        "center_weighted",
+    )
+    if reference_config.sequence_length != 61:
+        raise ValueError("Stage 16 reference run must use sequence_length=61.")
+    reference_signature = _stage15_replication_config_signature(reference_config)
+
+    run_dirs = [Path(reference_run_dir)]
+    for config in configs:
+        _validate_training_config(config)
+        if _stage15_replication_config_signature(config) != reference_signature:
+            raise ValueError(
+                "Replication configs must match the reference except for seed."
+            )
+
+        seed_dir = stage_dir / f"seed_{config.random_seed}"
+        expected_id = stage16_experiment_id(config)
+        summary_path = seed_dir / "experiment_summary.csv"
+        completed_run_dir: Path | None = None
+        if summary_path.exists():
+            completed = pd.read_csv(summary_path)
+            matching = completed[
+                (completed["experiment_id"] == expected_id)
+                & (completed["aggregation_method"] == config.sequence_aggregation)
+            ]
+            if not matching.empty:
+                candidate = Path(str(matching.iloc[0]["output_dir"]))
+                prediction_path = _stage15_primary_prediction_path(
+                    candidate,
+                    config.sequence_aggregation,
+                )
+                if prediction_path.exists():
+                    completed_run_dir = candidate
+
+        if completed_run_dir is None:
+            summary = run_stage16_experiment(config, output_dir=seed_dir)
+            primary = summary[
+                summary["aggregation_method"] == config.sequence_aggregation
+            ].iloc[0]
+            completed_run_dir = Path(str(primary["output_dir"]))
+        run_dirs.append(completed_run_dir)
+
+    ensemble_result = ensemble_stage16_predictions(
         run_dirs,
         output_dir=stage_dir,
         aggregation_method=reference_config.sequence_aggregation,
