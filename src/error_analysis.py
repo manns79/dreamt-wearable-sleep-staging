@@ -1,4 +1,4 @@
-"""Validation error-analysis utilities for Stage 13."""
+"""Validation error-analysis utilities for model-comparison workflows."""
 
 from __future__ import annotations
 
@@ -318,6 +318,16 @@ def load_prediction_csv(
     """Load and normalize one validation prediction CSV."""
 
     frame = pd.read_csv(path, dtype={"participant_id": str})
+    if "split" in frame.columns:
+        split_values = frame["split"].dropna().astype(str).str.strip().str.lower()
+        non_validation_splits = sorted(
+            value for value in split_values.unique() if value != "validation"
+        )
+        if non_validation_splits:
+            raise ValueError(
+                "Validation prediction CSV contains non-validation split(s): "
+                f"{non_validation_splits} in {path}"
+            )
     return normalize_prediction_frame(
         frame,
         model_name=model_name,
@@ -1094,7 +1104,7 @@ def build_stage6_validation_prediction_tables(
 def discover_validation_prediction_files(
     results_dir: str | Path = "results",
 ) -> pd.DataFrame:
-    """Discover Stage 13-compatible validation prediction CSVs."""
+    """Discover validation prediction CSVs compatible with error analysis."""
 
     root = Path(results_dir)
     rows: list[dict[str, Any]] = []
@@ -1207,6 +1217,90 @@ def discover_validation_prediction_files(
                     model_family="cnn_gru_many_to_many",
                     model_name=f"stage12_best_cnn_gru_many_to_many_{method}",
                 )
+
+    stage14_specs = [
+        (
+            root / "stage14_multiscale_fusion_cnn" / "experiment_summary.csv",
+            "stage14",
+            "multiscale_residual_fusion",
+            "stage14_multiscale_fusion_cnn",
+        ),
+        (
+            root / "stage14_multiscale_fusion_cnn_sqrt_weighted"
+            / "experiment_summary.csv",
+            "stage14",
+            "multiscale_residual_fusion",
+            "stage14_multiscale_fusion_cnn_sqrt_weighted",
+        ),
+    ]
+    for summary_path, stage, family, model_name in stage14_specs:
+        for run_dir in _best_output_dirs_by_group(summary_path):
+            add_if_exists(
+                run_dir / "validation_epoch_predictions.csv",
+                stage=stage,
+                model_family=family,
+                model_name=model_name,
+            )
+
+    stage15_stage16_specs = [
+        (
+            root / "stage15_temporal_fusion_tcn" / "experiment_summary.csv",
+            "stage15",
+            "frozen_stage14_embedding_tcn",
+            "stage15_temporal_fusion_tcn",
+        ),
+        (
+            root / "stage16_temporal_fusion_tcn_s61" / "experiment_summary.csv",
+            "stage16",
+            "frozen_stage14_embedding_tcn_s61",
+            "stage16_temporal_fusion_tcn_s61",
+        ),
+    ]
+    for summary_path, stage, family, model_name_prefix in stage15_stage16_specs:
+        if not summary_path.exists():
+            continue
+        summary = pd.read_csv(summary_path)
+        if summary.empty or not {"output_dir", "aggregation_method"}.issubset(
+            summary.columns
+        ):
+            continue
+        best_output_dir = str(summary.iloc[0]["output_dir"])
+        best_run_rows = summary[summary["output_dir"].astype(str) == best_output_dir]
+        for _, method_row in best_run_rows.iterrows():
+            method = str(method_row["aggregation_method"])
+            add_if_exists(
+                Path(best_output_dir)
+                / f"validation_aggregated_epoch_predictions_{method}.csv",
+                stage=stage,
+                model_family=family,
+                model_name=f"{model_name_prefix}_{method}",
+            )
+
+    ensemble_specs = [
+        (
+            root
+            / "stage15_temporal_fusion_tcn_seed_replication"
+            / "ensemble_validation_epoch_predictions.csv",
+            "stage15",
+            "frozen_stage14_embedding_tcn",
+            "stage15_equal_weight_seed_ensemble",
+        ),
+        (
+            root
+            / "stage16_temporal_fusion_tcn_s61_seed_replication"
+            / "ensemble_validation_epoch_predictions.csv",
+            "stage16",
+            "frozen_stage14_embedding_tcn_s61",
+            "stage16_equal_weight_seed_ensemble",
+        ),
+    ]
+    for path, stage, family, model_name in ensemble_specs:
+        add_if_exists(
+            path,
+            stage=stage,
+            model_family=family,
+            model_name=model_name,
+        )
 
     return pd.DataFrame(rows)
 
@@ -1384,7 +1478,7 @@ def run_stage13_error_analysis(
     high_confidence_threshold: float = 0.80,
     make_plots: bool = True,
 ) -> dict[str, pd.DataFrame]:
-    """Run Stage 13 validation error analysis and save CSV/figure artifacts."""
+    """Run validation error analysis and save CSV/figure artifacts."""
 
     if predictions.empty:
         raise ValueError("At least one validation prediction table is required.")

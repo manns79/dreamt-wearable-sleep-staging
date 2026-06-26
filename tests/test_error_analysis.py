@@ -9,6 +9,7 @@ from src.error_analysis import (
     confidence_diagnostics,
     discover_validation_prediction_files,
     error_type_summary,
+    load_prediction_csv,
     materialize_deep_validation_predictions_from_checkpoints,
     model_agreement_summary,
     model_validation_metrics,
@@ -156,6 +157,87 @@ def test_discovery_includes_all_stage12_aggregations_for_best_checkpoint(tmp_pat
     assert set(discovery["model_name"]) == {
         "stage12_best_cnn_gru_many_to_many_uniform",
         "stage12_best_cnn_gru_many_to_many_center_weighted",
+    }
+
+
+def test_load_prediction_csv_rejects_non_validation_splits(tmp_path):
+    path = tmp_path / "validation_epoch_predictions.csv"
+    predictions = _prediction_frame().head(2).copy()
+    predictions["split"] = ["validation", "test"]
+    predictions.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="non-validation split"):
+        load_prediction_csv(path)
+
+
+def test_discovery_includes_stage14_stage15_stage16_current_artifacts(tmp_path):
+    stage14_dir = tmp_path / "stage14_multiscale_fusion_cnn"
+    stage14_run_dir = stage14_dir / "runs" / "best"
+    stage14_run_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "output_dir": [str(stage14_run_dir)],
+            "macro_f1": [0.45],
+        }
+    ).to_csv(stage14_dir / "experiment_summary.csv", index=False)
+    _prediction_frame().head(1).to_csv(
+        stage14_run_dir / "validation_epoch_predictions.csv",
+        index=False,
+    )
+
+    stage15_dir = tmp_path / "stage15_temporal_fusion_tcn"
+    stage15_run_dir = stage15_dir / "runs" / "best"
+    stage15_run_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "output_dir": [str(stage15_run_dir), str(stage15_run_dir)],
+            "aggregation_method": ["uniform", "center_weighted"],
+            "macro_f1": [0.47, 0.49],
+        }
+    ).to_csv(stage15_dir / "experiment_summary.csv", index=False)
+    for method in ["uniform", "center_weighted"]:
+        _prediction_frame().head(1).to_csv(
+            stage15_run_dir / f"validation_aggregated_epoch_predictions_{method}.csv",
+            index=False,
+        )
+
+    stage16_dir = tmp_path / "stage16_temporal_fusion_tcn_s61"
+    stage16_run_dir = stage16_dir / "runs" / "best"
+    stage16_run_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "output_dir": [str(stage16_run_dir)],
+            "aggregation_method": ["center_weighted"],
+            "macro_f1": [0.50],
+        }
+    ).to_csv(stage16_dir / "experiment_summary.csv", index=False)
+    _prediction_frame().head(1).to_csv(
+        stage16_run_dir / "validation_aggregated_epoch_predictions_center_weighted.csv",
+        index=False,
+    )
+
+    stage15_ensemble_dir = tmp_path / "stage15_temporal_fusion_tcn_seed_replication"
+    stage15_ensemble_dir.mkdir()
+    _prediction_frame().head(1).to_csv(
+        stage15_ensemble_dir / "ensemble_validation_epoch_predictions.csv",
+        index=False,
+    )
+    stage16_ensemble_dir = tmp_path / "stage16_temporal_fusion_tcn_s61_seed_replication"
+    stage16_ensemble_dir.mkdir()
+    _prediction_frame().head(1).to_csv(
+        stage16_ensemble_dir / "ensemble_validation_epoch_predictions.csv",
+        index=False,
+    )
+
+    discovery = discover_validation_prediction_files(results_dir=tmp_path)
+
+    assert set(discovery["model_name"]) == {
+        "stage14_multiscale_fusion_cnn",
+        "stage15_temporal_fusion_tcn_uniform",
+        "stage15_temporal_fusion_tcn_center_weighted",
+        "stage16_temporal_fusion_tcn_s61_center_weighted",
+        "stage15_equal_weight_seed_ensemble",
+        "stage16_equal_weight_seed_ensemble",
     }
 
 
