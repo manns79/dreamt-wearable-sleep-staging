@@ -917,16 +917,19 @@ def _prediction_frame_from_probabilities(
     return normalize_prediction_frame(output)
 
 
-def _macro_f1(y_true: Sequence[object], y_pred: Sequence[object]) -> float:
-    return float(
-        f1_score(
-            y_true,
-            y_pred,
-            labels=list(TARGET_SLEEP_STAGE_LABELS),
-            average="macro",
-            zero_division=0,
-        )
-    )
+def _macro_f1(
+    y_true: Sequence[object],
+    y_pred: Sequence[object],
+    *,
+    labels: Sequence[object] | None = TARGET_SLEEP_STAGE_LABELS,
+) -> float:
+    kwargs: dict[str, Any] = {
+        "average": "macro",
+        "zero_division": 0,
+    }
+    if labels is not None:
+        kwargs["labels"] = list(labels)
+    return float(f1_score(y_true, y_pred, **kwargs))
 
 
 def _fit_cv_or_plain(
@@ -937,6 +940,7 @@ def _fit_cv_or_plain(
     groups_train: pd.Series,
     *,
     sample_weight: np.ndarray | None = None,
+    scoring_labels: Sequence[object] | None = TARGET_SLEEP_STAGE_LABELS,
 ) -> Any:
     n_groups = int(groups_train.nunique())
     if n_groups < 2:
@@ -949,7 +953,11 @@ def _fit_cv_or_plain(
     search = GridSearchCV(
         estimator=estimator,
         param_grid=param_grid,
-        scoring=lambda fitted, X, y: _macro_f1(y, fitted.predict(X)),
+        scoring=lambda fitted, X, y: _macro_f1(
+            y,
+            fitted.predict(X),
+            labels=scoring_labels,
+        ),
         cv=cv,
         n_jobs=-1,
         refit=True,
@@ -1078,6 +1086,7 @@ def build_stage6_validation_prediction_tables(
                 pd.Series(y_train_encoded),
                 groups_train,
                 sample_weight=sample_weight,
+                scoring_labels=None,
             )
             xgb_predictions = label_encoder.inverse_transform(xgb.predict(X_val))
             xgb_probabilities = xgb.predict_proba(X_val)

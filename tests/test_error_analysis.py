@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from src.error_analysis import (
+    _macro_f1,
     apply_class_prior_correction,
     class_prior_correction_sweep,
     confidence_diagnostics,
@@ -83,6 +84,13 @@ def test_class_prior_correction_reduces_overweighted_minority_predictions():
     assert corrected.loc[1, "pred_label"] == "REM"
     assert set(sweep["alpha"]) == {0.0, 1.0}
     assert sweep.iloc[0]["macro_f1"] >= sweep.iloc[1]["macro_f1"]
+
+
+def test_macro_f1_can_score_encoded_labels_without_fixed_sleep_stage_labels():
+    y_true = pd.Series([0, 1, 2, 0, 1, 2])
+    y_pred = pd.Series([0, 1, 1, 0, 0, 2])
+
+    assert _macro_f1(y_true, y_pred, labels=None) == pytest.approx(0.6555555556)
 
 
 def test_stage13_error_analysis_summaries_and_outputs(tmp_path):
