@@ -4,7 +4,7 @@
 
 This repository contains an in-progress, reproducible Python workflow for wearable-based sleep stage classification using the DREAMT dataset. The current target is three-class sleep staging: `Wake`, `Non-REM`, and `REM`.
 
-It now includes reusable source modules, staged notebooks, automated tests, engineered feature baselines, PyTorch dataset utilities, 1D CNN training workflows, temporal-context CNN comparisons, CNN-GRU sequence-model utilities, a multiscale raw/engineered-feature fusion CNN, a frozen-embedding many-to-many temporal convolutional model, signal-family ablations, and a P-as-Wake sensitivity workflow. Raw data, trained checkpoints, and final held-out test results are not committed.
+It now includes reusable source modules, staged notebooks, automated tests, engineered feature baselines, PyTorch dataset utilities, 1D CNN training workflows, temporal-context CNN comparisons, CNN-GRU sequence-model utilities, a multiscale raw/engineered-feature fusion CNN, a frozen-embedding many-to-many temporal convolutional model, signal-family ablations, P-as-Wake sensitivity, transition regularization, and a guarded final-test evaluation framework. Raw data, trained checkpoints, and final held-out test results are not committed.
 
 ## Current Status
 
@@ -28,6 +28,8 @@ It now includes reusable source modules, staged notebooks, automated tests, engi
 | 16. 61-epoch frozen-embedding TCN | Implemented as guarded validation and seed-replication runs | `src/data.py`, `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
 | 17. Signal-family ablation | Implemented as guarded validation-only explanatory runs | `src/signal_ablation.py`, `notebooks/06_signal_ablation.ipynb` |
 | 18. P-as-Wake sensitivity | Implemented as one guarded validation-only sensitivity run | `src/p_as_wake_sensitivity.py`, `notebooks/07_p_as_wake_sensitivity.ipynb` |
+| 19. Transition regularization | Implemented as guarded validation-only lambda/seed ablation | `src/transition_regularization.py`, `notebooks/08_transition_regularization.ipynb` |
+| 20. Final held-out test evaluation | Framework prepared; final test run remains guarded | `src/final_evaluation.py`, `notebooks/09_final_test_evaluation.ipynb` |
 
 The guarded training cells are disabled by default so routine notebook
 execution does not launch long experiments. When enabled locally, they write
@@ -518,6 +520,40 @@ When run locally, Stage 19 writes artifacts under:
 - `results/stage19_transition_regularization/all_history.csv`
 - `results/stage19_transition_regularization/best_config.json`
 
+## Final Held-Out Test Evaluation
+
+Stage 20 is implemented in `notebooks/09_final_test_evaluation.ipynb`, with
+reusable helpers in `src/final_evaluation.py`. It is a guarded final-evaluation
+framework, not a validation-development stage. The notebook first builds a
+candidate registry from validation artifacts only, then allows that registry to
+be frozen after Stage 19 completes. The final held-out test evaluation remains
+disabled unless `RUN_FINAL_TEST_EVALUATION = True` is set explicitly.
+
+The final candidate list includes the Stage 6 majority-class, logistic
+regression, and XGBoost baselines; the validation-selected best models from
+Stages 9, 10, 11, 12, and 14; the equal-weight seed ensembles from Stages 15 and
+16; and the Stage 19 equal-weight seed ensemble selected by validation macro F1
+after Stage 19 finishes.
+
+Stage 20 compares validation and test performance using macro F1 as the primary
+metric, per-class precision/recall/F1, confusion matrices, participant-level
+macro F1, total sleep time error, and REM duration error. Duration errors are
+computed at participant level from 30-second epochs and summarized as signed
+and absolute minute errors.
+
+When run locally, Stage 20 writes artifacts under:
+
+- `results/stage20_final_test_evaluation/candidate_registry_draft.csv`
+- `results/stage20_final_test_evaluation/final_candidate_registry.csv`
+- `results/stage20_final_test_evaluation/final_candidate_registry_manifest.json`
+- `results/stage20_final_test_evaluation/validation_metrics.csv`
+- `results/stage20_final_test_evaluation/test_metrics.csv`
+- `results/stage20_final_test_evaluation/validation_test_metric_comparison.csv`
+- `results/stage20_final_test_evaluation/test_participant_macro_f1.csv`
+- `results/stage20_final_test_evaluation/test_duration_errors.csv`
+- `results/stage20_final_test_evaluation/duration_error_summary.csv`
+- `results/stage20_final_test_evaluation/figures/`
+
 ## Validation Error Analysis
 
 Stage 13 is implemented in `notebooks/05_error_analysis.ipynb`, with reusable
@@ -573,10 +609,13 @@ Implemented methods include:
   class-specific precision/recall/F1, and confusion matrices
 - Validation error analysis across model families, participants, transition
   neighborhoods, prediction confidence, and shared-epoch model agreement
+- Guarded final held-out test framework with validation/test comparisons,
+  participant-level macro F1, total sleep time error, REM duration error, and
+  presentation-ready summary figures
 
-Final held-out test comparisons remain future work. The current modeling
-outputs are interim validation diagnostics used to develop and compare model
-families without touching the test split.
+Final held-out test execution remains guarded until the candidate registry is
+frozen. The current modeling outputs are interim validation diagnostics used to
+develop and compare model families without touching the test split.
 
 ## Repository Structure
 
@@ -595,10 +634,12 @@ dreamt-wearable-sleep-staging/
     06_signal_ablation.ipynb
     07_p_as_wake_sensitivity.ipynb
     08_transition_regularization.ipynb
+    09_final_test_evaluation.ipynb
   src/
     baselines.py
     data.py
     evaluate.py
+    final_evaluation.py
     features.py
     models.py
     p_as_wake_sensitivity.py
@@ -678,7 +719,10 @@ workflow is:
     validation-only P-as-Wake sensitivity analysis.
 19. Run `notebooks/08_transition_regularization.ipynb` for the guarded Stage 19
     transition-regularization lambda/seed ablation.
-20. Save generated metrics, figures, summaries, and checkpoints under
+20. Run `notebooks/09_final_test_evaluation.ipynb` in Phase 1 mode to inspect
+    and freeze the final candidate registry after Stage 19 completes. Run the
+    final test-evaluation cell only once the registry is frozen.
+21. Save generated metrics, figures, summaries, and checkpoints under
     stage-specific local `results/` folders.
 
 The dataset overview notebook writes these local intermediate summaries when raw

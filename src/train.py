@@ -22,6 +22,7 @@ from src.data import (
     DEFAULT_PREPROCESSING_METADATA_PATH,
     DEFAULT_RAW_DATA_DIR,
     DEFAULT_STAGE15_EMBEDDING_DIR,
+    DEFAULT_TEST_FEATURES_PATH,
     DEFAULT_TRAIN_FEATURES_PATH,
     DEFAULT_VALIDATION_FEATURES_PATH,
     EXPECTED_SIGNAL_COLUMNS,
@@ -99,6 +100,7 @@ class TrainConfig:
     label_smoothing: float = 0.0
     train_feature_path: str | Path = DEFAULT_TRAIN_FEATURES_PATH
     validation_feature_path: str | Path = DEFAULT_VALIDATION_FEATURES_PATH
+    test_feature_path: str | Path = DEFAULT_TEST_FEATURES_PATH
     feature_preprocessing_metadata_path: str | Path = (
         DEFAULT_FEATURE_PREPROCESSING_METADATA_PATH
     )
@@ -743,6 +745,8 @@ def _stage15_embedding_paths(config: TrainConfig) -> dict[str, Path]:
         "train_index": embedding_dir / "train_epoch_index.csv",
         "validation_embeddings": embedding_dir / "validation_embeddings.npy",
         "validation_index": embedding_dir / "validation_epoch_index.csv",
+        "test_embeddings": embedding_dir / "test_embeddings.npy",
+        "test_index": embedding_dir / "test_epoch_index.csv",
     }
 
 
@@ -777,6 +781,7 @@ def _stage15_embedding_signature(config: TrainConfig) -> dict[str, Any]:
         "epoch_index": file_signature(config.epoch_index_path),
         "train_features": file_signature(config.train_feature_path),
         "validation_features": file_signature(config.validation_feature_path),
+        "test_features": file_signature(config.test_feature_path),
         "raw_preprocessing": file_signature(config.preprocessing_metadata_path),
         "feature_preprocessing": file_signature(
             config.feature_preprocessing_metadata_path
@@ -792,14 +797,22 @@ def _stage15_embedding_signature(config: TrainConfig) -> dict[str, Any]:
     }
 
 
-def _stage15_embedding_cache_matches(config: TrainConfig) -> bool:
+def _stage15_embedding_cache_matches(
+    config: TrainConfig,
+    splits: Sequence[str] = ("train", "validation"),
+) -> bool:
     paths = _stage15_embedding_paths(config)
+    split_names = [str(split) for split in splits]
     required_paths = [
         paths["manifest"],
-        paths["train_embeddings"],
-        paths["train_index"],
-        paths["validation_embeddings"],
-        paths["validation_index"],
+        *[
+            paths[f"{split}_embeddings"]
+            for split in split_names
+        ],
+        *[
+            paths[f"{split}_index"]
+            for split in split_names
+        ],
     ]
     if not all(path.exists() for path in required_paths):
         return False
@@ -809,7 +822,7 @@ def _stage15_embedding_cache_matches(config: TrainConfig) -> bool:
             manifest = json.load(file)
         if manifest.get("signature") != _stage15_embedding_signature(config):
             return False
-        for split in ["train", "validation"]:
+        for split in split_names:
             embeddings = np.load(paths[f"{split}_embeddings"], mmap_mode="r")
             epoch_index = pd.read_csv(paths[f"{split}_index"])
             if embeddings.ndim != 2:
@@ -835,6 +848,7 @@ def _stage15_source_encoder_config(config: TrainConfig) -> TrainConfig:
         preprocessing_metadata_path=config.preprocessing_metadata_path,
         train_feature_path=config.train_feature_path,
         validation_feature_path=config.validation_feature_path,
+        test_feature_path=config.test_feature_path,
         feature_preprocessing_metadata_path=(
             config.feature_preprocessing_metadata_path
         ),
@@ -852,6 +866,7 @@ def export_stage15_frozen_embeddings(
     config: TrainConfig,
     *,
     overwrite: bool = False,
+    splits: Sequence[str] = ("train", "validation"),
 ) -> dict[str, Path]:
     """Cache fused epoch embeddings from a frozen Stage 14 checkpoint."""
 
@@ -859,13 +874,26 @@ def export_stage15_frozen_embeddings(
     _validate_training_config(config)
     if not _uses_temporal_fusion_tcn(config):
         raise ValueError("Embedding export requires a temporal_fusion_tcn config.")
+    split_names = [str(split) for split in splits]
+    invalid_splits = sorted(set(split_names) - {"train", "validation", "test"})
+    if invalid_splits:
+        raise ValueError(
+            "Embedding export splits must be train, validation, or test: "
+            f"{invalid_splits}"
+        )
 
     paths = _stage15_embedding_paths(config)
-    if not overwrite and _stage15_embedding_cache_matches(config):
+    if not overwrite and _stage15_embedding_cache_matches(config, splits=split_names):
         return paths
 
     source_config = _stage15_source_encoder_config(config)
-    datasets = build_train_validation_datasets(source_config)
+    if split_names == ["train", "validation"]:
+        datasets = build_train_validation_datasets(source_config)
+    else:
+        datasets = {
+            split: build_dataset_for_split(source_config, split)
+            for split in split_names
+        }
     device = resolve_device(config.device)
     model = _new_model_for_config(source_config)
     checkpoint = load_checkpoint(
@@ -973,6 +1001,27 @@ def _build_stage15_embedding_datasets(config: TrainConfig) -> dict[str, Any]:
     return datasets
 
 
+def _build_stage15_embedding_dataset_for_split(config: TrainConfig, split: str) -> Any:
+    split = str(split)
+    paths = export_stage15_frozen_embeddings(config, splits=(split,))
+    dataset = DreamtEmbeddingSequenceDataset(
+        paths[f"{split}_embeddings"],
+        paths[f"{split}_index"],
+        sequence_length=config.sequence_length,
+        stride=config.sequence_stride,
+        label_mode=config.sequence_label_mode,
+        target_position=config.sequence_target_position,
+        return_sample_weights=(
+            config.sequence_label_mode == "many_to_many"
+            and config.sequence_loss_weighting != "none"
+        ),
+        sample_weight_mode=config.sequence_loss_weighting,
+    )
+    if len(dataset) == 0:
+        raise ValueError(f"Stage 15 {split} sequence dataset is empty.")
+    return dataset
+
+
 def _dataset_class_for_config(config: TrainConfig) -> type[Any]:
     if _uses_fusion_model(config):
         return DreamtFeatureFusionDataset
@@ -983,12 +1032,33 @@ def _dataset_class_for_config(config: TrainConfig) -> type[Any]:
     return DreamtEpochDataset
 
 
-def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
-    """Build train and validation datasets without touching the test split."""
+def _feature_path_for_split(config: TrainConfig, split: str) -> str | Path:
+    if split == "train":
+        return config.train_feature_path
+    if split == "validation":
+        return config.validation_feature_path
+    if split == "test":
+        return config.test_feature_path
+    raise ValueError("split must be 'train', 'validation', or 'test'.")
 
+
+def _max_participants_for_split(config: TrainConfig, split: str) -> int | None:
+    if split == "train":
+        return config.max_train_participants
+    if split == "validation":
+        return config.max_val_participants
+    if split == "test":
+        return None
+    raise ValueError("split must be 'train', 'validation', or 'test'.")
+
+
+def build_dataset_for_split(config: TrainConfig, split: str) -> Any:
+    """Build one dataset split using train-fitted preprocessing metadata."""
+
+    split = str(split)
     _validate_training_config(config)
     if _uses_temporal_fusion_tcn(config):
-        return _build_stage15_embedding_datasets(config)
+        return _build_stage15_embedding_dataset_for_split(config, split)
 
     channels = list(config.channels)
     stats = _load_or_fit_preprocessing_stats(config)
@@ -1013,54 +1083,59 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
                 "sample_weight_mode": config.sequence_loss_weighting,
             }
         )
-
-    train_kwargs = dict(dataset_kwargs)
-    validation_kwargs = dict(dataset_kwargs)
     if _uses_fusion_model(config):
-        train_kwargs.update(
+        dataset_kwargs.update(
             {
-                "feature_table": config.train_feature_path,
-                "feature_preprocessing_stats": feature_stats,
-            }
-        )
-        validation_kwargs.update(
-            {
-                "feature_table": config.validation_feature_path,
+                "feature_table": _feature_path_for_split(config, split),
                 "feature_preprocessing_stats": feature_stats,
             }
         )
 
-    train_dataset = dataset_class(
+    dataset = dataset_class(
         raw_dir=config.raw_dir,
         epoch_index=config.epoch_index_path,
-        split="train",
+        split=split,
         channels=channels,
         preprocessing_stats=stats,
-        max_participants=config.max_train_participants,
+        max_participants=_max_participants_for_split(config, split),
         max_cached_participants=config.max_cached_participants,
         participant_array_cache_dir=config.participant_array_cache_dir,
         dtype=config.dataset_dtype,
-        **train_kwargs,
+        **dataset_kwargs,
     )
-    val_dataset = dataset_class(
-        raw_dir=config.raw_dir,
-        epoch_index=config.epoch_index_path,
-        split="validation",
-        channels=channels,
-        preprocessing_stats=stats,
-        max_participants=config.max_val_participants,
-        max_cached_participants=config.max_cached_participants,
-        participant_array_cache_dir=config.participant_array_cache_dir,
-        dtype=config.dataset_dtype,
-        **validation_kwargs,
+    if len(dataset) == 0:
+        raise ValueError(f"{split} dataset is empty.")
+    return dataset
+
+
+def build_dataloader_for_split(
+    config: TrainConfig,
+    split: str,
+    *,
+    shuffle: bool = False,
+) -> Any:
+    """Build a dataloader for one split without changing model weights."""
+
+    torch = _require_torch()
+    dataset = build_dataset_for_split(config, split)
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=shuffle,
+        num_workers=config.num_workers,
     )
 
-    if len(train_dataset) == 0:
-        raise ValueError("Training dataset is empty.")
-    if len(val_dataset) == 0:
-        raise ValueError("Validation dataset is empty.")
 
-    return {"train": train_dataset, "validation": val_dataset}
+def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
+    """Build train and validation datasets without touching the test split."""
+
+    _validate_training_config(config)
+    if _uses_temporal_fusion_tcn(config):
+        return _build_stage15_embedding_datasets(config)
+    return {
+        "train": build_dataset_for_split(config, "train"),
+        "validation": build_dataset_for_split(config, "validation"),
+    }
 
 
 def _new_seeded_generator(seed: int) -> Any:
@@ -1238,6 +1313,46 @@ def build_stage10_paired_dataloaders(
             "train_examples": len(context_datasets["train"]),
             "validation_examples": len(context_datasets["validation"]),
         },
+    }
+
+
+def build_stage10_paired_dataloader_for_split(
+    config: TrainConfig,
+    context_radius: int,
+    split: str,
+) -> dict[str, Any]:
+    """Build matched Stage 10 single/context loaders for one split."""
+
+    if context_radius <= 0:
+        raise ValueError("context_radius must be positive for Stage 10 pairing.")
+
+    torch = _require_torch()
+    base_config = replace(config, context_radius=0)
+    context_config = replace(config, context_radius=int(context_radius))
+
+    single_dataset = build_dataset_for_split(base_config, split)
+    context_dataset = build_dataset_for_split(context_config, split)
+    single_subset = torch.utils.data.Subset(
+        single_dataset,
+        _context_center_positions(context_dataset),
+    )
+    if len(single_subset) != len(context_dataset):
+        raise ValueError(
+            f"Stage 10 {split} pairing produced mismatched dataset lengths."
+        )
+
+    paired_datasets = {
+        "single": single_subset,
+        "context": context_dataset,
+    }
+    return {
+        key: torch.utils.data.DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+        )
+        for key, dataset in paired_datasets.items()
     }
 
 
@@ -2154,6 +2269,28 @@ def _validation_loader_for_prediction_export(config: TrainConfig) -> Any:
     return build_train_validation_dataloaders(config)["validation"]
 
 
+def _loader_for_prediction_export(config: TrainConfig, split: str) -> Any:
+    """Build the requested split loader that matches a saved run configuration."""
+
+    split = str(split)
+    if split == "validation":
+        return _validation_loader_for_prediction_export(config)
+    if split not in {"train", "test"}:
+        raise ValueError("split must be 'train', 'validation', or 'test'.")
+    if (
+        config.comparison_context_radius is not None
+        and config.comparison_context_radius > 0
+    ):
+        paired = build_stage10_paired_dataloader_for_split(
+            config,
+            context_radius=int(config.comparison_context_radius),
+            split=split,
+        )
+        loader_key = "context" if config.context_radius > 0 else "single"
+        return paired[loader_key]
+    return build_dataloader_for_split(config, split, shuffle=False)
+
+
 def export_validation_predictions_from_checkpoint(
     run_dir: str | Path,
     *,
@@ -2242,6 +2379,107 @@ def export_validation_predictions_from_checkpoint(
 
     for method, confusion in validation.get("extra_confusion_matrices", {}).items():
         confusion_path = output_path / f"validation_confusion_matrix_{method}.csv"
+        if overwrite or not confusion_path.exists():
+            confusion.to_csv(confusion_path)
+        written[f"confusion_matrix_{method}"] = confusion_path
+
+    return written
+
+
+def export_split_predictions_from_checkpoint(
+    run_dir: str | Path,
+    *,
+    split: str,
+    config_path: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    overwrite: bool = False,
+) -> dict[str, Path]:
+    """Export prediction artifacts for one split from a saved checkpoint.
+
+    This is an inference-only helper for final evaluation. It does not train or
+    update model weights. Callers are responsible for guarding held-out test
+    evaluation.
+    """
+
+    torch = _require_torch()
+    split = str(split)
+    if split not in {"train", "validation", "test"}:
+        raise ValueError("split must be 'train', 'validation', or 'test'.")
+
+    run_path = Path(run_dir)
+    checkpoint_file = Path(checkpoint_path) if checkpoint_path else (
+        run_path / "checkpoints" / "best.pt"
+    )
+    config_file = Path(config_path) if config_path else run_path / "config.json"
+    output_path = Path(output_dir) if output_dir else run_path
+
+    config = load_train_config(
+        config_path=config_file,
+        checkpoint_path=checkpoint_file,
+    )
+    checkpoint = load_checkpoint(checkpoint_file, map_location="cpu")
+    device = resolve_device(config.device)
+    model = _new_model_for_config(config)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+
+    loader = _loader_for_prediction_export(config, split)
+    reduction = "none" if config.sequence_label_mode == "many_to_many" else "mean"
+    criterion = torch.nn.CrossEntropyLoss(reduction=reduction)
+    evaluation = evaluate_model(
+        model,
+        loader,
+        criterion,
+        device,
+        model_name=config.model_name,
+        split=split,
+        config=config,
+    )
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    written: dict[str, Path] = {}
+
+    metrics_path = output_path / f"{split}_metrics_from_checkpoint.csv"
+    if overwrite or not metrics_path.exists():
+        pd.DataFrame([{**evaluation["metrics"], "loss": evaluation["loss"]}]).to_csv(
+            metrics_path,
+            index=False,
+        )
+    written["metrics"] = metrics_path
+
+    confusion_path = output_path / f"{split}_confusion_matrix.csv"
+    if overwrite or not confusion_path.exists():
+        evaluation["confusion_matrix"].to_csv(confusion_path)
+    written["confusion_matrix"] = confusion_path
+
+    epoch_predictions = evaluation.get("epoch_predictions")
+    if epoch_predictions is not None:
+        prediction_path = output_path / f"{split}_epoch_predictions.csv"
+        if overwrite or not prediction_path.exists():
+            epoch_predictions.to_csv(prediction_path, index=False)
+        written["epoch_predictions"] = prediction_path
+
+    sequence_position_predictions = evaluation.get("sequence_position_predictions")
+    if sequence_position_predictions is not None:
+        sequence_path = output_path / f"{split}_sequence_position_predictions.csv"
+        if overwrite or not sequence_path.exists():
+            sequence_position_predictions.to_csv(sequence_path, index=False)
+        written["sequence_position_predictions"] = sequence_path
+
+    for method, predictions in evaluation.get(
+        "aggregated_epoch_predictions",
+        {},
+    ).items():
+        prediction_path = output_path / (
+            f"{split}_aggregated_epoch_predictions_{method}.csv"
+        )
+        if overwrite or not prediction_path.exists():
+            predictions.to_csv(prediction_path, index=False)
+        written[f"aggregated_epoch_predictions_{method}"] = prediction_path
+
+    for method, confusion in evaluation.get("extra_confusion_matrices", {}).items():
+        confusion_path = output_path / f"{split}_confusion_matrix_{method}.csv"
         if overwrite or not confusion_path.exists():
             confusion.to_csv(confusion_path)
         written[f"confusion_matrix_{method}"] = confusion_path
