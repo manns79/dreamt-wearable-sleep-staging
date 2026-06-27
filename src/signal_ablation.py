@@ -223,7 +223,13 @@ def _feature_columns_from_frame(frame: pd.DataFrame) -> list[str]:
 
 
 def _read_feature_table(path: str | Path) -> pd.DataFrame:
-    return pd.read_csv(path, dtype={"participant_id": str})
+    feature_path = Path(path)
+    if not feature_path.exists():
+        raise FileNotFoundError(
+            "Stage 17 signal ablation requires an engineered feature table: "
+            f"{feature_path}"
+        )
+    return pd.read_csv(feature_path, dtype={"participant_id": str})
 
 
 def write_stage17_signal_ablation_feature_tables(
