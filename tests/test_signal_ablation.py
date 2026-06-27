@@ -184,6 +184,7 @@ def test_run_stage17_signal_ablation_writes_multirow_summary(
                 "balanced_accuracy": [score],
             }
         )
+        history.to_csv(output_dir / "train_history.csv", index=False)
         return TrainingResult(
             history=history,
             best_metrics={
@@ -212,11 +213,26 @@ def test_run_stage17_signal_ablation_writes_multirow_summary(
     )
 
     assert list(summary["ablation_id"]) == ["full", "without_cardiovascular"]
+    assert set(summary["stage17_run_status"]) == {"trained"}
     assert summary.loc[1, "delta_macro_f1"] == pytest.approx(-0.1)
     assert len(calls) == 2
     assert (tmp_path / "stage17" / "experiment_summary.csv").exists()
     assert (tmp_path / "stage17" / "all_history.csv").exists()
     assert (tmp_path / "stage17" / "best_config.json").exists()
+
+    calls.clear()
+    skipped_summary = run_stage17_signal_ablation(
+        specs,
+        base_config=TrainConfig(epochs=3, patience=2),
+        output_dir=tmp_path / "stage17",
+        train_feature_path=train_path,
+        validation_feature_path=validation_path,
+        skip_completed=True,
+    )
+
+    assert calls == []
+    assert set(skipped_summary["stage17_run_status"]) == {"skipped_completed"}
+    assert skipped_summary.loc[1, "delta_macro_f1"] == pytest.approx(-0.1)
 
 
 def test_validation_only_assertion_rejects_test_split_rows(tmp_path):

@@ -360,6 +360,20 @@ def _list_string(values: tuple[str, ...]) -> str:
     return json.dumps(list(values))
 
 
+def _json_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return [value]
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+        return [str(parsed)]
+    if isinstance(value, list | tuple):
+        return [str(item) for item in value]
+    return []
+
+
 def _run_summary_row(
     run: Stage17SignalAblationRun,
     *,
@@ -372,6 +386,7 @@ def _run_summary_row(
         "stage": "stage17",
         "ablation_id": run.ablation_id,
         "ablation_label": run.spec.label,
+        "stage17_run_status": "trained",
         "description": run.spec.description,
         "included_families": _list_string(run.spec.included_families),
         "omitted_families": _list_string(run.spec.omitted_families),
@@ -388,6 +403,82 @@ def _run_summary_row(
         **config_to_dict(run.config),
         **dict(best_metrics),
     }
+
+
+def _completed_run_summary_path(run: Stage17SignalAblationRun) -> Path:
+    return run.run_dir / "stage17_ablation_summary.json"
+
+
+def _completed_run_matches_current_config(
+    row: dict[str, Any],
+    run: Stage17SignalAblationRun,
+) -> bool:
+    try:
+        if row.get("stage") != "stage17":
+            return False
+        if row.get("ablation_id") != run.ablation_id:
+            return False
+        if row.get("model_name") != run.config.model_name:
+            return False
+        if _json_list(row.get("raw_channels")) != list(run.raw_channels):
+            return False
+        if _json_list(row.get("channels")) != list(run.config.channels):
+            return False
+        if _json_list(row.get("engineered_feature_columns")) != list(
+            run.engineered_feature_columns
+        ):
+            return False
+        if int(row.get("engineered_feature_count", -1)) != int(
+            run.config.engineered_feature_count
+        ):
+            return False
+        if bool(row.get("class_weighting")) != bool(run.config.class_weighting):
+            return False
+        if float(row.get("class_weight_power", -1.0)) != float(
+            run.config.class_weight_power
+        ):
+            return False
+    except (TypeError, ValueError):
+        return False
+    expected_paths = {
+        "output_dir": run.run_dir,
+        "train_feature_path": run.train_feature_path,
+        "validation_feature_path": run.validation_feature_path,
+    }
+    return all(str(row.get(key)) == str(path) for key, path in expected_paths.items())
+
+
+def _load_completed_run_summary(
+    run: Stage17SignalAblationRun,
+) -> dict[str, Any] | None:
+    summary_path = _completed_run_summary_path(run)
+    if not summary_path.exists():
+        return None
+    with summary_path.open("r", encoding="utf-8") as file:
+        row = json.load(file)
+    if not isinstance(row, dict):
+        return None
+    if not _completed_run_matches_current_config(row, run):
+        return None
+    row = dict(row)
+    row["stage17_run_status"] = "skipped_completed"
+    return row
+
+
+def _history_frame_for_run(run: Stage17SignalAblationRun) -> pd.DataFrame | None:
+    history_path = run.run_dir / "train_history.csv"
+    if not history_path.exists():
+        return None
+    try:
+        history = pd.read_csv(history_path)
+    except pd.errors.EmptyDataError:
+        return None
+    if history.empty:
+        return None
+    history.insert(0, "ablation_id", run.ablation_id)
+    history.insert(1, "ablation_label", run.spec.label)
+    history.insert(2, "included_families", _list_string(run.spec.included_families))
+    return history
 
 
 def summarize_stage17_signal_ablation(
@@ -420,7 +511,8 @@ def run_stage17_signal_ablation(
     output_dir: str | Path = DEFAULT_STAGE17_OUTPUT_DIR,
     train_feature_path: str | Path = DEFAULT_TRAIN_FEATURES_PATH,
     validation_feature_path: str | Path = DEFAULT_VALIDATION_FEATURES_PATH,
-    overwrite_feature_tables: bool = True,
+    overwrite_feature_tables: bool = False,
+    skip_completed: bool = True,
 ) -> pd.DataFrame:
     """Run validation-only Stage 17 signal-family ablations."""
 
@@ -439,6 +531,14 @@ def run_stage17_signal_ablation(
     history_frames: list[pd.DataFrame] = []
     for run in runs:
         run.run_dir.mkdir(parents=True, exist_ok=True)
+        completed_row = _load_completed_run_summary(run) if skip_completed else None
+        if completed_row is not None:
+            summary_rows.append(completed_row)
+            completed_history = _history_frame_for_run(run)
+            if completed_history is not None:
+                history_frames.append(completed_history)
+            continue
+
         loaders = build_train_validation_dataloaders(run.config)
         result = train_model(
             loaders["train"],
