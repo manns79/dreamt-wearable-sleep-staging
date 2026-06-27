@@ -396,9 +396,10 @@ def _epoch_summary_row(
     epoch_start_offset_rows: int,
     sampling_rate_hz: int,
     signal_columns: Iterable[str],
+    p_as_wake: bool = False,
 ) -> dict[str, object]:
     """Summarize one fixed row-range epoch without assuming full-file context."""
-    label_info = validate_epoch_labels(epoch_df)
+    label_info = validate_epoch_labels(epoch_df, p_as_wake=p_as_wake)
     missingness = compute_epoch_missingness(epoch_df, signal_columns)
     has_timestamp_discontinuity = _timestamp_discontinuity(
         epoch_df,
@@ -428,7 +429,10 @@ def _epoch_summary_row(
     }
 
 
-def validate_epoch_labels(epoch_df: pd.DataFrame) -> dict[str, object]:
+def validate_epoch_labels(
+    epoch_df: pd.DataFrame,
+    p_as_wake: bool = False,
+) -> dict[str, object]:
     """Validate that an epoch has one consistent three-class sleep-stage label.
 
     Returns raw labels present, standardized labels present, the mapped target
@@ -447,7 +451,9 @@ def validate_epoch_labels(epoch_df: pd.DataFrame) -> dict[str, object]:
     labels = epoch_df[LABEL_COLUMN]
     raw_label = _pipe_join(labels)
     standardized_label_series = labels.map(standardize_label_names)
-    mapped_label_series = labels.map(map_sleep_stage)
+    mapped_label_series = labels.map(
+        lambda value: map_sleep_stage(value, p_as_wake=p_as_wake)
+    )
     standardized_labels = sorted(
         {
             label
@@ -579,6 +585,7 @@ def segment_participant_into_epochs(
     epoch_length_seconds: int = DEFAULT_EPOCH_LENGTH_SECONDS,
     signal_columns: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
     epoch_start_offset_rows: int | None = None,
+    p_as_wake: bool = False,
 ) -> pd.DataFrame:
     """Segment one participant DataFrame into fixed-length epoch summaries.
 
@@ -629,6 +636,7 @@ def segment_participant_into_epochs(
                 epoch_start_offset_rows=epoch_start_offset_rows,
                 sampling_rate_hz=sampling_rate_hz,
                 signal_columns=signal_columns,
+                p_as_wake=p_as_wake,
             )
         )
 
@@ -642,6 +650,7 @@ def segment_participant_chunks_into_epochs(
     epoch_length_seconds: int = DEFAULT_EPOCH_LENGTH_SECONDS,
     signal_columns: Iterable[str] = EXPECTED_SIGNAL_COLUMNS,
     epoch_start_offset_rows: int = 0,
+    p_as_wake: bool = False,
 ) -> pd.DataFrame:
     """Segment participant CSV chunks into fixed-length epoch summaries.
 
@@ -706,6 +715,7 @@ def segment_participant_chunks_into_epochs(
                     epoch_start_offset_rows=epoch_start_offset_rows,
                     sampling_rate_hz=sampling_rate_hz,
                     signal_columns=signal_columns,
+                    p_as_wake=p_as_wake,
                 )
             )
             epoch_id += 1
@@ -726,6 +736,7 @@ def segment_participant_chunks_into_epochs(
                 epoch_start_offset_rows=epoch_start_offset_rows,
                 sampling_rate_hz=sampling_rate_hz,
                 signal_columns=signal_columns,
+                p_as_wake=p_as_wake,
             )
         )
 

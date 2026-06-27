@@ -4,7 +4,7 @@
 
 This repository contains an in-progress, reproducible Python workflow for wearable-based sleep stage classification using the DREAMT dataset. The current target is three-class sleep staging: `Wake`, `Non-REM`, and `REM`.
 
-It now includes reusable source modules, staged notebooks, automated tests, engineered feature baselines, PyTorch dataset utilities, 1D CNN training workflows, temporal-context CNN comparisons, CNN-GRU sequence-model utilities, a multiscale raw/engineered-feature fusion CNN, and a frozen-embedding many-to-many temporal convolutional model. Raw data, trained checkpoints, and final held-out test results are not committed.
+It now includes reusable source modules, staged notebooks, automated tests, engineered feature baselines, PyTorch dataset utilities, 1D CNN training workflows, temporal-context CNN comparisons, CNN-GRU sequence-model utilities, a multiscale raw/engineered-feature fusion CNN, a frozen-embedding many-to-many temporal convolutional model, signal-family ablations, and a P-as-Wake sensitivity workflow. Raw data, trained checkpoints, and final held-out test results are not committed.
 
 ## Current Status
 
@@ -25,6 +25,9 @@ It now includes reusable source modules, staged notebooks, automated tests, engi
 | 13. Validation error analysis | Implemented as guarded validation diagnostics | `src/error_analysis.py`, `notebooks/05_error_analysis.ipynb` |
 | 14. Multiscale residual feature-fusion CNN | Implemented as one guarded validation run | `src/data.py`, `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
 | 15. Frozen Stage 14 embedding TCN | Implemented as one guarded many-to-many validation run | `src/data.py`, `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
+| 16. 61-epoch frozen-embedding TCN | Implemented as guarded validation and seed-replication runs | `src/data.py`, `src/models.py`, `src/train.py`, `notebooks/04_cnn_training.ipynb` |
+| 17. Signal-family ablation | Implemented as guarded validation-only explanatory runs | `src/signal_ablation.py`, `notebooks/06_signal_ablation.ipynb` |
+| 18. P-as-Wake sensitivity | Implemented as one guarded validation-only sensitivity run | `src/p_as_wake_sensitivity.py`, `notebooks/07_p_as_wake_sensitivity.ipynb` |
 
 The guarded training cells are disabled by default so routine notebook
 execution does not launch long experiments. When enabled locally, they write
@@ -79,6 +82,10 @@ DREAMT `data_100Hz` convention where `P` is treated as Wake. Missing, unknown,
 artifact, movement, unscored, and ambiguous labels are excluded rather than
 silently forced into one of the three target classes.
 
+Stage 18 implements the P-as-Wake option as a sensitivity analysis. It should
+not replace the primary drop-P analysis unless that decision is made before any
+held-out test evaluation.
+
 ## Epoch Preprocessing
 
 Stage 4 uses one PSG sleep epoch as the modeling unit. Reusable epoch utilities
@@ -104,6 +111,9 @@ participant-level split. The builder refuses to create epoch rows for a raw
 participant file that is missing from the split assignments, preventing silent
 train/validation/test leakage. Scaling and normalization are not fit at this
 stage; any later scaler must be fit using training participants only.
+For Stage 18, the same builder can be run with `p_as_wake=True` and restricted
+to train/validation splits so the sensitivity analysis does not create held-out
+test prediction artifacts.
 
 ## Training-Set EDA
 
@@ -439,6 +449,42 @@ Stage 16 artifacts are written under:
 - `results/stage16_temporal_fusion_tcn_s61_seed_replication/ensemble_validation_metrics.csv`
 - `results/stage16_temporal_fusion_tcn_s61_seed_replication/seed_ensemble_summary.csv`
 
+## Signal-Family Ablation
+
+Stage 17 is implemented in `notebooks/06_signal_ablation.ipynb`, with reusable
+helpers in `src/signal_ablation.py`. It is a validation-only explanatory
+analysis that reuses the fixed Stage 14 square-root-weighted fusion recipe while
+ablating raw channels and engineered features by signal family.
+
+When run locally, Stage 17 writes isolated artifacts under:
+
+- `results/stage17_signal_ablation/experiment_summary.csv`
+- `results/stage17_signal_ablation/all_history.csv`
+- `results/stage17_signal_ablation/best_config.json`
+- `results/stage17_signal_ablation/features/<ablation_id>/`
+- `results/stage17_signal_ablation/runs/<ablation_id>/`
+
+## P-As-Wake Sensitivity
+
+Stage 18 is implemented in `notebooks/07_p_as_wake_sensitivity.ipynb`, with
+reusable helpers in `src/p_as_wake_sensitivity.py`. It rebuilds train and
+validation inputs with `P` preparation labels mapped to `Wake`, then retrains
+one representative model: the Stage 14 square-root-weighted multiscale residual
+feature-fusion CNN. This is a sensitivity analysis for reporting robustness to
+the original DREAMT paper convention, not the main result.
+
+Stage 18 intentionally writes only train/validation modeling artifacts and
+checks its output directory for held-out test split rows. When run locally, it
+writes artifacts under:
+
+- `results/stage18_p_as_wake_sensitivity/epoch_index_p_as_wake_train_validation.csv`
+- `results/stage18_p_as_wake_sensitivity/features/features_train.csv`
+- `results/stage18_p_as_wake_sensitivity/features/features_val.csv`
+- `results/stage18_p_as_wake_sensitivity/experiment_summary.csv`
+- `results/stage18_p_as_wake_sensitivity/all_history.csv`
+- `results/stage18_p_as_wake_sensitivity/best_config.json`
+- `results/stage18_p_as_wake_sensitivity/runs/p_as_wake_stage14_sqrt_weighted/`
+
 ## Validation Error Analysis
 
 Stage 13 is implemented in `notebooks/05_error_analysis.ipynb`, with reusable
@@ -486,6 +532,8 @@ Implemented methods include:
 - PyTorch 1D CNN, CNN-GRU, and multiscale residual fusion models
 - Frozen-embedding many-to-many temporal convolution with overlap-aware loss
   weighting, 31- and 61-epoch windows, and epoch-level probability aggregation
+- Validation-only signal-family ablations and P-as-Wake label-mapping
+  sensitivity analysis
 - Validation monitoring with accuracy, balanced accuracy, macro F1,
   class-specific precision/recall/F1, and confusion matrices
 - Validation error analysis across model families, participants, transition
@@ -509,14 +557,18 @@ dreamt-wearable-sleep-staging/
     03_feature_baselines.ipynb
     04_cnn_training.ipynb
     05_error_analysis.ipynb
+    06_signal_ablation.ipynb
+    07_p_as_wake_sensitivity.ipynb
   src/
     baselines.py
     data.py
     evaluate.py
     features.py
     models.py
+    p_as_wake_sensitivity.py
     plots.py
     preprocessing.py
+    signal_ablation.py
     train.py
   tests/
   results/
@@ -584,7 +636,11 @@ workflow is:
 15. Enable the guarded Stage 16 cell to train the seed-42 61-epoch-window TCN.
 16. After reviewing that run, enable the Stage 16 seed-replication cell to
     train seeds 43 and 44 and create the three-seed equal-weight ensemble.
-17. Save generated metrics, figures, summaries, and checkpoints under
+17. Run `notebooks/06_signal_ablation.ipynb` for Stage 17 validation-only
+    signal-family ablation diagnostics.
+18. Run `notebooks/07_p_as_wake_sensitivity.ipynb` for the guarded Stage 18
+    validation-only P-as-Wake sensitivity analysis.
+19. Save generated metrics, figures, summaries, and checkpoints under
     stage-specific local `results/` folders.
 
 The dataset overview notebook writes these local intermediate summaries when raw
@@ -595,6 +651,7 @@ participant files are available:
 - `data/interim/label_mapping_summary_p_as_wake.csv`
 - `data/interim/split_assignments.csv`
 - `data/interim/epoch_index.csv`
+- `results/stage18_p_as_wake_sensitivity/epoch_index_p_as_wake_train_validation.csv`
 
 The feature-baseline notebook writes these local processed feature tables when
 the raw files and epoch index are available:
@@ -602,6 +659,8 @@ the raw files and epoch index are available:
 - `data/processed/features_train.csv`
 - `data/processed/features_val.csv`
 - `data/processed/features_test.csv`
+- `results/stage18_p_as_wake_sensitivity/features/features_train.csv`
+- `results/stage18_p_as_wake_sensitivity/features/features_val.csv`
 
 The CNN training notebook and training utilities write train-only preprocessing
 metadata when local deep-learning datasets are built:
@@ -662,8 +721,8 @@ features in the group and exclude each feature's self-correlation.
 The repository includes automated tests for the reusable code in `src/`,
 including participant splitting, label mapping, epoch preprocessing, engineered
 features, PyTorch dataset shapes, CNN/CNN-GRU/fusion models, paired-input
-training utilities, checkpoint restoration, and staged experiment-summary
-writers.
+training utilities, checkpoint restoration, signal ablations, P-as-Wake
+sensitivity helpers, and staged experiment-summary writers.
 
 Run the test suite with:
 
@@ -680,12 +739,13 @@ ruff check .
 ## Limitations
 
 This repository does not include raw data, trained models, or final held-out
-test results. Stage 6 through Stage 14 report validation diagnostics for model
-development, not final benchmark claims. Final comparisons should wait until
-model choices are fixed and each selected model class is evaluated once on the
-held-out test split.
+test results. Stage 6 through Stage 18 report validation diagnostics for model
+development and sensitivity analysis, not final benchmark claims. Final
+comparisons should wait until model choices are fixed and each selected model
+class is evaluated once on the held-out test split.
 
-Known next steps include running the guarded Stage 14 experiment, selecting the
-final model families to evaluate, documenting final test-set results, and
-continuing to account for participant-level splitting, class imbalance, missing
-data, wearable signal quality, and privacy requirements.
+Known next steps include reviewing the validation-only Stage 17 and Stage 18
+diagnostics, selecting the final model/story before any held-out evaluation,
+documenting final test-set results after that freeze, and continuing to account
+for participant-level splitting, class imbalance, missing data, wearable signal
+quality, and privacy requirements.

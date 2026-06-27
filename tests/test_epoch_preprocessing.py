@@ -2,7 +2,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
-
 from src.data import EXPECTED_SIGNAL_COLUMNS, build_epoch_index
 from src.preprocessing import (
     apply_epoch_inclusion_rules,
@@ -133,6 +132,18 @@ def test_validate_epoch_labels_handles_mixed_valid_and_missing_labels():
     assert label_info["raw_label"] == "<MISSING>|W"
 
 
+def test_validate_epoch_labels_can_map_preparation_to_wake():
+    df = _participant_frame(["P", "P", "P"])
+
+    primary_label_info = validate_epoch_labels(df)
+    sensitivity_label_info = validate_epoch_labels(df, p_as_wake=True)
+
+    assert primary_label_info["is_valid_label"] is False
+    assert primary_label_info["mapped_label"] is None
+    assert sensitivity_label_info["is_valid_label"] is True
+    assert sensitivity_label_info["mapped_label"] == "Wake"
+
+
 def test_compute_epoch_missingness_handles_known_and_missing_signal_columns():
     df = _participant_frame(["REM"] * 4)
     df.loc[:1, "BVP"] = None
@@ -257,6 +268,40 @@ def test_build_epoch_index_infers_label_offset_across_chunks():
     assert set(epoch_index["epoch_start_offset_rows"]) == {3}
     assert list(epoch_index["raw_label"]) == ["W", "N2", "REM"]
     assert epoch_index["is_valid_epoch"].all()
+
+
+def test_build_epoch_index_supports_p_as_wake_and_split_filtering():
+    output_dir = _test_output_dir("test-epoch-index-p-as-wake")
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    split_path = output_dir / "split_assignments.csv"
+    output_path = output_dir / "epoch_index.csv"
+
+    _participant_frame(["P"] * 8).to_csv(raw_dir / "S001_whole_df.csv", index=False)
+    _participant_frame(["W"] * 8).to_csv(raw_dir / "S002_whole_df.csv", index=False)
+    pd.DataFrame(
+        {
+            "participant_id": ["S001", "S002"],
+            "split": ["train", "test"],
+        }
+    ).to_csv(split_path, index=False)
+
+    epoch_index = build_epoch_index(
+        raw_dir=raw_dir,
+        split_assignments_path=split_path,
+        output_path=output_path,
+        sampling_rate_hz=4,
+        epoch_length_seconds=2,
+        chunksize=3,
+        p_as_wake=True,
+        included_splits=("train", "validation"),
+    )
+
+    assert list(epoch_index["participant_id"]) == ["S001"]
+    assert list(epoch_index["split"]) == ["train"]
+    assert list(epoch_index["raw_label"]) == ["P"]
+    assert list(epoch_index["mapped_label"]) == ["Wake"]
+    assert bool(epoch_index.loc[0, "is_valid_epoch"]) is True
 
 
 def test_build_epoch_index_requires_split_for_raw_participants():

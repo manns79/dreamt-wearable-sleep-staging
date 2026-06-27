@@ -1827,6 +1827,8 @@ def build_epoch_index(
     missingness_threshold: float = 0.20,
     pattern: str = DEFAULT_PARTICIPANT_PATTERN,
     chunksize: int | None = DEFAULT_EPOCH_INDEX_CHUNKSIZE,
+    p_as_wake: bool = False,
+    included_splits: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     """Build and save a participant-level split-aware sleep epoch index.
 
@@ -1836,7 +1838,8 @@ def build_epoch_index(
     in ``split_assignments_path`` so downstream work cannot silently create
     epochs without train/validation/test membership. Raw participant CSVs are
     streamed in chunks and limited to timestamp, label, and expected signal
-    columns.
+    columns. Set ``p_as_wake=True`` only for the documented sensitivity analysis
+    that maps preparation-stage P labels to Wake.
     """
     from src.preprocessing import (
         apply_epoch_inclusion_rules,
@@ -1857,6 +1860,11 @@ def build_epoch_index(
             strict=True,
         )
     )
+    included_split_set = (
+        {str(split).strip() for split in included_splits}
+        if included_splits is not None
+        else None
+    )
     participant_files = list_participant_csvs(raw_dir, pattern=pattern)
 
     epoch_frames: list[pd.DataFrame] = []
@@ -1867,6 +1875,8 @@ def build_epoch_index(
         split = split_lookup.get(participant_id)
         if split is None:
             participants_without_split.append(participant_id)
+            continue
+        if included_split_set is not None and split not in included_split_set:
             continue
 
         columns = _read_csv_header(file_path)
@@ -1895,6 +1905,7 @@ def build_epoch_index(
             epoch_length_seconds=epoch_length_seconds,
             signal_columns=EXPECTED_SIGNAL_COLUMNS,
             epoch_start_offset_rows=epoch_start_offset_rows,
+            p_as_wake=p_as_wake,
         )
         participant_epochs.insert(1, "split", split)
         participant_epochs = apply_epoch_inclusion_rules(
