@@ -485,6 +485,39 @@ writes artifacts under:
 - `results/stage18_p_as_wake_sensitivity/best_config.json`
 - `results/stage18_p_as_wake_sensitivity/runs/p_as_wake_stage14_sqrt_weighted/`
 
+## Transition-Regularization Ablation
+
+Stage 19 is implemented in `notebooks/08_transition_regularization.ipynb`, with
+reusable helpers in `src/transition_regularization.py`. It estimates a
+train-label transition matrix from training epochs only, converts the smoothed
+transition probabilities into a zero-diagonal cost matrix, and trains the
+Stage 16 61-epoch frozen-embedding TCN with an added adjacent-probability
+transition penalty. The existing Stage 16 three-seed ensemble is reused as the
+`lambda_transition = 0.0` baseline rather than retrained.
+
+The guarded run trains the nonzero lambda grid `0.001`, `0.01`, and `0.05`
+across seeds 42, 43, and 44, then creates one equal-weight validation ensemble
+per lambda. Transition counts are built from full training epoch indexes, not
+sliding windows, and transitions are counted only within participants across
+consecutive epoch IDs. Validation and held-out test labels are not used to
+construct the transition cost matrix.
+
+When run locally, Stage 19 writes artifacts under:
+
+- `results/stage19_transition_regularization/transition_counts_train.csv`
+- `results/stage19_transition_regularization/transition_probabilities_train.csv`
+- `results/stage19_transition_regularization/transition_cost_matrix.csv`
+- `results/stage19_transition_regularization/lambda_0_0/`
+- `results/stage19_transition_regularization/lambda_<value>/seed_<seed>/`
+- `results/stage19_transition_regularization/lambda_<value>/ensemble_validation_metrics.csv`
+- `results/stage19_transition_regularization/lambda_<value>/ensemble_validation_epoch_predictions.csv`
+- `results/stage19_transition_regularization/lambda_<value>/validation_predicted_transition_matrix.csv`
+- `results/stage19_transition_regularization/lambda_<value>/validation_true_transition_matrix.csv`
+- `results/stage19_transition_regularization/experiment_summary.csv`
+- `results/stage19_transition_regularization/baseline_comparison.csv`
+- `results/stage19_transition_regularization/all_history.csv`
+- `results/stage19_transition_regularization/best_config.json`
+
 ## Validation Error Analysis
 
 Stage 13 is implemented in `notebooks/05_error_analysis.ipynb`, with reusable
@@ -534,6 +567,8 @@ Implemented methods include:
   weighting, 31- and 61-epoch windows, and epoch-level probability aggregation
 - Validation-only signal-family ablations and P-as-Wake label-mapping
   sensitivity analysis
+- Train-label transition regularization as a validation-only Stage 16 ensemble
+  ablation
 - Validation monitoring with accuracy, balanced accuracy, macro F1,
   class-specific precision/recall/F1, and confusion matrices
 - Validation error analysis across model families, participants, transition
@@ -559,6 +594,7 @@ dreamt-wearable-sleep-staging/
     05_error_analysis.ipynb
     06_signal_ablation.ipynb
     07_p_as_wake_sensitivity.ipynb
+    08_transition_regularization.ipynb
   src/
     baselines.py
     data.py
@@ -640,7 +676,9 @@ workflow is:
     signal-family ablation diagnostics.
 18. Run `notebooks/07_p_as_wake_sensitivity.ipynb` for the guarded Stage 18
     validation-only P-as-Wake sensitivity analysis.
-19. Save generated metrics, figures, summaries, and checkpoints under
+19. Run `notebooks/08_transition_regularization.ipynb` for the guarded Stage 19
+    transition-regularization lambda/seed ablation.
+20. Save generated metrics, figures, summaries, and checkpoints under
     stage-specific local `results/` folders.
 
 The dataset overview notebook writes these local intermediate summaries when raw

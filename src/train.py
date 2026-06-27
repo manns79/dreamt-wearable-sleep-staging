@@ -118,6 +118,10 @@ class TrainConfig:
     tcn_hidden_channels: int = 96
     tcn_kernel_size: int = 3
     tcn_dilations: Sequence[int] = (1, 2, 4, 8)
+    transition_regularization_weight: float = 0.0
+    transition_cost_matrix_path: str | Path | None = None
+    transition_smoothing_alpha: float = 1.0
+    transition_cost_normalize: bool = True
     max_grad_norm: float | None = None
     patience: int = 5
     min_delta: float = 0.0
@@ -495,6 +499,18 @@ def _validate_training_config(config: TrainConfig) -> None:
         int(dilation) <= 0 for dilation in config.tcn_dilations
     ):
         raise ValueError("tcn_dilations must contain positive values.")
+    if config.transition_regularization_weight < 0:
+        raise ValueError("transition_regularization_weight must be non-negative.")
+    if config.transition_smoothing_alpha <= 0:
+        raise ValueError("transition_smoothing_alpha must be positive.")
+    if (
+        config.transition_regularization_weight > 0
+        and config.transition_cost_matrix_path is None
+    ):
+        raise ValueError(
+            "transition_cost_matrix_path is required when "
+            "transition_regularization_weight > 0."
+        )
     if _uses_fusion_model(config):
         if config.context_radius != 0 or config.sequence_length != 1:
             raise ValueError(
@@ -1416,6 +1432,29 @@ def _classification_loss(
     return loss, float(denominator.detach().cpu().item())
 
 
+def _load_transition_cost_matrix(config: TrainConfig, device: Any) -> Any | None:
+    """Load the optional transition cost matrix for many-to-many training."""
+
+    if config.transition_regularization_weight <= 0:
+        return None
+    if config.transition_cost_matrix_path is None:
+        raise ValueError("transition_cost_matrix_path is required.")
+
+    torch = _require_torch()
+    matrix = pd.read_csv(config.transition_cost_matrix_path, index_col=0)
+    matrix = matrix.reindex(index=TARGET_LABELS, columns=TARGET_LABELS)
+    if matrix.isna().any().any():
+        raise ValueError(
+            "transition cost matrix must contain every target label in "
+            f"{TARGET_LABELS}."
+        )
+    return torch.as_tensor(
+        matrix.to_numpy(dtype=np.float32),
+        dtype=torch.float32,
+        device=device,
+    )
+
+
 def train_one_epoch(
     model: Any,
     dataloader: Any,
@@ -1423,13 +1462,21 @@ def train_one_epoch(
     optimizer: Any,
     device: Any,
     max_grad_norm: float | None = None,
-) -> float:
+    transition_cost_matrix: Any | None = None,
+    transition_regularization_weight: float = 0.0,
+    return_components: bool = False,
+) -> float | dict[str, float]:
     """Train for one epoch and return mean loss."""
 
     model.train()
     total_loss = 0.0
+    total_ce_loss = 0.0
+    total_transition_loss = 0.0
     total_examples = 0
     paired_input = bool(getattr(model, "expects_paired_input", False))
+    use_transition_regularization = (
+        transition_cost_matrix is not None and transition_regularization_weight > 0
+    )
 
     for batch in dataloader:
         x_batch, y_batch, sample_weight_batch = _unpack_training_batch(
@@ -1449,6 +1496,28 @@ def train_one_epoch(
             criterion,
             sample_weight_batch=sample_weight_batch,
         )
+        ce_loss = loss
+        transition_loss = None
+        if use_transition_regularization:
+            if y_batch.ndim != 2:
+                raise ValueError(
+                    "Transition regularization requires many-to-many targets."
+                )
+            from src.transition_regularization import transition_regularization_loss
+
+            mask = (
+                sample_weight_batch > 0
+                if sample_weight_batch is not None
+                else None
+            )
+            transition_loss = transition_regularization_loss(
+                logits,
+                transition_cost_matrix,
+                mask=mask,
+            )
+            loss = ce_loss + (
+                float(transition_regularization_weight) * transition_loss
+            )
         loss.backward()
         if max_grad_norm is not None:
             _require_torch().nn.utils.clip_grad_norm_(
@@ -1458,11 +1527,23 @@ def train_one_epoch(
         optimizer.step()
 
         total_loss += float(loss.item()) * batch_denominator
+        total_ce_loss += float(ce_loss.item()) * batch_denominator
+        if transition_loss is not None:
+            total_transition_loss += (
+                float(transition_loss.item()) * batch_denominator
+            )
         total_examples += batch_denominator
 
     if total_examples == 0:
         raise ValueError("Cannot train on an empty dataloader.")
-    return total_loss / total_examples
+    losses = {
+        "loss": total_loss / total_examples,
+        "ce_loss": total_ce_loss / total_examples,
+        "transition_loss": total_transition_loss / total_examples,
+    }
+    if return_components:
+        return losses
+    return losses["loss"]
 
 
 def _safe_label_name(label: str) -> str:
@@ -2250,6 +2331,8 @@ def train_model(
     model = model.to(device)
 
     criterion = build_loss_function(train_loader, config, device)
+    transition_cost_matrix = _load_transition_cost_matrix(config, device)
+    use_transition_regularization = transition_cost_matrix is not None
     eval_reduction = "none" if config.sequence_label_mode == "many_to_many" else "mean"
     eval_criterion = torch.nn.CrossEntropyLoss(reduction=eval_reduction)
     train_eval_loader = _evaluation_loader_from_training_loader(train_loader)
@@ -2279,14 +2362,27 @@ def train_model(
         epoch_start_time = time.perf_counter()
         train_cache_start = _participant_cache_load_count_from_loader(train_loader)
         train_start_time = time.perf_counter()
-        train_objective_loss = train_one_epoch(
+        train_epoch_loss = train_one_epoch(
             model,
             train_loader,
             criterion,
             optimizer,
             device,
             max_grad_norm=config.max_grad_norm,
+            transition_cost_matrix=transition_cost_matrix,
+            transition_regularization_weight=(
+                config.transition_regularization_weight
+            ),
+            return_components=use_transition_regularization,
         )
+        if isinstance(train_epoch_loss, Mapping):
+            train_objective_loss = float(train_epoch_loss["loss"])
+            train_ce_loss = float(train_epoch_loss["ce_loss"])
+            train_transition_loss = float(train_epoch_loss["transition_loss"])
+        else:
+            train_objective_loss = float(train_epoch_loss)
+            train_ce_loss = train_objective_loss
+            train_transition_loss = 0.0
         train_seconds = time.perf_counter() - train_start_time
         train_cache_loads = (
             _participant_cache_load_count_from_loader(train_loader)
@@ -2367,6 +2463,8 @@ def train_model(
             "validation_cache_loads": validation_cache_loads,
             "train_loss": train_loss,
             "train_objective_loss": train_objective_loss,
+            "train_ce_loss": train_ce_loss,
+            "train_transition_loss": train_transition_loss,
             "validation_loss": validation_loss,
             **_prefix_metric_keys(train_metrics, "train"),
             **validation_metrics,
