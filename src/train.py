@@ -870,7 +870,6 @@ def export_stage15_frozen_embeddings(
 ) -> dict[str, Path]:
     """Cache fused epoch embeddings from a frozen Stage 14 checkpoint."""
 
-    torch = _require_torch()
     _validate_training_config(config)
     if not _uses_temporal_fusion_tcn(config):
         raise ValueError("Embedding export requires a temporal_fusion_tcn config.")
@@ -886,6 +885,7 @@ def export_stage15_frozen_embeddings(
     if not overwrite and _stage15_embedding_cache_matches(config, splits=split_names):
         return paths
 
+    torch = _require_torch()
     source_config = _stage15_source_encoder_config(config)
     if split_names == ["train", "validation"]:
         datasets = build_train_validation_datasets(source_config)

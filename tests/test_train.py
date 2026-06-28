@@ -13,6 +13,7 @@ from src.train import (  # noqa: E402
     TrainConfig,
     TrainingResult,
     _new_model_for_config,
+    _stage15_embedding_signature,
     build_loss_function,
     build_stage9_screening_configs,
     build_stage10_comparison_configs,
@@ -1490,6 +1491,58 @@ def test_export_stage15_frozen_embeddings_writes_aligned_cache(
         datasets["train"].epoch_index["participant_id"]
     )
     assert paths["manifest"].exists()
+
+
+def test_export_stage15_frozen_embeddings_reuses_cache_before_torch(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint_path = tmp_path / "stage14_best.pt"
+    checkpoint_path.write_bytes(b"checkpoint")
+    embedding_dir = tmp_path / "embeddings"
+    embedding_dir.mkdir()
+    config = TrainConfig(
+        model_type="temporal_fusion_tcn",
+        stage15_encoder_checkpoint_path=checkpoint_path,
+        stage15_embedding_dir=embedding_dir,
+        stage15_embedding_dim=4,
+        sequence_length=3,
+        sequence_label_mode="many_to_many",
+        sequence_loss_weighting="inverse_epoch_coverage",
+        sequence_aggregation="center_weighted",
+    )
+    np.save(embedding_dir / "train_embeddings.npy", np.zeros((2, 4), dtype=np.float32))
+    np.save(
+        embedding_dir / "validation_embeddings.npy",
+        np.zeros((1, 4), dtype=np.float32),
+    )
+    pd.DataFrame(
+        {
+            "participant_id": ["S001", "S001"],
+            "epoch_id": [0, 1],
+            "split": ["train", "train"],
+            "mapped_label": ["Wake", "Non-REM"],
+        }
+    ).to_csv(embedding_dir / "train_epoch_index.csv", index=False)
+    pd.DataFrame(
+        {
+            "participant_id": ["S002"],
+            "epoch_id": [0],
+            "split": ["validation"],
+            "mapped_label": ["REM"],
+        }
+    ).to_csv(embedding_dir / "validation_epoch_index.csv", index=False)
+    with (embedding_dir / "manifest.json").open("w", encoding="utf-8") as file:
+        json.dump({"signature": _stage15_embedding_signature(config)}, file)
+
+    def fail_if_torch_is_required():
+        raise AssertionError("valid embedding cache should be returned before torch")
+
+    monkeypatch.setattr("src.train._require_torch", fail_if_torch_is_required)
+
+    paths = export_stage15_frozen_embeddings(config)
+
+    assert paths["train_index"] == embedding_dir / "train_epoch_index.csv"
 
 
 def test_run_stage15_experiment_writes_aggregation_summary(
