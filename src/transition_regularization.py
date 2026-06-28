@@ -17,7 +17,7 @@ DEFAULT_STAGE19_OUTPUT_DIR = Path("results/stage19_transition_regularization")
 DEFAULT_STAGE16_REPLICATION_OUTPUT_DIR = Path(
     "results/stage16_temporal_fusion_tcn_s61_seed_replication"
 )
-STAGE19_LAMBDAS = (0.001, 0.01, 0.05)
+STAGE19_LAMBDAS = (0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0)
 STAGE19_SEEDS = (42, 43, 44)
 WAKE_TO_REM = ("Wake", "REM")
 
@@ -414,6 +414,32 @@ def _load_baseline_row(
     return metrics, predictions
 
 
+def _load_completed_stage19_ensemble(
+    output_dir: str | Path,
+) -> dict[str, Any] | None:
+    """Load an existing Stage 19 ensemble without rewriting its artifacts."""
+
+    output_path = Path(output_dir)
+    metrics_path = output_path / "ensemble_validation_metrics.csv"
+    predictions_path = output_path / "ensemble_validation_epoch_predictions.csv"
+    if not metrics_path.exists() or not predictions_path.exists():
+        return None
+
+    metrics = pd.read_csv(metrics_path).iloc[0].to_dict()
+    predictions = pd.read_csv(predictions_path, dtype={"participant_id": str})
+    transition_summary_path = output_path / "validation_transition_summary.json"
+    if transition_summary_path.exists():
+        with transition_summary_path.open("r", encoding="utf-8") as file:
+            transition_summary = json.load(file)
+    else:
+        transition_summary = prediction_transition_diagnostics(predictions)["summary"]
+    return {
+        "metrics": metrics,
+        "predictions": predictions,
+        "transition_summary": transition_summary,
+    }
+
+
 def _transition_config_signature(config: Any) -> dict[str, Any]:
     from src.train import config_to_dict
 
@@ -604,18 +630,25 @@ def run_stage19_transition_regularization(
     baseline_metrics, baseline_predictions = _load_baseline_row(stage16_replication_dir)
     baseline_dir = stage_dir / "lambda_0_0"
     baseline_dir.mkdir(parents=True, exist_ok=True)
-    baseline_predictions.to_csv(
-        baseline_dir / "ensemble_validation_epoch_predictions.csv",
-        index=False,
+    completed_baseline = (
+        _load_completed_stage19_ensemble(baseline_dir) if skip_completed else None
     )
-    pd.DataFrame([baseline_metrics]).to_csv(
-        baseline_dir / "ensemble_validation_metrics.csv",
-        index=False,
-    )
-    baseline_transition_summary = save_prediction_transition_diagnostics(
-        baseline_predictions,
-        baseline_dir,
-    )
+    if completed_baseline is None:
+        baseline_predictions.to_csv(
+            baseline_dir / "ensemble_validation_epoch_predictions.csv",
+            index=False,
+        )
+        pd.DataFrame([baseline_metrics]).to_csv(
+            baseline_dir / "ensemble_validation_metrics.csv",
+            index=False,
+        )
+        baseline_transition_summary = save_prediction_transition_diagnostics(
+            baseline_predictions,
+            baseline_dir,
+        )
+    else:
+        baseline_metrics = completed_baseline["metrics"]
+        baseline_transition_summary = completed_baseline["transition_summary"]
 
     summary_rows = [
         {
@@ -669,26 +702,34 @@ def run_stage19_transition_regularization(
                 history_frames.append(history)
 
         lambda_dir = stage_dir / f"lambda_{lambda_slug(lambda_value)}"
-        ensemble = ensemble_stage15_predictions(
-            run_dirs,
-            output_dir=lambda_dir,
-            aggregation_method=base_config.sequence_aggregation,
-            _ensemble_model_name=(
-                "stage19_transition_regularized_ensemble_"
-                f"lambda_{lambda_slug(lambda_value)}"
-            ),
+        completed_ensemble = (
+            _load_completed_stage19_ensemble(lambda_dir) if skip_completed else None
         )
-        transition_summary = save_prediction_transition_diagnostics(
-            ensemble["predictions"],
-            lambda_dir,
-        )
+        if completed_ensemble is None:
+            ensemble = ensemble_stage15_predictions(
+                run_dirs,
+                output_dir=lambda_dir,
+                aggregation_method=base_config.sequence_aggregation,
+                _ensemble_model_name=(
+                    "stage19_transition_regularized_ensemble_"
+                    f"lambda_{lambda_slug(lambda_value)}"
+                ),
+            )
+            ensemble_metrics = ensemble["metrics"]
+            transition_summary = save_prediction_transition_diagnostics(
+                ensemble["predictions"],
+                lambda_dir,
+            )
+        else:
+            ensemble_metrics = completed_ensemble["metrics"]
+            transition_summary = completed_ensemble["transition_summary"]
         row = {
             "stage": "stage19",
             "stage19_run_status": "trained",
             "model_family": "transition_regularized_frozen_stage14_tcn_s61",
             "lambda_transition": lambda_value,
             "output_dir": str(lambda_dir),
-            **ensemble["metrics"],
+            **ensemble_metrics,
             **transition_summary,
         }
         summary_rows.append(row)

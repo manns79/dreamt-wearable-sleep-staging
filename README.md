@@ -497,12 +497,15 @@ Stage 16 61-epoch frozen-embedding TCN with an added adjacent-probability
 transition penalty. The existing Stage 16 three-seed ensemble is reused as the
 `lambda_transition = 0.0` baseline rather than retrained.
 
-The guarded run trains the nonzero lambda grid `0.001`, `0.01`, and `0.05`
-across seeds 42, 43, and 44, then creates one equal-weight validation ensemble
-per lambda. Transition counts are built from full training epoch indexes, not
-sliding windows, and transitions are counted only within participants across
-consecutive epoch IDs. Validation and held-out test labels are not used to
-construct the transition cost matrix.
+The guarded run trains the nonzero lambda grid `0.001`, `0.01`, `0.05`, `0.1`,
+`0.25`, `0.5`, `0.75`, and `1.0` across seeds 42, 43, and 44, then creates one
+equal-weight validation ensemble per lambda. Completed seed runs and completed
+per-lambda ensemble artifacts are reused when `skip_completed=True`, so expanding
+the grid preserves the initial lambda results instead of retraining or rewriting
+them. Transition counts are built from full training epoch indexes, not sliding
+windows, and transitions are counted only within participants across consecutive
+epoch IDs. Validation and held-out test labels are not used to construct the
+transition cost matrix.
 
 When run locally, Stage 19 writes artifacts under:
 
