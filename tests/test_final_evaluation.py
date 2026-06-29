@@ -2,6 +2,8 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+
+import src.final_evaluation as final_evaluation
 from src.final_evaluation import (
     FINAL_TEST_GUARD_MESSAGE,
     assert_final_registry_ready,
@@ -10,6 +12,7 @@ from src.final_evaluation import (
     duration_error_summary,
     ensemble_prediction_tables,
     freeze_candidate_registry,
+    materialize_final_candidate_predictions,
     participant_duration_errors,
     participant_macro_f1,
     run_final_test_evaluation,
@@ -195,3 +198,215 @@ def test_candidate_registry_marks_missing_stage19_as_pending(tmp_path):
         registry["candidate_id"] == "stage19_best_equal_weight_seed_ensemble"
     ].iloc[0]
     assert stage19["status"] == "pending_stage19"
+
+
+def test_materialize_final_candidate_predictions_writes_stage6_candidate_files(
+    monkeypatch,
+    tmp_path,
+):
+    registry = pd.DataFrame(
+        {
+            "candidate_id": ["stage6_majority_class"],
+            "stage": ["stage6"],
+            "model_class": ["majority_class"],
+            "model_family": ["sanity_baseline"],
+            "model_name": ["majority_class"],
+            "selection_rule": ["included baseline"],
+            "validation_macro_f1": [0.2],
+            "status": ["ready"],
+            "validation_artifact_path": ["validation.csv"],
+            "test_artifact_path": [None],
+            "notes": [""],
+        }
+    )
+    calls = []
+
+    def fake_stage6_builder(**kwargs):
+        calls.append(kwargs["split"])
+        return {
+            "majority_class": _prediction_frame(
+                model_name="raw_majority",
+                split=kwargs["split"],
+            )
+        }
+
+    monkeypatch.setattr(
+        final_evaluation,
+        "build_stage6_prediction_tables_for_split",
+        fake_stage6_builder,
+    )
+
+    manifest = materialize_final_candidate_predictions(
+        registry,
+        results_dir=tmp_path / "results",
+        output_dir=tmp_path / "predictions",
+        run_final_test=True,
+    )
+
+    validation_path = tmp_path / "predictions" / (
+        "validation_predictions_stage6_majority_class.csv"
+    )
+    test_path = tmp_path / "predictions" / "test_predictions_stage6_majority_class.csv"
+    assert calls == ["validation", "test"]
+    assert set(manifest["split"]) == {"validation", "test"}
+    assert validation_path.exists()
+    assert test_path.exists()
+    written = pd.read_csv(test_path)
+    assert set(written["model_name"]) == {"majority_class"}
+    assert set(written["split"]) == {"test"}
+
+
+def test_materialize_final_candidate_predictions_exports_single_checkpoint(
+    monkeypatch,
+    tmp_path,
+):
+    results_dir = tmp_path / "results"
+    run_dir = results_dir / "stage9_training_choices" / "runs" / "best"
+    run_dir.mkdir(parents=True)
+    _prediction_frame(model_name="raw_model").to_csv(
+        run_dir / "validation_epoch_predictions.csv",
+        index=False,
+    )
+    summary_path = results_dir / "stage9_training_choices" / "experiment_summary.csv"
+    summary_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "output_dir": [str(run_dir)],
+            "macro_f1": [0.5],
+            "balanced_accuracy": [0.5],
+            "accuracy": [0.5],
+        }
+    ).to_csv(summary_path, index=False)
+    registry = pd.DataFrame(
+        {
+            "candidate_id": ["stage9_best"],
+            "stage": ["stage9"],
+            "model_class": ["single_epoch_cnn"],
+            "model_family": ["single_epoch_cnn"],
+            "model_name": ["stage9_best_single_epoch_cnn"],
+            "selection_rule": ["best validation macro F1"],
+            "validation_macro_f1": [0.5],
+            "status": ["ready"],
+            "validation_artifact_path": [str(summary_path)],
+            "test_artifact_path": [None],
+            "notes": [""],
+        }
+    )
+
+    def fake_export(run_dir_arg, *, split, output_dir, overwrite=False, **_):
+        assert Path(run_dir_arg) == run_dir
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True)
+        prediction_path = output_path / f"{split}_epoch_predictions.csv"
+        _prediction_frame(model_name="raw_model", split=split).to_csv(
+            prediction_path,
+            index=False,
+        )
+        return {"epoch_predictions": prediction_path}
+
+    monkeypatch.setattr(
+        "src.train.export_split_predictions_from_checkpoint",
+        fake_export,
+    )
+
+    materialize_final_candidate_predictions(
+        registry,
+        results_dir=results_dir,
+        output_dir=tmp_path / "predictions",
+        run_final_test=True,
+    )
+
+    validation = pd.read_csv(
+        tmp_path / "predictions" / "validation_predictions_stage9_best.csv"
+    )
+    test = pd.read_csv(tmp_path / "predictions" / "test_predictions_stage9_best.csv")
+    assert set(validation["model_name"]) == {"stage9_best_single_epoch_cnn"}
+    assert set(test["model_name"]) == {"stage9_best_single_epoch_cnn"}
+    assert set(test["split"]) == {"test"}
+
+
+def test_materialize_final_candidate_predictions_exports_ensemble(
+    monkeypatch,
+    tmp_path,
+):
+    results_dir = tmp_path / "results"
+    ensemble_dir = results_dir / "stage19_transition_regularization" / "lambda_0_05"
+    ensemble_dir.mkdir(parents=True)
+    _prediction_frame(model_name="raw_ensemble").to_csv(
+        ensemble_dir / "ensemble_validation_epoch_predictions.csv",
+        index=False,
+    )
+    member_dirs = []
+    for seed in (42, 43):
+        member_dir = ensemble_dir / f"seed_{seed}" / "runs" / "best"
+        member_dir.mkdir(parents=True)
+        member_dirs.append(member_dir)
+    pd.DataFrame(
+        {
+            "seed": [42, 43],
+            "output_dir": [str(path) for path in member_dirs],
+            "aggregation_method": ["center_weighted", "center_weighted"],
+        }
+    ).to_csv(ensemble_dir / "seed_member_metrics.csv", index=False)
+    summary_path = results_dir / "stage19_transition_regularization" / (
+        "experiment_summary.csv"
+    )
+    pd.DataFrame(
+        {
+            "output_dir": [str(ensemble_dir)],
+            "lambda_transition": [0.05],
+            "macro_f1": [0.5],
+            "balanced_accuracy": [0.5],
+            "accuracy": [0.5],
+        }
+    ).to_csv(summary_path, index=False)
+    registry = pd.DataFrame(
+        {
+            "candidate_id": ["stage19_best_equal_weight_seed_ensemble"],
+            "stage": ["stage19"],
+            "model_class": ["transition_regularized_frozen_stage14_tcn_s61"],
+            "model_family": ["transition_regularized_frozen_stage14_tcn_s61"],
+            "model_name": ["stage19_best_equal_weight_seed_ensemble_lambda_0.05"],
+            "selection_rule": ["best validation macro F1"],
+            "validation_macro_f1": [0.5],
+            "status": ["ready"],
+            "validation_artifact_path": [str(summary_path)],
+            "test_artifact_path": [None],
+            "notes": [""],
+        }
+    )
+
+    def fake_export(run_dir_arg, *, split, output_dir, overwrite=False, **_):
+        assert Path(run_dir_arg) in member_dirs
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True)
+        prediction_path = (
+            output_path / f"{split}_aggregated_epoch_predictions_center_weighted.csv"
+        )
+        _prediction_frame(model_name="member", split=split).to_csv(
+            prediction_path,
+            index=False,
+        )
+        return {"aggregated_epoch_predictions_center_weighted": prediction_path}
+
+    monkeypatch.setattr(
+        "src.train.export_split_predictions_from_checkpoint",
+        fake_export,
+    )
+
+    materialize_final_candidate_predictions(
+        registry,
+        results_dir=results_dir,
+        output_dir=tmp_path / "predictions",
+        run_final_test=True,
+    )
+
+    test_path = tmp_path / "predictions" / (
+        "test_predictions_stage19_best_equal_weight_seed_ensemble.csv"
+    )
+    test = pd.read_csv(test_path)
+    assert test_path.exists()
+    assert set(test["model_name"]) == {
+        "stage19_best_equal_weight_seed_ensemble_lambda_0.05"
+    }
+    assert set(test["split"]) == {"test"}

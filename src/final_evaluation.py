@@ -822,6 +822,478 @@ def ensemble_prediction_files(
     return ensemble
 
 
+def _path_or_none(value: Any) -> Path | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return Path(text)
+
+
+def _candidate_prediction_path(
+    prediction_dir: Path,
+    *,
+    split: str,
+    candidate_id: str,
+) -> Path:
+    return prediction_dir / f"{split}_predictions_{_safe_name(candidate_id)}.csv"
+
+
+def _write_candidate_prediction_table(
+    table: pd.DataFrame,
+    destination: Path,
+    *,
+    candidate: Mapping[str, Any],
+    split: str,
+    overwrite: bool,
+) -> Path:
+    if destination.exists() and not overwrite:
+        return destination
+    frame = table.copy()
+    frame["split"] = split
+    normalized = normalize_prediction_frame(
+        frame,
+        model_name=str(candidate["model_name"]),
+        model_family=str(candidate["model_family"]),
+        stage=str(candidate["stage"]),
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    normalized.to_csv(destination, index=False)
+    return destination
+
+
+def _load_candidate_prediction_source(
+    source_path: str | Path,
+    destination: Path,
+    *,
+    candidate: Mapping[str, Any],
+    split: str,
+    overwrite: bool,
+) -> Path:
+    source = Path(source_path)
+    if not source.exists():
+        raise FileNotFoundError(f"Prediction source does not exist: {source}")
+    table = pd.read_csv(source, dtype={"participant_id": str})
+    return _write_candidate_prediction_table(
+        table,
+        destination,
+        candidate=candidate,
+        split=split,
+        overwrite=overwrite,
+    )
+
+
+def _best_registry_summary_row(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    artifact_path = _path_or_none(candidate.get("validation_artifact_path"))
+    if artifact_path is None:
+        raise ValueError(
+            f"Candidate {candidate['candidate_id']} has no validation artifact path."
+        )
+    row = _best_summary_row(artifact_path)
+    if row is None:
+        raise FileNotFoundError(
+            f"Could not load selected summary row for {candidate['candidate_id']} "
+            f"from {artifact_path}"
+        )
+    return row
+
+
+def _prediction_path_from_run_dir(
+    run_dir: str | Path,
+    *,
+    split: str,
+    aggregation_method: str | None = None,
+) -> Path:
+    run_path = Path(run_dir)
+    candidates = []
+    if aggregation_method:
+        candidates.append(
+            run_path / f"{split}_aggregated_epoch_predictions_{aggregation_method}.csv"
+        )
+    candidates.append(run_path / f"{split}_epoch_predictions.csv")
+    candidates.extend(
+        sorted(run_path.glob(f"{split}_aggregated_epoch_predictions_*.csv"))
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f"No {split} prediction artifact found in {run_path}."
+    )
+
+
+def _prediction_path_from_export(
+    written: Mapping[str, Path],
+    *,
+    split: str,
+    aggregation_method: str | None = None,
+) -> Path:
+    if aggregation_method:
+        key = f"aggregated_epoch_predictions_{aggregation_method}"
+        if key in written:
+            return Path(written[key])
+    if "epoch_predictions" in written:
+        return Path(written["epoch_predictions"])
+    aggregated = sorted(
+        Path(path)
+        for key, path in written.items()
+        if key.startswith("aggregated_epoch_predictions_")
+    )
+    if aggregated:
+        return aggregated[0]
+    raise ValueError(f"Checkpoint export did not write {split} epoch predictions.")
+
+
+def _materialize_stage6_candidate_predictions(
+    candidates: pd.DataFrame,
+    *,
+    prediction_dir: Path,
+    split: str,
+    results_dir: Path,
+    overwrite: bool,
+    include_xgboost: bool,
+) -> list[dict[str, Any]]:
+    from src.data import DEFAULT_TEST_FEATURES_PATH, DEFAULT_VALIDATION_FEATURES_PATH
+
+    existing_rows = []
+    for _, candidate in candidates.iterrows():
+        destination = _candidate_prediction_path(
+            prediction_dir,
+            split=split,
+            candidate_id=str(candidate["candidate_id"]),
+        )
+        if destination.exists() and not overwrite:
+            existing_rows.append(
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "split": split,
+                    "status": "already_available",
+                    "path": str(destination),
+                    "source_path": "stage6_refit_from_train_features",
+                }
+            )
+    if len(existing_rows) == len(candidates):
+        return existing_rows
+
+    split_feature_path = (
+        DEFAULT_VALIDATION_FEATURES_PATH
+        if split == "validation"
+        else DEFAULT_TEST_FEATURES_PATH
+    )
+    output_dir = prediction_dir / "_stage6_exports" / split
+    tables = build_stage6_prediction_tables_for_split(
+        train_features_path=(
+            results_dir.parent / "data" / "processed" / "features_train.csv"
+        ),
+        split_features_path=results_dir.parent / split_feature_path,
+        split=split,
+        output_dir=output_dir,
+        include_xgboost=include_xgboost,
+    )
+    rows: list[dict[str, Any]] = []
+    for _, candidate in candidates.iterrows():
+        model_name = str(candidate["model_name"])
+        if model_name not in tables:
+            raise FileNotFoundError(
+                f"Stage 6 predictions were not produced for {model_name}."
+            )
+        destination = _candidate_prediction_path(
+            prediction_dir,
+            split=split,
+            candidate_id=str(candidate["candidate_id"]),
+        )
+        path = _write_candidate_prediction_table(
+            tables[model_name],
+            destination,
+            candidate=candidate,
+            split=split,
+            overwrite=overwrite,
+        )
+        rows.append(
+            {
+                "candidate_id": candidate["candidate_id"],
+                "split": split,
+                "status": "materialized",
+                "path": str(path),
+                "source_path": "stage6_refit_from_train_features",
+            }
+        )
+    return rows
+
+
+def _ensemble_prediction_source_dir(
+    candidate: Mapping[str, Any],
+    *,
+    results_dir: Path,
+) -> Path:
+    stage = str(candidate["stage"])
+    if stage in {"stage15", "stage16"}:
+        metrics_path = _path_or_none(candidate.get("validation_artifact_path"))
+        if metrics_path is None:
+            raise ValueError(
+                f"Candidate {candidate['candidate_id']} has no ensemble metrics path."
+            )
+        return metrics_path.parent
+    if stage == "stage19":
+        row = _best_registry_summary_row(candidate)
+        output_dir = _path_or_none(row.get("output_dir"))
+        if output_dir is None:
+            raise ValueError("Stage 19 selected row does not contain output_dir.")
+        return output_dir
+    raise ValueError(f"Candidate {candidate['candidate_id']} is not an ensemble.")
+
+
+def _materialize_ensemble_candidate_predictions(
+    candidate: Mapping[str, Any],
+    *,
+    prediction_dir: Path,
+    split: str,
+    results_dir: Path,
+    overwrite: bool,
+) -> dict[str, Any]:
+    destination = _candidate_prediction_path(
+        prediction_dir,
+        split=split,
+        candidate_id=str(candidate["candidate_id"]),
+    )
+    ensemble_dir = _ensemble_prediction_source_dir(candidate, results_dir=results_dir)
+    if split == "validation":
+        source = ensemble_dir / "ensemble_validation_epoch_predictions.csv"
+        path = _load_candidate_prediction_source(
+            source,
+            destination,
+            candidate=candidate,
+            split=split,
+            overwrite=overwrite,
+        )
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "split": split,
+            "status": "materialized",
+            "path": str(path),
+            "source_path": str(source),
+        }
+
+    if destination.exists() and not overwrite:
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "split": split,
+            "status": "already_available",
+            "path": str(destination),
+            "source_path": str(ensemble_dir),
+        }
+
+    member_metrics_path = ensemble_dir / "seed_member_metrics.csv"
+    if not member_metrics_path.exists():
+        raise FileNotFoundError(
+            f"Ensemble member metrics do not exist: {member_metrics_path}"
+        )
+    member_metrics = pd.read_csv(member_metrics_path)
+    required_columns = {"seed", "output_dir", "aggregation_method"}
+    missing_columns = sorted(required_columns - set(member_metrics.columns))
+    if missing_columns:
+        raise ValueError(
+            f"Ensemble member metrics are missing column(s): {missing_columns}"
+        )
+
+    from src.train import export_split_predictions_from_checkpoint
+
+    member_paths = []
+    for _, member in member_metrics.sort_values("seed").iterrows():
+        run_dir = Path(str(member["output_dir"]))
+        aggregation_method = str(member["aggregation_method"])
+        member_output_dir = (
+            prediction_dir
+            / "_checkpoint_exports"
+            / str(candidate["candidate_id"])
+            / split
+            / f"seed_{int(member['seed'])}"
+        )
+        written = export_split_predictions_from_checkpoint(
+            run_dir,
+            split=split,
+            output_dir=member_output_dir,
+            overwrite=overwrite,
+        )
+        member_paths.append(
+            _prediction_path_from_export(
+                written,
+                split=split,
+                aggregation_method=aggregation_method,
+            )
+        )
+
+    ensemble_prediction_files(
+        member_paths,
+        model_name=str(candidate["model_name"]),
+        model_family=str(candidate["model_family"]),
+        stage=str(candidate["stage"]),
+        split=split,
+        output_path=destination,
+    )
+    return {
+        "candidate_id": candidate["candidate_id"],
+        "split": split,
+        "status": "materialized",
+        "path": str(destination),
+        "source_path": str(ensemble_dir),
+    }
+
+
+def _materialize_single_checkpoint_candidate_predictions(
+    candidate: Mapping[str, Any],
+    *,
+    prediction_dir: Path,
+    split: str,
+    overwrite: bool,
+) -> dict[str, Any]:
+    destination = _candidate_prediction_path(
+        prediction_dir,
+        split=split,
+        candidate_id=str(candidate["candidate_id"]),
+    )
+    summary_row = _best_registry_summary_row(candidate)
+    run_dir = _path_or_none(summary_row.get("output_dir"))
+    if run_dir is None:
+        raise ValueError(
+            f"Selected row for {candidate['candidate_id']} does not contain output_dir."
+        )
+    aggregation_method = (
+        str(summary_row["aggregation_method"])
+        if "aggregation_method" in summary_row
+        and pd.notna(summary_row["aggregation_method"])
+        else None
+    )
+
+    if split == "validation":
+        source = _prediction_path_from_run_dir(
+            run_dir,
+            split=split,
+            aggregation_method=aggregation_method,
+        )
+        path = _load_candidate_prediction_source(
+            source,
+            destination,
+            candidate=candidate,
+            split=split,
+            overwrite=overwrite,
+        )
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "split": split,
+            "status": "materialized",
+            "path": str(path),
+            "source_path": str(source),
+        }
+
+    if destination.exists() and not overwrite:
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "split": split,
+            "status": "already_available",
+            "path": str(destination),
+            "source_path": str(run_dir),
+        }
+
+    from src.train import export_split_predictions_from_checkpoint
+
+    export_dir = (
+        prediction_dir
+        / "_checkpoint_exports"
+        / str(candidate["candidate_id"])
+        / split
+    )
+    written = export_split_predictions_from_checkpoint(
+        run_dir,
+        split=split,
+        output_dir=export_dir,
+        overwrite=overwrite,
+    )
+    source = _prediction_path_from_export(
+        written,
+        split=split,
+        aggregation_method=aggregation_method,
+    )
+    path = _load_candidate_prediction_source(
+        source,
+        destination,
+        candidate=candidate,
+        split=split,
+        overwrite=True,
+    )
+    return {
+        "candidate_id": candidate["candidate_id"],
+        "split": split,
+        "status": "materialized",
+        "path": str(path),
+        "source_path": str(source),
+    }
+
+
+def materialize_final_candidate_predictions(
+    registry: pd.DataFrame,
+    *,
+    results_dir: str | Path = DEFAULT_RESULTS_DIR,
+    output_dir: str | Path = DEFAULT_STAGE20_OUTPUT_DIR / "predictions",
+    run_final_test: bool = False,
+    overwrite: bool = False,
+    include_xgboost: bool = True,
+) -> pd.DataFrame:
+    """Write Stage 20 validation/test prediction CSVs for frozen candidates.
+
+    Validation predictions are copied or rebuilt from validation-only artifacts.
+    Held-out test predictions are exported only when ``run_final_test`` is true.
+    """
+
+    assert_final_registry_ready(registry)
+    root = Path(results_dir)
+    prediction_dir = Path(output_dir)
+    prediction_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict[str, Any]] = []
+    splits = ["validation", *(["test"] if run_final_test else [])]
+    for split in splits:
+        stage6 = registry[registry["stage"] == "stage6"]
+        if not stage6.empty:
+            rows.extend(
+                _materialize_stage6_candidate_predictions(
+                    stage6,
+                    prediction_dir=prediction_dir,
+                    split=split,
+                    results_dir=root,
+                    overwrite=overwrite,
+                    include_xgboost=include_xgboost,
+                )
+            )
+
+        for _, candidate in registry[registry["stage"] != "stage6"].iterrows():
+            candidate_id = str(candidate["candidate_id"])
+            if "ensemble" in candidate_id:
+                row = _materialize_ensemble_candidate_predictions(
+                    candidate,
+                    prediction_dir=prediction_dir,
+                    split=split,
+                    results_dir=root,
+                    overwrite=overwrite,
+                )
+            else:
+                row = _materialize_single_checkpoint_candidate_predictions(
+                    candidate,
+                    prediction_dir=prediction_dir,
+                    split=split,
+                    overwrite=overwrite,
+                )
+            rows.append(row)
+
+    manifest = pd.DataFrame(rows)
+    manifest.to_csv(
+        prediction_dir / "prediction_materialization_manifest.csv",
+        index=False,
+    )
+    return manifest
+
+
 def _ensure_figure_dir(output_dir: str | Path) -> Path:
     figure_dir = Path(output_dir) / "figures"
     figure_dir.mkdir(parents=True, exist_ok=True)
