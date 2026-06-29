@@ -41,6 +41,13 @@ The project uses the DREAMT dataset, which contains wearable physiological signa
 
 Local data files should be placed under `data/raw/`, while intermediate and processed modeling files should remain in local-only data folders. `data/README.md` documents the expected local data products in more detail.
 
+For boot-camp review and reproducibility without DREAMT access, this repository
+includes a small synthetic DREAMT-compatible sample under `data/synthetic/`.
+These files are not real participant records. They use the expected 64 Hz CSV
+schema and contain four synthetic participants, each with 31 valid 30-second
+epochs, so the preprocessing, feature extraction, and PyTorch dataset utilities
+can be smoke-tested after copying them into a local `data/raw/` directory.
+
 ## Prediction Task
 
 The target task is three-class sleep staging:
@@ -727,6 +734,35 @@ workflow is:
     final test-evaluation cell only once the registry is frozen.
 21. Save generated metrics, figures, summaries, and checkpoints under
     stage-specific local `results/` folders.
+
+### Synthetic Data Smoke Run
+
+The committed synthetic sample lives in `data/synthetic/` so it remains clearly
+separate from local raw DREAMT data. To run the code against the synthetic
+sample, copy those CSVs into your ignored local raw-data folder:
+
+```bash
+mkdir -p data/raw data/interim
+cp data/synthetic/S*_whole_df.csv data/raw/
+```
+
+Then create a small participant split for the synthetic IDs:
+
+```bash
+cat > data/interim/split_assignments.csv <<'EOF'
+participant_id,split
+S901,train
+S902,train
+S903,validation
+S904,test
+EOF
+```
+
+The default split creator is intended for the full 100-participant DREAMT
+cohort, so use the explicit split above for the synthetic sample. After that,
+the usual Stage 1 through Stage 7 preprocessing, feature, and dataset utilities
+can run against `data/raw/`. The synthetic sample is deliberately small and is
+intended for code-path smoke tests rather than meaningful model performance.
 
 The dataset overview notebook writes these local intermediate summaries when raw
 participant files are available:
