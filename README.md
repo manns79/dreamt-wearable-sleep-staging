@@ -4,7 +4,7 @@ A leakage-aware machine learning workflow for classifying PSG-derived sleep stag
 
 ## Overview
 
-This Erdos Institute Deep Learning Boot Camp project studies wearable-based sleep staging using the DREAMT dataset. The goal is to predict a three-class PSG sleep-stage label, `Wake`, `Non-REM`, or `REM`, from physiological signals recorded by a wearable device.
+This project studies wearable-based sleep staging using the DREAMT dataset. The goal is to predict a three-class PSG sleep-stage label, `Wake`, `Non-REM`, or `REM`, from physiological signals recorded by a wearable device.
 
 The project combines traditional feature-based baselines with deep learning models for raw time-series inputs. It emphasizes reproducible preprocessing, participant-level evaluation, and honest handling of final held-out test results.
 
