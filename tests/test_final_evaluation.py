@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -263,12 +264,21 @@ def test_materialize_final_candidate_predictions_exports_single_checkpoint(
     results_dir = tmp_path / "results"
     run_dir = results_dir / "stage9_training_choices" / "runs" / "best"
     run_dir.mkdir(parents=True)
+    (run_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "raw_dir": "data/raw",
+                "test_feature_path": "data/processed/features_test.csv",
+            }
+        ),
+        encoding="utf-8",
+    )
     _prediction_frame(model_name="raw_model").to_csv(
         run_dir / "validation_epoch_predictions.csv",
         index=False,
     )
     summary_path = results_dir / "stage9_training_choices" / "experiment_summary.csv"
-    summary_path.parent.mkdir(parents=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         {
             "output_dir": [str(run_dir)],
@@ -293,8 +303,21 @@ def test_materialize_final_candidate_predictions_exports_single_checkpoint(
         }
     )
 
-    def fake_export(run_dir_arg, *, split, output_dir, overwrite=False, **_):
+    def fake_export(
+        run_dir_arg,
+        *,
+        split,
+        output_dir,
+        config_path=None,
+        overwrite=False,
+        **_,
+    ):
         assert Path(run_dir_arg) == run_dir
+        assert config_path is not None
+        resolved_config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        assert resolved_config["test_feature_path"] == str(
+            tmp_path / "data" / "processed" / "features_test.csv"
+        )
         output_path = Path(output_dir)
         output_path.mkdir(parents=True)
         prediction_path = output_path / f"{split}_epoch_predictions.csv"

@@ -950,14 +950,24 @@ def _fit_cv_or_plain(
         return estimator.fit(X_train, y_train, **fit_kwargs)
 
     cv = GroupKFold(n_splits=min(5, n_groups))
-    search = GridSearchCV(
-        estimator=estimator,
-        param_grid=param_grid,
-        scoring=lambda fitted, X, y: _macro_f1(
+
+    def score_macro_f1(
+        fitted: Any,
+        X: pd.DataFrame,
+        y: pd.Series,
+        *,
+        sample_weight: np.ndarray | None = None,
+    ) -> float:
+        return _macro_f1(
             y,
             fitted.predict(X),
             labels=scoring_labels,
-        ),
+        )
+
+    search = GridSearchCV(
+        estimator=estimator,
+        param_grid=param_grid,
+        scoring=score_macro_f1,
         cv=cv,
         n_jobs=-1,
         refit=True,

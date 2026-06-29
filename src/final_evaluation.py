@@ -945,6 +945,69 @@ def _prediction_path_from_export(
     raise ValueError(f"Checkpoint export did not write {split} epoch predictions.")
 
 
+_CONFIG_PATH_KEYS = {
+    "raw_dir",
+    "epoch_index_path",
+    "preprocessing_metadata_path",
+    "output_dir",
+    "train_feature_path",
+    "validation_feature_path",
+    "test_feature_path",
+    "feature_preprocessing_metadata_path",
+    "stage15_encoder_checkpoint_path",
+    "stage15_embedding_dir",
+    "transition_cost_matrix_path",
+    "participant_array_cache_dir",
+}
+
+
+def _resolve_relative_path(value: Any, *, repo_root: Path) -> Any:
+    if value is None:
+        return value
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    path = Path(text)
+    if path.is_absolute():
+        return value
+    return str(repo_root / path)
+
+
+def _resolved_checkpoint_config_path(
+    run_dir: str | Path,
+    *,
+    prediction_dir: Path,
+    candidate_id: str,
+    repo_root: Path,
+    label: str = "single",
+) -> Path | None:
+    config_path = Path(run_dir) / "config.json"
+    if not config_path.exists():
+        return None
+
+    with config_path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Training config is not a JSON object: {config_path}")
+
+    from src.train import config_to_dict, train_config_from_mapping
+
+    resolved = config_to_dict(train_config_from_mapping(payload))
+    for key in _CONFIG_PATH_KEYS:
+        if key in resolved:
+            resolved[key] = _resolve_relative_path(
+                resolved[key],
+                repo_root=repo_root,
+            )
+
+    resolved_dir = prediction_dir / "_resolved_configs" / _safe_name(candidate_id)
+    resolved_path = resolved_dir / f"{_safe_name(label)}_config.json"
+    _save_json(resolved, resolved_path)
+    return resolved_path
+
+
 def _materialize_stage6_candidate_predictions(
     candidates: pd.DataFrame,
     *,
@@ -1050,6 +1113,7 @@ def _materialize_ensemble_candidate_predictions(
     prediction_dir: Path,
     split: str,
     results_dir: Path,
+    repo_root: Path,
     overwrite: bool,
 ) -> dict[str, Any]:
     destination = _candidate_prediction_path(
@@ -1103,16 +1167,25 @@ def _materialize_ensemble_candidate_predictions(
     for _, member in member_metrics.sort_values("seed").iterrows():
         run_dir = Path(str(member["output_dir"]))
         aggregation_method = str(member["aggregation_method"])
+        seed_label = f"seed_{int(member['seed'])}"
         member_output_dir = (
             prediction_dir
             / "_checkpoint_exports"
             / str(candidate["candidate_id"])
             / split
-            / f"seed_{int(member['seed'])}"
+            / seed_label
+        )
+        config_path = _resolved_checkpoint_config_path(
+            run_dir,
+            prediction_dir=prediction_dir,
+            candidate_id=str(candidate["candidate_id"]),
+            repo_root=repo_root,
+            label=seed_label,
         )
         written = export_split_predictions_from_checkpoint(
             run_dir,
             split=split,
+            config_path=config_path,
             output_dir=member_output_dir,
             overwrite=overwrite,
         )
@@ -1146,6 +1219,7 @@ def _materialize_single_checkpoint_candidate_predictions(
     *,
     prediction_dir: Path,
     split: str,
+    repo_root: Path,
     overwrite: bool,
 ) -> dict[str, Any]:
     destination = _candidate_prediction_path(
@@ -1204,9 +1278,16 @@ def _materialize_single_checkpoint_candidate_predictions(
         / str(candidate["candidate_id"])
         / split
     )
+    config_path = _resolved_checkpoint_config_path(
+        run_dir,
+        prediction_dir=prediction_dir,
+        candidate_id=str(candidate["candidate_id"]),
+        repo_root=repo_root,
+    )
     written = export_split_predictions_from_checkpoint(
         run_dir,
         split=split,
+        config_path=config_path,
         output_dir=export_dir,
         overwrite=overwrite,
     )
@@ -1248,6 +1329,7 @@ def materialize_final_candidate_predictions(
 
     assert_final_registry_ready(registry)
     root = Path(results_dir)
+    repo_root = root.parent
     prediction_dir = Path(output_dir)
     prediction_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1275,6 +1357,7 @@ def materialize_final_candidate_predictions(
                     prediction_dir=prediction_dir,
                     split=split,
                     results_dir=root,
+                    repo_root=repo_root,
                     overwrite=overwrite,
                 )
             else:
@@ -1282,6 +1365,7 @@ def materialize_final_candidate_predictions(
                     candidate,
                     prediction_dir=prediction_dir,
                     split=split,
+                    repo_root=repo_root,
                     overwrite=overwrite,
                 )
             rows.append(row)
