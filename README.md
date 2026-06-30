@@ -33,7 +33,7 @@ Interpretation:
 
 - The best-performing model combines a multiscale residual CNN-MLP fusion encoder (`MSResCNN-MLP`) with a temporal convolutional network (`TCN`) sequence head. The 61-epoch input window provides approximately 30.5 minutes of temporal context, and transition regularization discourages physiologically rare sleep-stage transitions.
 
-- Deep learning models generally improved over traditional baselines, especially when temporal context was added. One notable exception was REM classification, where elastic-net logistic regression achieved the highest REM F1.
+- The strongest deep learning models improved over traditional baselines, especially when temporal context was added. One notable exception was REM classification, where elastic-net logistic regression achieved the highest REM F1.
 
 - Adding temporal context improved test macro F1, although the gains were modest in some comparisons. This suggests that neighboring sleep epochs provide useful information, but model architecture and class imbalance remain important constraints.
 
@@ -42,7 +42,7 @@ Interpretation:
 
 ## Why This Project Matters
 
-This project demonstrates practical data science and machine learning engineering skills on a realistic biomedical time-series problem:
+Sleep staging from wearable physiological signals is a challenging biomedical time-series problem because labels are imbalanced, signals are noisy, and neighboring epochs from the same participant are highly correlated. This project demonstrates practical data science and machine learning engineering skills on that realistic setting:
 
 - wearable physiological signal processing at 64 Hz
 - participant-level splitting to control leakage
@@ -54,26 +54,28 @@ This project demonstrates practical data science and machine learning engineerin
 
 ## Dataset and Prediction Task
 
-The DREAMT dataset contains wearable physiological signals relevant to sleep analysis. This project uses signals including:
+The DREAMT dataset was collected from 100 participants at the Duke University Health System Sleep Disorder Lab. The cohort includes participants with clinically relevant sleep-related conditions, including sleep apnea (n=56), obstructive sleep apnea (n=33), restless sleep or restless leg syndrome (n=23), difficulty breathing or gasping during sleep (n=22), excessive daytime sleepiness (n=34), and snoring (n=40). These disorder-enriched data make wearable sleep staging more challenging, but also more relevant: populations with disrupted sleep are among those most likely to benefit from accurate sleep-stage estimation outside the sleep lab.
 
-- `BVP`
+Wearable physiological signals obtained from Empatica E4 devices include:
+
+- `BVP` 
 - `ACC_X`, `ACC_Y`, `ACC_Z`
 - `TEMP`
 - `EDA`
 - `HR`
 - `IBI`
 
-Raw DREAMT files are not committed to GitHub and should remain local according to dataset access terms and privacy requirements. Local real-data files are expected under `data/raw/`.
+Raw DREAMT files are not committed to GitHub and should remain local in accordance with dataset access terms and privacy requirements. Local real-data files are expected under `data/raw/`.
 
 For reviewers without DREAMT access, the repository includes a small committed synthetic sample under `data/synthetic/`. These files are not real participant records. They use the same CSV schema expected by the project loaders and contain four synthetic participants with 31 valid 30-second epochs each. The sample is intended for pipeline smoke tests, not model-performance claims.
 
-The target is a three-class sleep-stage label:
+The prediction target is a three-class sleep-stage label:
 
 - `Wake`
 - `Non-REM`
 - `REM`
 
-PSG labels `N1`, `N2`, and `N3` are mapped to `Non-REM`. DREAMT `data_64Hz` files may include `P`, a preparation-stage label before PSG recording starts. The primary workflow excludes `P`; treating `P` as `Wake` is implemented only as a documented sensitivity analysis.
+PSG labels `N1`, `N2`, and `N3` are mapped to `Non-REM`. DREAMT `data_64Hz` files include `P`, a preparation-stage label before PSG recording starts. The primary workflow excludes `P`; treating `P` as `Wake`, as in `data_100Hz` files, is implemented only as a documented sensitivity analysis.
 
 ## Evaluation Design
 
