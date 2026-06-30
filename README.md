@@ -193,7 +193,7 @@ The tests cover participant splitting, label mapping, epoch preprocessing, engin
 
 ## Limitations and Future Work
 
-Wearable-only sleep staging remains challenging because wearable signals are indirect proxies for PSG-derived sleep stage. Unlike electroencephalography (EEG), electrooculography (EOG), and lectromyography (EMG) signals used in standard sleep scoring, wearable physiological signals reflect downstream autonomic and movement patterns rather than sleep stage directly. Minority classes such as `REM` are especially difficult because they are less frequent and may be harder to distinguish from other stages using wearable signals alone.
+Wearable-only sleep staging remains challenging because wearable signals are indirect proxies for PSG-derived sleep stage. Unlike electroencephalography (EEG), electrooculography (EOG), and electromyography (EMG) signals used in standard sleep scoring, wearable physiological signals reflect downstream autonomic and movement patterns rather than sleep stage directly. Minority classes such as `REM` are especially difficult because they are less frequent and may be harder to distinguish from other stages using wearable signals alone.
 
 Current limitations include:
 
