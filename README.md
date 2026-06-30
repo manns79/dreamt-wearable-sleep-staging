@@ -13,27 +13,32 @@ A leakage-aware machine learning workflow for classifying polysomnography-derive
 
 ## Key Results
 
-The table below summarizes validation and held-out test performance across the main model families. Macro F1 is reported for validation and test sets; per-class F1 scores are reported on the held-out test set. 
+The table below summarizes validation and held-out test performance across the main model families. Macro F1 is reported for validation and test sets; per-class F1 scores are reported on the held-out test set. The best value in each metric column is shown in bold. 
 
 | Model | Validation macro F1 | Test macro F1 | Wake F1 | Non-REM F1 | REM F1 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Majority-class baseline | 0.276 | 0.266 | 0.000 | 0.797 | 0.000 |
-| Elastic-net logistic regression | 0.375 | 0.408 | 0.487 | 0.575 | 0.162 |
+| Elastic-net logistic regression | 0.375 | 0.408 | 0.487 | 0.575 | **0.162** |
 | XGBoost | 0.383 | 0.435 | 0.518 | 0.651 | 0.136 |
 | Single-epoch CNN | 0.384 | 0.372 | 0.402 | 0.565 | 0.149 |
 | Temporal-context CNN | 0.379 | 0.425 | 0.472 | 0.688 | 0.115 |
 | CNN-GRU, many-to-one | 0.284 | 0.329 | 0.418 | 0.409 | 0.161 |
 | CNN-GRU, many-to-many | 0.367 | 0.383 | 0.470 | 0.582 | 0.097 |
 | MSResCNN-MLP | 0.446 | 0.454 | 0.508 | 0.775 | 0.078 |
-| 31-epoch MSResCNN-MLP-TCN | 0.492 | 0.498 | 0.538 | 0.808 | 0.148 |
+| 31-epoch MSResCNN-MLP-TCN | 0.492 | 0.498 | 0.538 | **0.808** | 0.148 |
 | 61-epoch MSResCNN-MLP-TCN | 0.506 | 0.500 | 0.563 | 0.792 | 0.145 |
-| Transition-regularized 61-epoch MSResCNN-MLP-TCN | 0.510 | 0.501 | 0.564 | 0.793 | 0.146 |
+| Transition-regularized 61-epoch MSResCNN-MLP-TCN | **0.510** | **0.501** | **0.564** | 0.793 | 0.146 |
 
 Interpretation:
 
-- The repository is structured for a validation-first workflow; committed files do not include final held-out test metrics.
-- Model-selection logic, validation diagnostics, and final-test scaffolding are implemented, but final benchmark claims should be added only after the guarded final evaluation is run once.
-- The synthetic sample verifies that preprocessing and dataset-loading code paths are executable without access to DREAMT.
+- The best-performing model combines a multiscale residual CNN-MLP fusion encoder (`MSResCNN-MLP`) with a temporal convolutional network (`TCN`) sequence head. The 61-epoch input window provides approximately 30.5 minutes of temporal context, and transition regularization discourages physiologically rare sleep-stage transitions.
+
+- Deep learning models generally improved over traditional baselines, especially when temporal context was added. One notable exception was REM classification, where elastic-net logistic regression achieved the highest REM F1.
+
+- Adding temporal context improved test macro F1, although the gains were modest in some comparisons. This suggests that neighboring sleep epochs provide useful information, but model architecture and class imbalance remain important constraints.
+
+- Signal-family ablations using `MSResCNN-MLP` suggest that cardiovascular signals (`BVP`, `HR`, and `IBI`) contributed the most useful predictive information among the available wearable signal groups.
+
 
 ## Why This Project Matters
 
