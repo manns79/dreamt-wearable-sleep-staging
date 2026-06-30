@@ -84,36 +84,32 @@ The project uses a fixed participant-level split: participants, not individual e
 Evaluation principles:
 
 - preprocessing and normalization statistics are fit on training participants only
-- model selection and explanatory analyses use validation data only
-- final held-out test evaluation is guarded and should run once after model selection is frozen
+- model selection, ablation studies, and error analyses use validation data only
+- final held-out test evaluation was reserved until model selection was frozen
 - macro F1 is the primary metric because the target classes are imbalanced
 
 Supporting metrics include per-class precision/recall/F1, balanced accuracy, confusion matrices, participant-level macro F1, total sleep time error, and REM duration error.
 
 ## Modeling Approach
 
-The long development workflow is organized around a few methodological groups:
+The modeling workflow was designed to progress from simple, interpretable baselines to neural architectures that incorporate raw signal morphology, engineered summary features, and longer temporal context.
 
 **Traditional baselines**
 
-- majority-class classifier
-- elastic-net multinomial logistic regression
+- majority-class classifier as a sanity-check baseline
+- elastic-net multinomial logistic regression on engineered epoch-level signal summaries
 - XGBoost on engineered epoch-level signal summaries
 
-**Deep learning models**
+**Raw-signal and sequence models**
 
-- single-epoch 1D CNN
-- temporal-context CNN using neighboring epochs
-- CNN-GRU sequence models
-- multiscale residual fusion CNN combining raw signals and engineered features
-- frozen-embedding many-to-many temporal convolutional model
+- single-epoch 1D CNN for classifying individual 30-second raw signal windows
+- temporal-context CNN using neighboring epochs around the target epoch
+- CNN-GRU sequence models for explicit recurrent temporal modeling
 
-**Explanatory and robustness analyses**
-
-- validation error analysis across model families
-- signal-family ablation
-- `P`-as-`Wake` sensitivity analysis
-- train-label transition-regularization ablation
+**Fusion and temporal-context models**
+- `MSResCNN-MLP`, combining a multiscale residual CNN raw-signal branch with an MLP branch for engineered features
+- `MSResCNN-MLP-TCN`, using a frozen `MSResCNN-MLP` epoch encoder followed by a temporal convolutional sequence head
+- transition-regularized `MSResCNN-MLP-TCN`, adding a biologically informed penalty for physiologically rare sleep-stage transitions
 
 ## Repository Structure
 
@@ -127,10 +123,10 @@ dreamt-wearable-sleep-staging/
   notebooks/            # staged analysis and modeling notebooks
   src/                  # reusable preprocessing, data, modeling, and evaluation code
   tests/                # automated tests for reusable code paths
-  results/              # placeholders plus local-only generated artifacts
+  results/              # curated summary metrics and figures; large artifacts ignored
 ```
 
-The repository separates exploratory notebooks from reusable source code. Raw DREAMT data, trained checkpoints, processed local artifacts, and final test outputs are not committed.
+The repository separates exploratory notebooks from reusable source code. Raw DREAMT data, processed local artifacts, trained checkpoints, per-epoch predictions, and large generated outputs are not committed. Curated summary CSVs and selected figures are committed under `results/` to document the main findings reported in this README.
 
 ## Reproducibility
 
