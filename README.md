@@ -1,34 +1,33 @@
 # DREAMT Wearable Sleep Staging
 
-A leakage-aware machine learning workflow for classifying PSG-derived sleep stage from wearable physiological time series.
-
-## Overview
-
-This project studies wearable-based sleep staging using the DREAMT dataset. The goal is to predict a three-class PSG sleep-stage label, `Wake`, `Non-REM`, or `REM`, from physiological signals recorded by a wearable device.
-
-The project combines traditional feature-based baselines with deep learning models for raw time-series inputs. It emphasizes reproducible preprocessing, participant-level evaluation, and honest handling of final held-out test results.
+A leakage-aware machine learning workflow for classifying polysomnography-derived sleep stage from wearable physiological time series.
 
 ## Executive Summary
 
-- **Goal:** Classify 30-second sleep epochs from wearable signals into `Wake`, `Non-REM`, or `REM`.
-- **Data:** DREAMT wearable physiological signals, including BVP, accelerometry, temperature, EDA, heart rate, and IBI.
-- **Evaluation design:** Fixed participant-level train/validation/test split to reduce leakage from temporally correlated epochs from the same participant.
-- **Modeling:** Majority-class baseline, elastic-net logistic regression, XGBoost, 1D CNNs, CNN-GRU sequence models, multiscale fusion CNNs, and frozen-embedding temporal convolutional models.
+- **Goal:** Classify 30-second sleep epochs as `Wake`, `Non-REM`, or `REM` using wearable physiological signals. 
+- **Data:** [DREAMT](https://physionet.org/content/dreamt/2.2.0/) wearable physiological signals, including blood volume pulse (`BVP`), accelerometry (`ACC`), temperature (`TEMP`), electrodermal activity (`EDA`), heart rate (`HR`), and interbeat interval (`IBI`).
+- **Evaluation design:** Fixed participant-level train/validation/test split to reduce leakage from within-participant temporal correlation.
+- **Methods:** Naive and traditional ML baselines, CNN variants, sequence models, signal ablations, sensitivity analyses, biologically informed loss-function experiments. 
 - **Reproducibility:** Raw DREAMT data are not committed; a small synthetic DREAMT-compatible sample is included for smoke testing the pipeline.
-- **Status:** Validation-stage modeling and analysis are implemented. Final held-out test evaluation remains guarded and should be run only after model selection is frozen.
+- **Final result:** The best deep learning model meaningfully improves test-set macro F1 over traditional ML and naive baselines: 0.501 vs. 0.435 and 0.266, respectively.
 
 ## Key Results
 
-Final held-out test results are not committed in this repository. The table below summarizes the intended comparison format while avoiding unsupported performance claims.
+The table below summarizes validation and held-out test performance across the main model families. Macro F1 is reported for validation and test sets; per-class F1 scores are reported on the held-out test set. 
 
-| Model family | Validation macro F1 | Test macro F1 | Notes |
-| --- | ---: | ---: | --- |
-| Majority-class baseline | N/A | N/A | Sanity-check baseline |
-| Elastic-net logistic regression | N/A | N/A | Engineered epoch-level features |
-| XGBoost | N/A | N/A | Engineered epoch-level features |
-| 1D CNN / temporal-context CNN | N/A | N/A | Raw wearable time-series models |
-| CNN-GRU sequence models | N/A | N/A | Explicit temporal sequence modeling |
-| Multiscale fusion CNN / frozen-embedding TCN | N/A | N/A | Combines raw signals, engineered features, and longer temporal context |
+| Model | Validation macro F1 | Test macro F1 | Wake F1 | Non-REM F1 | REM F1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Majority-class baseline | 0.276 | 0.266 | 0.000 | 0.797 | 0.000 |
+| Elastic-net logistic regression | 0.375 | 0.408 | 0.487 | 0.575 | 0.162 |
+| XGBoost | 0.383 | 0.435 | 0.518 | 0.651 | 0.136 |
+| Single-epoch CNN | 0.384 | 0.372 | 0.402 | 0.565 | 0.149 |
+| Temporal-context CNN | 0.379 | 0.425 | 0.472 | 0.688 | 0.115 |
+| CNN-GRU, many-to-one | 0.284 | 0.329 | 0.418 | 0.409 | 0.161 |
+| CNN-GRU, many-to-many | 0.367 | 0.383 | 0.470 | 0.582 | 0.097 |
+| MSResCNN-MLP | 0.446 | 0.454 | 0.508 | 0.775 | 0.078 |
+| 31-epoch MSResCNN-MLP-TCN | 0.492 | 0.498 | 0.538 | 0.808 | 0.148 |
+| 61-epoch MSResCNN-MLP-TCN | 0.506 | 0.500 | 0.563 | 0.792 | 0.145 |
+| Transition-regularized 61-epoch MSResCNN-MLP-TCN | 0.510 | 0.501 | 0.564 | 0.793 | 0.146 |
 
 Interpretation:
 
