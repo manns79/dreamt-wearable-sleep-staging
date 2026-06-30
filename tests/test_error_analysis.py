@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-
 from src.error_analysis import (
     _macro_f1,
     apply_class_prior_correction,

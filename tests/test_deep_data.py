@@ -1,4 +1,5 @@
 import importlib.util
+import warnings
 from pathlib import Path
 from uuid import uuid4
 
@@ -106,9 +107,16 @@ def test_dreamt_epoch_dataset_can_return_float64_tensor_when_requested():
         dtype=np.float64,
     )
 
-    x, _ = dataset[0]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        x, _ = dataset[0]
 
     assert x.dtype == torch.float64
+    assert dataset.get_epoch_array(0).flags.writeable
+    assert not any(
+        "NumPy array is not writable" in str(warning.message)
+        for warning in caught
+    )
 
 
 def test_fit_normalization_stats_uses_training_participants_only_and_imputes():

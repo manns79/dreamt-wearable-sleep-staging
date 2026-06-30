@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-
 import src.final_evaluation as final_evaluation
 from src.final_evaluation import (
     FINAL_TEST_GUARD_MESSAGE,

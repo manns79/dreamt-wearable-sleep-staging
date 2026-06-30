@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
 from src.data import (
     DEFAULT_EPOCH_INDEX_CHUNKSIZE,
     DEFAULT_RAW_DATA_DIR,

@@ -3,7 +3,6 @@ from uuid import uuid4
 
 import pandas as pd
 import pytest
-
 from src.preprocessing import (
     TARGET_SLEEP_STAGE_LABELS,
     identify_invalid_labels,

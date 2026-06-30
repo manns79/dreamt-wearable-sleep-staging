@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
 from src.data import TARGET_LABELS
 from src.error_analysis import (
     FEATURE_ID_COLUMNS,
@@ -634,6 +635,7 @@ def build_stage6_prediction_tables_for_split(
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import LabelEncoder, StandardScaler
+
     from src.baselines import balanced_sample_weights
 
     train_path = Path(train_features_path)

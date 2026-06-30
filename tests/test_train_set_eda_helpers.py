@@ -3,7 +3,6 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-
 from src.plots import (
     add_acc_magnitude,
     collect_epoch_signal_summaries,

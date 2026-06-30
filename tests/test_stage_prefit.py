@@ -2,7 +2,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
-
 from src.train import (
     TrainConfig,
     TrainingResult,

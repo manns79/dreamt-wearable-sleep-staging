@@ -3,11 +3,9 @@ from uuid import uuid4
 
 import pandas as pd
 import pytest
-
 from src.data import (
     EVENT_ANNOTATION_COLUMNS,
     EXPECTED_DREAMT_COLUMNS,
-    EXPECTED_SIGNAL_COLUMNS,
     summarize_dataset,
     summarize_participant_file,
 )

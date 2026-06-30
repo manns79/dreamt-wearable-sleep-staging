@@ -4,7 +4,6 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 import pytest
-
 from src.data import (
     DreamtEpochDataset,
     build_participant_array_cache,
@@ -122,6 +121,7 @@ def test_dreamt_epoch_dataset_can_use_participant_array_cache(tmp_path):
         cached_dataset.get_epoch_array(0),
         raw_dataset.get_epoch_array(0),
     )
+    assert cached_dataset.get_epoch_array(0).flags.writeable
     assert manifest["channels"] == ["BVP"]
     assert (cache_dir / "manifest.json").exists()
     assert cached_dataset.signal_cache.load_count == 1

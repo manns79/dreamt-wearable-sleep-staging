@@ -5,7 +5,6 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 import pytest
-
 from src.data import (
     EVENT_ANNOTATION_COLUMNS,
     EXPECTED_DREAMT_COLUMNS,
@@ -23,8 +22,8 @@ from src.data import (
 )
 from src.plots import collect_epoch_signal_summaries, summarize_raw_epoch_signals
 from src.preprocessing import (
-    PRIMARY_LABEL_MAPPING_NOTE,
     P_AS_WAKE_LABEL_MAPPING_NOTE,
+    PRIMARY_LABEL_MAPPING_NOTE,
     _display_raw_label,
     _invalid_label_reason,
     apply_epoch_inclusion_rules,
@@ -210,7 +209,11 @@ def _reference_full_label_mapping(files, p_as_wake=False):
             p_as_wake=p_as_wake,
         )
         participant_summary.insert(0, "scope", "participant")
-        participant_summary.insert(1, "participant_id", extract_participant_id(file_path))
+        participant_summary.insert(
+            1,
+            "participant_id",
+            extract_participant_id(file_path),
+        )
         participant_summary.insert(2, "file_path", str(file_path))
         participant_summary.insert(3, "label_column", LABEL_COLUMN)
         participant_summary["p_as_wake"] = p_as_wake

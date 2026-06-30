@@ -803,6 +803,13 @@ def _epoch_row_to_array(
     return np.asarray(epoch_array.T, dtype=np.float64)
 
 
+def _ensure_writable_array(array: np.ndarray) -> np.ndarray:
+    """Copy read-only NumPy views before handing them to tensor constructors."""
+    if array.flags.writeable:
+        return array
+    return array.copy()
+
+
 def _label_to_id(label: object) -> int:
     label_text = str(label)
     if label_text not in LABEL_TO_ID:
@@ -1027,7 +1034,7 @@ class DreamtEpochDataset:
             from src.preprocessing import apply_normalization
 
             x = apply_normalization(x, self.preprocessing_stats)
-        return x.astype(self.dtype, copy=False)
+        return _ensure_writable_array(x.astype(self.dtype, copy=False))
 
     def __getitem__(self, index: int) -> tuple[Any, ...]:
         import torch

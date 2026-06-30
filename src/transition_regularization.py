@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
 from src.data import TARGET_LABELS
 
 DEFAULT_STAGE19_OUTPUT_DIR = Path("results/stage19_transition_regularization")

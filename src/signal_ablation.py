@@ -61,7 +61,11 @@ class SignalAblationSpec:
 
     @property
     def omitted_families(self) -> tuple[str, ...]:
-        return tuple(family for family in _ALL_FAMILIES if family not in self.included_families)
+        return tuple(
+            family
+            for family in _ALL_FAMILIES
+            if family not in self.included_families
+        )
 
 
 @dataclass(frozen=True)
@@ -96,13 +100,17 @@ def default_stage17_signal_ablation_specs() -> list[SignalAblationSpec]:
             name="without_cardiovascular",
             label="No cardiovascular",
             included_families=("movement", "eda", "temperature"),
-            description="Exclude BVP, HR, and IBI raw channels and engineered features.",
+            description=(
+                "Exclude BVP, HR, and IBI raw channels and engineered features."
+            ),
         ),
         SignalAblationSpec(
             name="without_movement",
             label="No movement",
             included_families=("cardiovascular", "eda", "temperature"),
-            description="Exclude accelerometer raw channels and engineered movement features.",
+            description=(
+                "Exclude accelerometer raw channels and engineered movement features."
+            ),
         ),
         SignalAblationSpec(
             name="without_eda",
@@ -120,14 +128,18 @@ def default_stage17_signal_ablation_specs() -> list[SignalAblationSpec]:
             name="cardiovascular_only",
             label="Cardiovascular only",
             included_families=("cardiovascular",),
-            description="Use only BVP, HR, and IBI raw channels and engineered features.",
+            description=(
+                "Use only BVP, HR, and IBI raw channels and engineered features."
+            ),
             include_unmatched_engineered_features=False,
         ),
         SignalAblationSpec(
             name="movement_only",
             label="Movement only",
             included_families=("movement",),
-            description="Use only accelerometer raw channels and engineered movement features.",
+            description=(
+                "Use only accelerometer raw channels and engineered movement features."
+            ),
             include_unmatched_engineered_features=False,
         ),
         SignalAblationSpec(
@@ -141,7 +153,9 @@ def default_stage17_signal_ablation_specs() -> list[SignalAblationSpec]:
             name="temperature_only",
             label="Temperature only",
             included_families=("temperature",),
-            description="Use only TEMP raw channel and engineered temperature features.",
+            description=(
+                "Use only TEMP raw channel and engineered temperature features."
+            ),
             include_unmatched_engineered_features=False,
         ),
     ]
@@ -261,7 +275,9 @@ def write_stage17_signal_ablation_feature_tables(
         include_unmatched=spec.include_unmatched_engineered_features,
     )
     if not selected_columns:
-        raise ValueError(f"Ablation spec {spec.name!r} selected no engineered features.")
+        raise ValueError(
+            f"Ablation spec {spec.name!r} selected no engineered features."
+        )
 
     output_columns = [*FEATURE_ID_COLUMNS, *selected_columns]
     if overwrite or not train_output.exists():

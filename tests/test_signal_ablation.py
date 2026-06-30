@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
-
 from src.signal_ablation import (
     SignalAblationSpec,
     assert_validation_only_stage17_outputs,
@@ -146,7 +145,9 @@ def test_build_stage17_runs_use_adjusted_channels_and_feature_counts(tmp_path):
     assert run.config.class_weight_power == pytest.approx(0.5)
     assert run.config.engineered_feature_count == 5
     assert "BVP_mean" not in run.engineered_feature_columns
-    assert run.config.output_dir == tmp_path / "stage17" / "runs" / "without_cardiovascular"
+    assert run.config.output_dir == (
+        tmp_path / "stage17" / "runs" / "without_cardiovascular"
+    )
     assert run.config.preprocessing_metadata_path == (
         tmp_path
         / "stage17"
