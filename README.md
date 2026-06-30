@@ -75,7 +75,7 @@ The prediction target is a three-class sleep-stage label:
 - `Non-REM`
 - `REM`
 
-PSG labels `N1`, `N2`, and `N3` are mapped to `Non-REM`. DREAMT `data_64Hz` files include `P`, a preparation-stage label before PSG recording starts. The primary workflow excludes `P`; treating `P` as `Wake`, as in `data_100Hz` files, is implemented only as a documented sensitivity analysis.
+Polysomnograph (PSG) labels `N1`, `N2`, and `N3` are mapped to `Non-REM`. DREAMT `data_64Hz` files include `P`, a preparation-stage label before PSG recording starts. The primary workflow excludes `P`; treating `P` as `Wake`, as in `data_100Hz` files, is implemented only as a documented sensitivity analysis.
 
 ## Evaluation Design
 
@@ -193,13 +193,18 @@ The tests cover participant splitting, label mapping, epoch preprocessing, engin
 
 ## Limitations and Future Work
 
-Wearable-only sleep staging is challenging because wearable signals are indirect proxies for PSG sleep stage. Minority classes such as `REM` can be especially difficult under class imbalance and participant heterogeneity.
+Wearable-only sleep staging remains challenging because wearable signals are indirect proxies for PSG-derived sleep stage. Unlike electroencephalography (EEG), electrooculography (EOG), and lectromyography (EMG) signals used in standard sleep scoring, wearable physiological signals reflect downstream autonomic and movement patterns rather than sleep stage directly. Minority classes such as `REM` are especially difficult because they are less frequent and may be harder to distinguish from other stages using wearable signals alone.
 
-Current limitations:
+Current limitations include:
 
-- final held-out test results are not committed
-- local validation artifacts and checkpoints are intentionally excluded
-- DREAMT is a finite dataset, so participant-level evaluation and external validation are important
-- synthetic data are included only for reproducibility smoke tests, not for training meaningful models
+- weaker performance on minority classes, especially `REM`
+- errors near sleep-stage transition boundaries, where adjacent epochs may be physiologically ambiguous
+- substantial variation in performance across participants, suggesting sensitivity to participant-specific signal patterns
+- limited dataset size relative to the complexity of deep learning models, increasing the risk of overfitting to participant-level noise
 
-Future work includes final guarded test evaluation, external validation, probability calibration, additional temporal modeling, richer uncertainty analysis, and deployment-oriented improvements for efficient inference and monitoring.
+Future work includes:
+
+- identifying additional wearable sleep datasets that could be harmonized with DREAMT, especially datasets with overlapping cardiovascular signals such as `BVP`, `HR`, or `IBI`
+- developing richer engineered features for traditional ML baselines, since stronger feature engineering may offer competitive performance at lower computational cost
+- testing oversampling to try to improve `REM` and `Wake` classification
+- further analyzing transition-boundary errors and participant-level failure modes to guide model and preprocessing improvements
