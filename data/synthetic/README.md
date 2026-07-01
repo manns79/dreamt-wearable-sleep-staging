@@ -1,7 +1,6 @@
 # Synthetic DREAMT-Compatible Sample
 
-This folder contains four fully synthetic participant CSVs for boot-camp review
-and lightweight smoke testing:
+This folder contains four fully synthetic participant CSVs for smoke testing:
 
 - `S901_whole_df.csv`
 - `S902_whole_df.csv`
