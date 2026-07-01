@@ -71,6 +71,8 @@ temp/
 Thumbs.db
 Desktop.ini
 *:Zone.Identifier
+/README.md?
+*.code-workspace
 .vscode/
 .idea/
 *.swp

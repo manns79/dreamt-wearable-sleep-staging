@@ -126,7 +126,7 @@ dreamt-wearable-sleep-staging/
   results/              # curated summary metrics and figures; large artifacts ignored
 ```
 
-The repository separates exploratory notebooks from reusable source code. Raw DREAMT data, processed local artifacts, trained checkpoints, per-epoch predictions, and large generated outputs are not committed. Curated summary CSVs and selected figures are committed under `results/` to document the main findings reported in this README.
+The repository separates exploratory notebooks from reusable source code. Raw DREAMT data, processed local artifacts, trained checkpoints, per-epoch predictions, and large generated outputs are not committed. Curated summary CSVs and selected figures are committed under `results/` to document the main findings reported in this README; see `results/MANIFEST.md` for the artifact list and model-name crosswalk.
 
 ## Reproducibility
 
