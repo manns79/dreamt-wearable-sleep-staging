@@ -39,8 +39,7 @@ Use `data/raw/` for local copies of real DREAMT participant CSV files. Use
 `data/processed/` for modeling-ready derived tables. These locations are
 ignored by Git so raw data and derived local data products remain local.
 
-`data/synthetic/` contains a committed four-participant synthetic sample for
-boot-camp review and smoke testing. These files are not real DREAMT records.
+`data/synthetic/` contains a committed four-participant synthetic sample for smoke testing. These files are not real DREAMT records.
 Copy them into `data/raw/` and create a matching local
 `data/interim/split_assignments.csv` before running the default raw-data
 pipeline against the synthetic sample.
