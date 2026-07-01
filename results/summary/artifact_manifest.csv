@@ -1,0 +1,11 @@
+artifact_path,artifact_type,stage,readme_support,source_artifact,commit_reason
+results/MANIFEST.md,documentation,all,Explains the curated results directory and stage-to-model lineage without expanding the root README.,manual summary of project stages,Human-readable provenance for stage-named artifacts.
+results/summary/key_results.csv,csv,stage20,Key Results table,results/stage20_final_test_evaluation/validation_test_metric_comparison.csv,Small reader-facing extract with README display names and table metrics.
+results/summary/model_name_crosswalk.csv,csv,all,Maps README model names to stage/run artifact names.,results/stage20_final_test_evaluation/final_candidate_registry.csv; results/stage20_final_test_evaluation/validation_test_metric_comparison.csv,Resolves naming mismatch between human-readable README and generated artifacts.
+results/summary/signal_ablation_summary.csv,csv,stage17,Signal-family ablation interpretation,results/stage17_signal_ablation/experiment_summary.csv,Path-free compact summary of the ablation metrics and deltas.
+results/summary/transition_regularization_summary.csv,csv,stage19,Transition-regularized model selection and effect summary,results/stage19_transition_regularization/baseline_comparison.csv,Compact summary of validation lambda sweep and transition metrics.
+results/summary/artifact_manifest.csv,csv,all,Inventory of committed curated result artifacts,manual manifest,Makes the intentionally committed subset explicit.
+results/stage20_final_test_evaluation/figures/validation_test_macro_f1_comparison.png,figure,stage20,Validation vs held-out test macro F1 comparison,notebooks/09_final_test_evaluation.ipynb,Visual support for final model comparison.
+results/stage20_final_test_evaluation/figures/test_per_class_f1.png,figure,stage20,Held-out test per-class F1 comparison,notebooks/09_final_test_evaluation.ipynb,Visual support for per-class Key Results columns.
+results/stage17_signal_ablation/figures/stage17_delta_macro_f1.png,figure,stage17,Signal-family ablation macro-F1 deltas,notebooks/06_signal_ablation.ipynb,Visual support for the cardiovascular-signal ablation finding.
+results/stage17_signal_ablation/figures/stage17_class_f1_deltas.png,figure,stage17,Signal-family ablation class-specific F1 deltas,notebooks/06_signal_ablation.ipynb,Visual support for class-level ablation effects.

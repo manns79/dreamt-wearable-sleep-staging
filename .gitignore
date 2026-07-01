@@ -40,6 +40,19 @@ models/checkpoints/
 artifacts/
 outputs/
 reports/generated/
+results/**
+!results/
+!results/MANIFEST.md
+!results/summary/
+!results/summary/**
+!results/stage17_signal_ablation/
+!results/stage17_signal_ablation/figures/
+!results/stage17_signal_ablation/figures/stage17_class_f1_deltas.png
+!results/stage17_signal_ablation/figures/stage17_delta_macro_f1.png
+!results/stage20_final_test_evaluation/
+!results/stage20_final_test_evaluation/figures/
+!results/stage20_final_test_evaluation/figures/test_per_class_f1.png
+!results/stage20_final_test_evaluation/figures/validation_test_macro_f1_comparison.png
 results/model_artifacts/
 results/predictions/
 results/tensorboard/
@@ -57,6 +70,7 @@ temp/
 .DS_Store
 Thumbs.db
 Desktop.ini
+*:Zone.Identifier
 .vscode/
 .idea/
 *.swp

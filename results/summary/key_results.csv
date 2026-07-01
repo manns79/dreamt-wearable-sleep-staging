@@ -1,0 +1,12 @@
+readme_order,readme_display_name,stage,model_family,artifact_model_name,validation_macro_f1,test_macro_f1,test_wake_f1,test_non_rem_f1,test_rem_f1
+1,Majority-class baseline,stage6,sanity_baseline,majority_class,0.275983,0.265739,0.0,0.797216,0.0
+2,Elastic-net logistic regression,stage6,feature_baseline,logistic_elasticnet,0.374741,0.407925,0.486648,0.574847,0.162281
+3,XGBoost,stage6,feature_baseline,xgboost_all_features,0.383188,0.435038,0.5179,0.651476,0.135736
+4,Single-epoch CNN,stage9,single_epoch_cnn,stage9_best_single_epoch_cnn,0.384392,0.371664,0.401579,0.56463,0.148783
+5,Temporal-context CNN,stage10,temporal_context_cnn,stage10_best,0.378887,0.425029,0.471785,0.688224,0.115077
+6,"CNN-GRU, many-to-one",stage11,cnn_gru_many_to_one,stage11_best_cnn_gru,0.284394,0.329244,0.41786,0.408546,0.161325
+7,"CNN-GRU, many-to-many",stage12,cnn_gru_many_to_many,stage12_best_cnn_gru_many_to_many,0.366689,0.383282,0.470353,0.582143,0.097351
+8,MSResCNN-MLP,stage14,multiscale_residual_fusion,stage14_best_sqrt_weighted,0.445788,0.45352,0.508267,0.774641,0.077651
+9,31-epoch MSResCNN-MLP-TCN,stage15,frozen_stage14_embedding_tcn,stage15_equal_weight_seed_ensemble,0.491921,0.498312,0.538446,0.8083,0.148189
+10,61-epoch MSResCNN-MLP-TCN,stage16,frozen_stage14_embedding_tcn_s61,stage16_equal_weight_seed_ensemble,0.506251,0.500005,0.563011,0.792058,0.144945
+11,Transition-regularized 61-epoch MSResCNN-MLP-TCN,stage19,transition_regularized_frozen_stage14_tcn_s61,stage19_best_equal_weight_seed_ensemble_lambda_0.05,0.509597,0.501087,0.563574,0.793255,0.146431
