@@ -180,6 +180,7 @@ class SleepStageCNNGRU(nn.Module):
         self.classifier = nn.Linear(int(gru_hidden_size) * directions, num_classes)
 
     def _target_index(self, sequence_length: int) -> int:
+        """Return the sequence position used for many-to-one supervision."""
         if self.target_position == "first":
             return 0
         if self.target_position == "center":
@@ -375,6 +376,7 @@ class MultiscaleResidualFusionCNN(nn.Module):
         raw_x: torch.Tensor,
         engineered_x: torch.Tensor,
     ) -> torch.Tensor:
+        """Return the fused raw/engineered representation before classification."""
         if raw_x.ndim != 3:
             raise ValueError(
                 "MultiscaleResidualFusionCNN expects raw input shaped "

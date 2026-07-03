@@ -169,6 +169,7 @@ def _participant_file_lookup(raw_dir: str | Path) -> dict[str, Path]:
 
 
 def _load_valid_epoch_index(epoch_index_path: str | Path) -> pd.DataFrame:
+    """Load valid, target-labeled epochs from a saved epoch index."""
     epoch_path = Path(epoch_index_path)
     if not epoch_path.exists():
         raise FileNotFoundError(f"Epoch index CSV does not exist: {epoch_path}")
@@ -198,6 +199,7 @@ def _check_epoch_splits_against_assignments(
     epoch_index: pd.DataFrame,
     split_df: pd.DataFrame,
 ) -> None:
+    """Confirm epoch-index split labels still match participant assignments."""
     split_lookup = split_df.assign(
         participant_id=split_df["participant_id"].astype(str).str.strip(),
         split=split_df["split"].astype(str).str.strip(),

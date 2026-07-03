@@ -33,6 +33,7 @@ class TransitionMatrices:
 
 
 def _json_safe(value: Any) -> Any:
+    """Convert path-like and NumPy values into JSON-serializable objects."""
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, tuple | list):
@@ -45,6 +46,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def _save_json(payload: Mapping[str, Any], path: Path) -> None:
+    """Write a deterministic JSON artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         json.dump(_json_safe(dict(payload)), file, indent=2, sort_keys=True)
@@ -386,6 +388,7 @@ def stage19_experiment_id(config: Any, lambda_transition: float) -> str:
 
 
 def _stage16_seed_member_dirs(stage16_replication_dir: str | Path) -> dict[int, Path]:
+    """Load Stage 16 seed run directories keyed by seed."""
     metrics_path = Path(stage16_replication_dir) / "seed_member_metrics.csv"
     if not metrics_path.exists():
         raise FileNotFoundError(f"Missing Stage 16 seed metrics: {metrics_path}")
@@ -403,6 +406,7 @@ def _stage16_seed_member_dirs(stage16_replication_dir: str | Path) -> dict[int, 
 def _load_baseline_row(
     stage16_replication_dir: str | Path,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Load the completed Stage 16 ensemble metrics and predictions."""
     stage16_dir = Path(stage16_replication_dir)
     metrics_path = stage16_dir / "ensemble_validation_metrics.csv"
     predictions_path = stage16_dir / "ensemble_validation_epoch_predictions.csv"
@@ -442,6 +446,7 @@ def _load_completed_stage19_ensemble(
 
 
 def _transition_config_signature(config: Any) -> dict[str, Any]:
+    """Return config fields that must match when reusing Stage 19 outputs."""
     from src.train import config_to_dict
 
     payload = config_to_dict(config)
@@ -488,6 +493,7 @@ def _run_stage19_single_seed(
     lambda_transition: float,
     skip_completed: bool = True,
 ) -> dict[str, Any]:
+    """Train or reuse one Stage 19 lambda/seed member."""
     from src.train import (
         _sequence_aggregation_methods,
         _sequence_label_positions,

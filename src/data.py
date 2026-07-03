@@ -522,10 +522,12 @@ def _add_derived_channels(df: pd.DataFrame, channels: Iterable[str]) -> pd.DataF
 
 
 def _participant_array_manifest_path(cache_dir: str | Path) -> Path:
+    """Return the manifest path for a participant-array cache directory."""
     return Path(cache_dir) / PARTICIPANT_ARRAY_CACHE_MANIFEST
 
 
 def _participant_array_file_name(participant_id: str) -> str:
+    """Create a safe cache filename for one participant's NumPy array."""
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(participant_id).strip())
     if not safe_id:
         raise ValueError("Participant ID must not be empty.")
@@ -533,6 +535,7 @@ def _participant_array_file_name(participant_id: str) -> str:
 
 
 def _load_participant_array_manifest(cache_dir: str | Path) -> dict[str, Any]:
+    """Load and minimally validate the participant-array cache manifest."""
     manifest_path = _participant_array_manifest_path(cache_dir)
     if not manifest_path.exists():
         raise FileNotFoundError(
@@ -550,6 +553,7 @@ def _participant_array_manifest_matches_channels(
     manifest: Mapping[str, object],
     channels: Iterable[str],
 ) -> bool:
+    """Return whether a cache manifest was built for the requested channels."""
     return list(manifest.get("channels", [])) == list(channels)
 
 
@@ -776,6 +780,7 @@ def _epoch_row_to_array(
     signal_cache: _ParticipantSignalCache | _ParticipantArrayCache,
     channels: list[str],
 ) -> np.ndarray:
+    """Slice one epoch from a raw-frame or NumPy-array participant cache."""
     participant_id = str(epoch_row["participant_id"])
     start_row = int(epoch_row["start_row"])
     end_row = int(epoch_row["end_row"])
@@ -811,6 +816,7 @@ def _ensure_writable_array(array: np.ndarray) -> np.ndarray:
 
 
 def _label_to_id(label: object) -> int:
+    """Convert a target-label value to its numeric class ID."""
     label_text = str(label)
     if label_text not in LABEL_TO_ID:
         raise ValueError(f"Unexpected target label: {label_text}")
@@ -1263,6 +1269,7 @@ class DreamtContextDataset(DreamtEpochDataset):
         self.window_positions = self._build_window_positions()
 
     def _build_window_positions(self) -> list[list[int]]:
+        """Build participant-contained context windows over consecutive epochs."""
         if self.context_radius == 0:
             return [[index] for index in range(len(self.epoch_index))]
 
@@ -1377,6 +1384,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
         self._sample_weights_by_position = self._build_sample_weights_by_position()
 
     def _build_sequence_positions(self) -> list[list[int]]:
+        """Build participant-contained sequences over consecutive epochs."""
         sequences: list[list[int]] = []
         for _, group in self.epoch_index.groupby("participant_id", sort=False):
             positions = list(group.index)
@@ -1396,6 +1404,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
         return len(self.sequence_positions)
 
     def _target_index(self) -> int:
+        """Return the sequence position used for many-to-one labels."""
         if self.target_position == "first":
             return 0
         if self.target_position == "center":
@@ -1403,6 +1412,7 @@ class DreamtSequenceDataset(DreamtEpochDataset):
         return self.sequence_length - 1
 
     def _build_sample_weights_by_position(self) -> dict[int, float]:
+        """Weight repeated many-to-many targets by inverse epoch coverage."""
         if self.sample_weight_mode == "none":
             return {}
 
@@ -1523,13 +1533,16 @@ class DreamtEmbeddingSequenceDataset:
 
     @property
     def embedding_dim(self) -> int:
+        """Return the cached embedding vector width."""
         return int(self.embeddings.shape[1])
 
     @property
     def participants(self) -> set[str]:
+        """Return participant IDs represented in the embedding index."""
         return set(self.epoch_index["participant_id"].astype(str))
 
     def _build_sequence_positions(self) -> list[list[int]]:
+        """Build participant-contained embedding sequences over consecutive epochs."""
         sequences: list[list[int]] = []
         for _, group in self.epoch_index.groupby("participant_id", sort=False):
             positions = group.index.to_numpy(dtype=int)
@@ -1550,6 +1563,7 @@ class DreamtEmbeddingSequenceDataset:
         return sequences
 
     def _target_index(self) -> int:
+        """Return the sequence position used for many-to-one labels."""
         if self.target_position == "first":
             return 0
         if self.target_position == "center":
@@ -1557,6 +1571,7 @@ class DreamtEmbeddingSequenceDataset:
         return self.sequence_length - 1
 
     def _build_sample_weights_by_position(self) -> dict[int, float]:
+        """Weight repeated many-to-many targets by inverse epoch coverage."""
         if self.sample_weight_mode == "none":
             return {}
         counts: Counter[int] = Counter(
@@ -2128,6 +2143,7 @@ def _update_string_counts(counts: Counter[str], values: pd.Series) -> None:
 
 
 def _new_numeric_accumulator() -> dict[str, float | int | None]:
+    """Create scalar state for streaming min/mean/std/max summaries."""
     return {
         "count": 0,
         "sum": 0.0,
@@ -2141,6 +2157,7 @@ def _update_numeric_accumulator(
     accumulator: dict[str, float | int | None],
     values: pd.Series,
 ) -> None:
+    """Fold one numeric chunk into a streaming summary accumulator."""
     numeric_values = pd.to_numeric(values, errors="coerce").dropna()
     if numeric_values.empty:
         return
@@ -2170,6 +2187,7 @@ def _update_numeric_accumulator(
 def _finalize_numeric_accumulator(
     accumulator: dict[str, float | int | None],
 ) -> dict[str, float | None]:
+    """Convert streaming numeric state into JSON-friendly summary statistics."""
     count = int(accumulator["count"])
     if count == 0:
         return {
@@ -2198,6 +2216,7 @@ def _finalize_numeric_accumulator(
 
 
 def _new_timestamp_accumulator() -> dict[str, object]:
+    """Create streaming state for numeric or datetime recording durations."""
     return {
         "numeric_count": 0,
         "numeric_min": None,
@@ -2212,6 +2231,7 @@ def _update_timestamp_accumulator(
     accumulator: dict[str, object],
     values: pd.Series,
 ) -> None:
+    """Fold one timestamp chunk into duration-tracking state."""
     timestamps = values.dropna()
     if timestamps.empty:
         return
@@ -2257,6 +2277,7 @@ def _update_timestamp_accumulator(
 
 
 def _finalize_timestamp_duration(accumulator: dict[str, object]) -> float | None:
+    """Return the best available recording duration from timestamp state."""
     if int(accumulator["numeric_count"]) >= 2:
         duration = float(accumulator["numeric_max"]) - float(
             accumulator["numeric_min"]

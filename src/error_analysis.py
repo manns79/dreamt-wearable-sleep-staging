@@ -31,6 +31,7 @@ PROBABILITY_COLUMNS = {
 
 
 def _safe_name(value: object) -> str:
+    """Return a filesystem-safe label for derived CSV and figure names."""
     text = str(value).strip()
     for old, new in [
         (" ", "_"),
@@ -44,6 +45,7 @@ def _safe_name(value: object) -> str:
 
 
 def _ensure_model_columns(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Ensure every prediction row has model grouping columns."""
     output = predictions.copy()
     for column in MODEL_GROUP_COLUMNS:
         if column not in output.columns:
@@ -53,6 +55,7 @@ def _ensure_model_columns(predictions: pd.DataFrame) -> pd.DataFrame:
 
 
 def _probability_columns_present(predictions: pd.DataFrame) -> list[str]:
+    """Return probability columns that are available in a prediction table."""
     return [
         column
         for column in PROBABILITY_COLUMNS.values()
@@ -61,6 +64,7 @@ def _probability_columns_present(predictions: pd.DataFrame) -> list[str]:
 
 
 def _epoch_key_frame(predictions: pd.DataFrame) -> pd.Series:
+    """Build stable epoch keys, falling back to row identity when needed."""
     if {"participant_id", "epoch_id"}.issubset(predictions.columns):
         participant = predictions["participant_id"]
         epoch = predictions["epoch_id"]
@@ -77,6 +81,7 @@ def _epoch_key_frame(predictions: pd.DataFrame) -> pd.Series:
 
 
 def _row_probability(row: pd.Series, label: object) -> float:
+    """Read the probability assigned to one label from a prediction row."""
     column = PROBABILITY_COLUMNS.get(str(label))
     if column is None or column not in row or pd.isna(row[column]):
         return float("nan")
@@ -84,6 +89,7 @@ def _row_probability(row: pd.Series, label: object) -> float:
 
 
 def _confidence_values(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Add confidence, margin, entropy, and true/predicted probabilities."""
     output = predictions.copy()
     probability_columns = _probability_columns_present(output)
     if not probability_columns:
@@ -897,6 +903,7 @@ def _prediction_frame_from_probabilities(
     model_family: str = "feature_baseline",
     stage: str = "stage6",
 ) -> pd.DataFrame:
+    """Assemble a normalized prediction table from estimator outputs."""
     output = pd.DataFrame(
         {
             "participant_id": val_df["participant_id"].astype(str),
@@ -923,6 +930,7 @@ def _macro_f1(
     *,
     labels: Sequence[object] | None = TARGET_SLEEP_STAGE_LABELS,
 ) -> float:
+    """Return macro F1 with consistent label ordering and zero-division policy."""
     kwargs: dict[str, Any] = {
         "average": "macro",
         "zero_division": 0,
@@ -942,6 +950,7 @@ def _fit_cv_or_plain(
     sample_weight: np.ndarray | None = None,
     scoring_labels: Sequence[object] | None = TARGET_SLEEP_STAGE_LABELS,
 ) -> Any:
+    """Fit with grouped CV when possible, otherwise fall back to direct fitting."""
     n_groups = int(groups_train.nunique())
     if n_groups < 2:
         fit_kwargs = {}
@@ -1328,6 +1337,7 @@ def _best_output_dirs_by_group(
     summary_path: Path,
     group_column: str | None = None,
 ) -> list[Path]:
+    """Return selected output directories from a stage summary table."""
     if not summary_path.exists():
         return []
     summary = pd.read_csv(summary_path)
@@ -1511,11 +1521,13 @@ def load_discovered_predictions(discovery: pd.DataFrame) -> pd.DataFrame:
 
 
 def _write_table(table: pd.DataFrame, path: Path) -> None:
+    """Write one CSV table after creating its parent directory."""
     path.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(path, index=False)
 
 
 def _plot_model_confusions(predictions: pd.DataFrame, output_dir: Path) -> None:
+    """Save one validation confusion-matrix plot per model."""
     for keys, group in _model_groups(normalize_prediction_frame(predictions)):
         _, _, model_name = keys
         _, confusion = evaluate_predictions(

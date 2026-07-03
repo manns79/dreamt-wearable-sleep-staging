@@ -49,6 +49,7 @@ class FinalCandidateSpec:
 
 
 def _safe_name(value: object) -> str:
+    """Return a filesystem-safe label for candidate output files."""
     text = str(value).strip()
     for old, new in [
         (" ", "_"),
@@ -62,6 +63,7 @@ def _safe_name(value: object) -> str:
 
 
 def _json_safe(value: Any) -> Any:
+    """Convert common NumPy/path objects into JSON-serializable values."""
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, np.generic):
@@ -74,6 +76,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def _save_json(payload: Mapping[str, Any], path: Path) -> None:
+    """Write a deterministic JSON artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         json.dump(_json_safe(dict(payload)), file, indent=2, sort_keys=True)
@@ -81,6 +84,7 @@ def _save_json(payload: Mapping[str, Any], path: Path) -> None:
 
 
 def _load_first_row(path: Path) -> dict[str, Any] | None:
+    """Load the first row from a CSV artifact when it exists."""
     if not path.exists():
         return None
     frame = pd.read_csv(path)
@@ -90,6 +94,7 @@ def _load_first_row(path: Path) -> dict[str, Any] | None:
 
 
 def _best_summary_row(path: Path) -> dict[str, Any] | None:
+    """Return the best validation row from a stage summary artifact."""
     if not path.exists():
         return None
     summary = pd.read_csv(path)
@@ -120,6 +125,7 @@ def _candidate_from_row(
     validation_artifact_path: str | Path | None = None,
     notes: str = "",
 ) -> FinalCandidateSpec:
+    """Create a final-candidate spec from an optional validation summary row."""
     status = "ready" if row is not None else "missing_validation_artifact"
     validation_macro_f1 = None
     if row is not None and "macro_f1" in row and pd.notna(row["macro_f1"]):
@@ -141,6 +147,7 @@ def _candidate_from_row(
 
 
 def _stage6_candidates(results_dir: Path) -> list[FinalCandidateSpec]:
+    """Return fixed Stage 6 baseline candidates for the final registry."""
     path = results_dir / "stage6_feature_baselines" / "validation_metrics.csv"
     metrics = pd.read_csv(path) if path.exists() else pd.DataFrame()
     rows = {
@@ -181,6 +188,7 @@ def _single_best_candidate(
     model_family: str,
     model_name: str,
 ) -> FinalCandidateSpec:
+    """Create a candidate selected as the best row in one stage summary."""
     summary_path = results_dir / directory / "experiment_summary.csv"
     row = _best_summary_row(summary_path)
     return _candidate_from_row(
@@ -205,6 +213,7 @@ def _ensemble_candidate(
     model_family: str,
     model_name: str,
 ) -> FinalCandidateSpec:
+    """Create a candidate from a completed seed-ensemble metrics artifact."""
     metrics_path = results_dir / directory / "ensemble_validation_metrics.csv"
     row = _load_first_row(metrics_path)
     return _candidate_from_row(
@@ -220,6 +229,7 @@ def _ensemble_candidate(
 
 
 def _stage19_candidate(results_dir: Path) -> FinalCandidateSpec:
+    """Create the Stage 19 transition-regularized final candidate spec."""
     summary_path = (
         results_dir / "stage19_transition_regularization" / "experiment_summary.csv"
     )
@@ -825,6 +835,7 @@ def ensemble_prediction_files(
 
 
 def _path_or_none(value: Any) -> Path | None:
+    """Normalize optional path-like registry values."""
     if value is None or pd.isna(value):
         return None
     text = str(value).strip()
@@ -839,6 +850,7 @@ def _candidate_prediction_path(
     split: str,
     candidate_id: str,
 ) -> Path:
+    """Return the canonical materialized prediction path for one candidate."""
     return prediction_dir / f"{split}_predictions_{_safe_name(candidate_id)}.csv"
 
 
@@ -850,6 +862,7 @@ def _write_candidate_prediction_table(
     split: str,
     overwrite: bool,
 ) -> Path:
+    """Normalize and write one materialized candidate prediction table."""
     if destination.exists() and not overwrite:
         return destination
     frame = table.copy()
@@ -873,6 +886,7 @@ def _load_candidate_prediction_source(
     split: str,
     overwrite: bool,
 ) -> Path:
+    """Load an existing prediction CSV and write it in the final schema."""
     source = Path(source_path)
     if not source.exists():
         raise FileNotFoundError(f"Prediction source does not exist: {source}")
@@ -887,6 +901,7 @@ def _load_candidate_prediction_source(
 
 
 def _best_registry_summary_row(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Load the selected validation row for a registry candidate."""
     artifact_path = _path_or_none(candidate.get("validation_artifact_path"))
     if artifact_path is None:
         raise ValueError(
@@ -907,6 +922,7 @@ def _prediction_path_from_run_dir(
     split: str,
     aggregation_method: str | None = None,
 ) -> Path:
+    """Find the preferred prediction artifact already present in a run directory."""
     run_path = Path(run_dir)
     candidates = []
     if aggregation_method:
@@ -931,6 +947,7 @@ def _prediction_path_from_export(
     split: str,
     aggregation_method: str | None = None,
 ) -> Path:
+    """Choose the prediction artifact returned by a checkpoint export."""
     if aggregation_method:
         key = f"aggregated_epoch_predictions_{aggregation_method}"
         if key in written:
@@ -964,6 +981,7 @@ _CONFIG_PATH_KEYS = {
 
 
 def _resolve_relative_path(value: Any, *, repo_root: Path) -> Any:
+    """Resolve relative config paths against the repository root."""
     if value is None:
         return value
     if not isinstance(value, str):
@@ -985,6 +1003,7 @@ def _resolved_checkpoint_config_path(
     repo_root: Path,
     label: str = "single",
 ) -> Path | None:
+    """Write a checkpoint config with relative data paths made explicit."""
     config_path = Path(run_dir) / "config.json"
     if not config_path.exists():
         return None
@@ -1019,6 +1038,7 @@ def _materialize_stage6_candidate_predictions(
     overwrite: bool,
     include_xgboost: bool,
 ) -> list[dict[str, Any]]:
+    """Refit Stage 6 baselines on train features and predict one split."""
     from src.data import DEFAULT_TEST_FEATURES_PATH, DEFAULT_VALIDATION_FEATURES_PATH
 
     existing_rows = []
@@ -1092,6 +1112,7 @@ def _ensemble_prediction_source_dir(
     *,
     results_dir: Path,
 ) -> Path:
+    """Locate the directory containing source files for an ensemble candidate."""
     stage = str(candidate["stage"])
     if stage in {"stage15", "stage16"}:
         metrics_path = _path_or_none(candidate.get("validation_artifact_path"))
@@ -1118,6 +1139,7 @@ def _materialize_ensemble_candidate_predictions(
     repo_root: Path,
     overwrite: bool,
 ) -> dict[str, Any]:
+    """Materialize validation or test predictions for one ensemble candidate."""
     destination = _candidate_prediction_path(
         prediction_dir,
         split=split,
@@ -1224,6 +1246,7 @@ def _materialize_single_checkpoint_candidate_predictions(
     repo_root: Path,
     overwrite: bool,
 ) -> dict[str, Any]:
+    """Export and normalize predictions for one checkpoint-backed candidate."""
     destination = _candidate_prediction_path(
         prediction_dir,
         split=split,
@@ -1381,6 +1404,7 @@ def materialize_final_candidate_predictions(
 
 
 def _ensure_figure_dir(output_dir: str | Path) -> Path:
+    """Create and return the final-evaluation figure directory."""
     figure_dir = Path(output_dir) / "figures"
     figure_dir.mkdir(parents=True, exist_ok=True)
     return figure_dir

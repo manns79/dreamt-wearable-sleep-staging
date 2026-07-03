@@ -61,6 +61,7 @@ class SignalAblationSpec:
 
     @property
     def omitted_families(self) -> tuple[str, ...]:
+        """Return signal families intentionally removed by this ablation."""
         return tuple(
             family
             for family in _ALL_FAMILIES
@@ -83,6 +84,7 @@ class Stage17SignalAblationRun:
 
     @property
     def ablation_id(self) -> str:
+        """Return the stable ID used for Stage 17 artifacts."""
         return self.spec.name
 
 
@@ -162,6 +164,7 @@ def default_stage17_signal_ablation_specs() -> list[SignalAblationSpec]:
 
 
 def _validate_spec(spec: SignalAblationSpec) -> None:
+    """Validate that an ablation spec names at least one known signal family."""
     if not spec.name:
         raise ValueError("Ablation spec name must be non-empty.")
     unknown = sorted(set(spec.included_families) - set(_ALL_FAMILIES))
@@ -191,6 +194,7 @@ def _feature_family_lookup(
     *,
     family_prefixes: dict[str, tuple[str, ...]] = SIGNAL_FAMILY_FEATURE_PREFIXES,
 ) -> dict[str, str | None]:
+    """Map engineered feature columns to signal families by configured prefixes."""
     lookup: dict[str, str | None] = {}
     for column in columns:
         matches = [
@@ -230,6 +234,7 @@ def engineered_feature_columns_for_signal_families(
 
 
 def _feature_columns_from_frame(frame: pd.DataFrame) -> list[str]:
+    """Return engineered feature columns after checking identity columns."""
     missing = sorted(set(FEATURE_ID_COLUMNS) - set(frame.columns))
     if missing:
         raise ValueError(f"Engineered feature table is missing ID column(s): {missing}")
@@ -237,6 +242,7 @@ def _feature_columns_from_frame(frame: pd.DataFrame) -> list[str]:
 
 
 def _read_feature_table(path: str | Path) -> pd.DataFrame:
+    """Load one engineered feature table needed for Stage 17."""
     feature_path = Path(path)
     if not feature_path.exists():
         raise FileNotFoundError(
@@ -357,6 +363,7 @@ def build_stage17_signal_ablation_runs(
 
 
 def _json_safe(value: Any) -> Any:
+    """Convert path-like and NumPy-like values before JSON serialization."""
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, tuple | list):
@@ -372,6 +379,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def _save_json(payload: dict[str, Any], path: Path) -> None:
+    """Write a deterministic JSON artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         json.dump(_json_safe(payload), file, indent=2, sort_keys=True)
@@ -379,10 +387,12 @@ def _save_json(payload: dict[str, Any], path: Path) -> None:
 
 
 def _list_string(values: tuple[str, ...]) -> str:
+    """Encode tuple-valued summary fields as JSON strings."""
     return json.dumps(list(values))
 
 
 def _json_list(value: object) -> list[str]:
+    """Decode tuple/list summary fields that were stored as JSON strings."""
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
@@ -404,6 +414,7 @@ def _run_summary_row(
     best_epoch: int,
     best_metrics: dict[str, Any],
 ) -> dict[str, Any]:
+    """Build the persisted summary row for one Stage 17 run."""
     return {
         "stage": "stage17",
         "ablation_id": run.ablation_id,
@@ -428,6 +439,7 @@ def _run_summary_row(
 
 
 def _completed_run_summary_path(run: Stage17SignalAblationRun) -> Path:
+    """Return the per-run completion summary path."""
     return run.run_dir / "stage17_ablation_summary.json"
 
 
@@ -435,6 +447,7 @@ def _completed_run_matches_current_config(
     row: dict[str, Any],
     run: Stage17SignalAblationRun,
 ) -> bool:
+    """Return whether a cached Stage 17 run matches the current config."""
     try:
         if row.get("stage") != "stage17":
             return False
@@ -473,6 +486,7 @@ def _completed_run_matches_current_config(
 def _load_completed_run_summary(
     run: Stage17SignalAblationRun,
 ) -> dict[str, Any] | None:
+    """Load a matching completed Stage 17 run summary when available."""
     summary_path = _completed_run_summary_path(run)
     if not summary_path.exists():
         return None
@@ -488,6 +502,7 @@ def _load_completed_run_summary(
 
 
 def _history_frame_for_run(run: Stage17SignalAblationRun) -> pd.DataFrame | None:
+    """Load one run's training history with ablation metadata columns."""
     history_path = run.run_dir / "train_history.csv"
     if not history_path.exists():
         return None

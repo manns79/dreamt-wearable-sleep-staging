@@ -16,6 +16,7 @@ from src.preprocessing import TARGET_SLEEP_STAGE_LABELS
 
 
 def _metric_label(label: str) -> str:
+    """Return a label string safe for metric column names."""
     return label.replace("-", "_").replace(" ", "_")
 
 

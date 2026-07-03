@@ -133,6 +133,7 @@ def summarize_participant_class_distribution(
 
 
 def _missingness_columns(df: pd.DataFrame) -> list[str]:
+    """Return expected signal missingness columns present in a frame."""
     return [
         column
         for column in df.columns

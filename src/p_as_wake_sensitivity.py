@@ -46,6 +46,7 @@ class Stage18PAsWakeRun:
 
 
 def _json_safe(value: Any) -> Any:
+    """Convert path-like and NumPy-like values before JSON serialization."""
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, tuple | list):
@@ -61,6 +62,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def _save_json(payload: dict[str, Any], path: Path) -> None:
+    """Write a deterministic JSON artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         json.dump(_json_safe(payload), file, indent=2, sort_keys=True)
@@ -68,6 +70,7 @@ def _save_json(payload: dict[str, Any], path: Path) -> None:
 
 
 def _feature_count(path: str | Path) -> int:
+    """Count engineered feature columns without reading the full CSV."""
     header = pd.read_csv(path, nrows=0)
     feature_columns = [
         column for column in header.columns if column not in FEATURE_ID_COLUMNS
@@ -86,6 +89,7 @@ def _read_or_build_stage18_epoch_index(
     chunksize: int | None,
     overwrite: bool,
 ) -> pd.DataFrame:
+    """Load or rebuild the validation-only P-as-Wake epoch index."""
     if output_path.exists() and not overwrite:
         return pd.read_csv(output_path, dtype={"participant_id": str})
 
@@ -103,6 +107,7 @@ def _read_or_build_stage18_epoch_index(
 
 
 def _assert_no_test_split_rows(frame: pd.DataFrame, frame_name: str) -> None:
+    """Fail if a Stage 18 artifact accidentally includes held-out test rows."""
     if "split" not in frame.columns:
         return
     splits = set(frame["split"].dropna().astype(str).str.strip().str.lower())
@@ -111,6 +116,7 @@ def _assert_no_test_split_rows(frame: pd.DataFrame, frame_name: str) -> None:
 
 
 def _valid_stage18_epoch_keys(epoch_index: pd.DataFrame) -> pd.DataFrame:
+    """Return valid train/validation epoch keys under the P-as-Wake mapping."""
     required_columns = {
         "participant_id",
         "epoch_id",
@@ -134,6 +140,7 @@ def _load_primary_feature_rows(
     feature_path: str | Path,
     stage18_keys: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Reuse primary feature rows that still align with Stage 18 epoch keys."""
     features = pd.read_csv(feature_path, dtype={"participant_id": str})
     missing_columns = sorted(set(FEATURE_ID_COLUMNS) - set(features.columns))
     if missing_columns:
@@ -169,6 +176,7 @@ def _write_missing_epoch_index(
     missing_keys: pd.DataFrame,
     output_path: Path,
 ) -> Path:
+    """Write an epoch index for rows whose features must be rebuilt."""
     if missing_keys.empty:
         pd.DataFrame(columns=epoch_index.columns).to_csv(output_path, index=False)
         return output_path
@@ -183,6 +191,7 @@ def _write_missing_epoch_index(
 
 
 def _sort_feature_table(feature_table: pd.DataFrame) -> pd.DataFrame:
+    """Sort Stage 18 feature rows deterministically by split and epoch identity."""
     if feature_table.empty:
         return feature_table
     split_order = pd.CategoricalDtype(
@@ -208,6 +217,7 @@ def _build_stage18_feature_table(
     primary_train_feature_path: str | Path,
     primary_validation_feature_path: str | Path,
 ) -> pd.DataFrame:
+    """Build Stage 18 features by reusing primary rows and filling gaps."""
     primary_train_path = Path(primary_train_feature_path)
     primary_validation_path = Path(primary_validation_feature_path)
     if not primary_train_path.exists() or not primary_validation_path.exists():
@@ -383,10 +393,12 @@ def build_stage18_p_as_wake_run(
 
 
 def _summary_path(run: Stage18PAsWakeRun) -> Path:
+    """Return the per-run Stage 18 completion summary path."""
     return run.run_dir / "stage18_p_as_wake_summary.json"
 
 
 def _completed_run_matches(row: dict[str, Any], run: Stage18PAsWakeRun) -> bool:
+    """Return whether a cached Stage 18 result matches the requested run."""
     expected_paths = {
         "output_dir": run.run_dir,
         "epoch_index_path": run.epoch_index_path,
@@ -402,6 +414,7 @@ def _completed_run_matches(row: dict[str, Any], run: Stage18PAsWakeRun) -> bool:
 
 
 def _load_completed_run_summary(run: Stage18PAsWakeRun) -> dict[str, Any] | None:
+    """Load a matching completed Stage 18 summary when available."""
     path = _summary_path(run)
     if not path.exists():
         return None
@@ -422,6 +435,7 @@ def _summary_row(
     best_epoch: int,
     best_metrics: dict[str, Any],
 ) -> dict[str, Any]:
+    """Build the persisted summary row for the Stage 18 sensitivity run."""
     return {
         "stage": "stage18",
         "sensitivity_id": DEFAULT_STAGE18_RUN_ID,

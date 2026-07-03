@@ -81,6 +81,7 @@ def _score_estimator(
     y: Sequence[object] | np.ndarray | pd.Series,
     scoring: Callable[..., float],
 ) -> float:
+    """Evaluate one estimator with a scorer and coerce NumPy scalars to float."""
     return float(scoring(estimator, X, y))
 
 

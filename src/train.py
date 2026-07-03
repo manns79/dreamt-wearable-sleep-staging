@@ -185,6 +185,7 @@ class ParticipantBlockSampler:
 
     @classmethod
     def _build_participant_blocks(cls, dataset: Any) -> dict[str, list[int]]:
+        """Group dataset indices by participant for cache-friendly sampling."""
         blocks: dict[str, list[int]] = {}
         for index in range(len(dataset)):
             participant_id = cls._participant_id_for_index(dataset, index)
@@ -193,6 +194,7 @@ class ParticipantBlockSampler:
 
     @classmethod
     def _participant_id_for_index(cls, dataset: Any, index: int) -> str:
+        """Resolve the participant ID for an item, unwrapping subsets if needed."""
         if hasattr(dataset, "indices") and hasattr(dataset, "dataset"):
             parent_index = int(dataset.indices[index])
             return cls._participant_id_for_index(dataset.dataset, parent_index)
@@ -219,6 +221,7 @@ class ParticipantBlockSampler:
 
 
 def _require_torch() -> Any:
+    """Import PyTorch lazily so non-training utilities remain lightweight."""
     try:
         import torch
     except ImportError as exc:
@@ -230,6 +233,7 @@ def _require_torch() -> Any:
 
 
 def _new_sleep_stage_cnn(in_channels: int, config: TrainConfig | None = None) -> Any:
+    """Construct the single-epoch CNN from a training config."""
     from src.models import SleepStageCNN
 
     filters = config.filters if config is not None else (16, 32, 64)
@@ -266,6 +270,7 @@ def _new_sleep_stage_cnn_gru(
     in_channels: int,
     config: TrainConfig,
 ) -> Any:
+    """Construct the CNN-GRU sequence model from a training config."""
     from src.models import SleepStageCNNGRU
 
     return SleepStageCNNGRU(
@@ -284,6 +289,7 @@ def _new_sleep_stage_cnn_gru(
 
 
 def _new_multiscale_fusion_cnn(config: TrainConfig) -> Any:
+    """Construct the raw-plus-engineered Stage 14 fusion model."""
     from src.models import MultiscaleResidualFusionCNN
 
     return MultiscaleResidualFusionCNN(
@@ -303,6 +309,7 @@ def _new_multiscale_fusion_cnn(config: TrainConfig) -> Any:
 
 
 def _new_sleep_stage_embedding_tcn(config: TrainConfig) -> Any:
+    """Construct the TCN over cached Stage 14 epoch embeddings."""
     from src.models import SleepStageEmbeddingTCN
 
     return SleepStageEmbeddingTCN(
@@ -331,6 +338,7 @@ def _new_model_for_config(config: TrainConfig) -> Any:
 
 
 def _json_safe(value: Any) -> Any:
+    """Convert common config/result values into JSON-serializable objects."""
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
@@ -738,6 +746,7 @@ def _prefit_preprocessing_metadata(configs: Sequence[TrainConfig]) -> None:
 
 
 def _stage15_embedding_paths(config: TrainConfig) -> dict[str, Path]:
+    """Return all cache paths used for frozen Stage 14 embeddings."""
     embedding_dir = Path(config.stage15_embedding_dir)
     return {
         "directory": embedding_dir,
@@ -752,7 +761,9 @@ def _stage15_embedding_paths(config: TrainConfig) -> dict[str, Path]:
 
 
 def _stage15_embedding_signature(config: TrainConfig) -> dict[str, Any]:
+    """Return source-file metadata used to validate the embedding cache."""
     def file_signature(value: str | Path | None) -> dict[str, Any] | None:
+        """Return existence, size, and mtime metadata for one source file."""
         if value is None:
             return None
         path = Path(value)
@@ -802,6 +813,7 @@ def _stage15_embedding_cache_matches(
     config: TrainConfig,
     splits: Sequence[str] = ("train", "validation"),
 ) -> bool:
+    """Return whether cached frozen embeddings match the current config."""
     paths = _stage15_embedding_paths(config)
     split_names = [str(split) for split in splits]
     required_paths = [
@@ -838,6 +850,7 @@ def _stage15_embedding_cache_matches(
 
 
 def _stage15_source_encoder_config(config: TrainConfig) -> TrainConfig:
+    """Load the Stage 14 encoder config and align it with current data paths."""
     checkpoint_path = Path(str(config.stage15_encoder_checkpoint_path))
     source_config = load_train_config(checkpoint_path=checkpoint_path)
     if not _uses_fusion_model(source_config):
@@ -971,6 +984,7 @@ def export_stage15_frozen_embeddings(
 
 
 def _build_stage15_embedding_datasets(config: TrainConfig) -> dict[str, Any]:
+    """Build train/validation sequence datasets from frozen embeddings."""
     paths = export_stage15_frozen_embeddings(config)
     dataset_kwargs = {
         "sequence_length": config.sequence_length,
@@ -1003,6 +1017,7 @@ def _build_stage15_embedding_datasets(config: TrainConfig) -> dict[str, Any]:
 
 
 def _build_stage15_embedding_dataset_for_split(config: TrainConfig, split: str) -> Any:
+    """Build one split dataset from frozen embeddings."""
     split = str(split)
     paths = export_stage15_frozen_embeddings(config, splits=(split,))
     dataset = DreamtEmbeddingSequenceDataset(
@@ -1024,6 +1039,7 @@ def _build_stage15_embedding_dataset_for_split(config: TrainConfig, split: str) 
 
 
 def _dataset_class_for_config(config: TrainConfig) -> type[Any]:
+    """Choose the dataset class implied by model type and context settings."""
     if _uses_fusion_model(config):
         return DreamtFeatureFusionDataset
     if _uses_sequence_model(config):
@@ -1034,6 +1050,7 @@ def _dataset_class_for_config(config: TrainConfig) -> type[Any]:
 
 
 def _feature_path_for_split(config: TrainConfig, split: str) -> str | Path:
+    """Return the engineered-feature table path for a dataset split."""
     if split == "train":
         return config.train_feature_path
     if split == "validation":
@@ -1044,6 +1061,7 @@ def _feature_path_for_split(config: TrainConfig, split: str) -> str | Path:
 
 
 def _max_participants_for_split(config: TrainConfig, split: str) -> int | None:
+    """Return debug participant limits for train/validation only."""
     if split == "train":
         return config.max_train_participants
     if split == "validation":
@@ -1140,6 +1158,7 @@ def build_train_validation_datasets(config: TrainConfig) -> dict[str, Any]:
 
 
 def _new_seeded_generator(seed: int) -> Any:
+    """Create a PyTorch generator seeded for reproducible dataloader order."""
     torch = _require_torch()
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -1169,6 +1188,7 @@ def _build_dataloaders_from_datasets(
     datasets: Mapping[str, Any],
     config: TrainConfig,
 ) -> dict[str, Any]:
+    """Wrap train/validation datasets in dataloaders with participant-block sampling."""
     torch = _require_torch()
     train_sampler = ParticipantBlockSampler(
         datasets["train"],
@@ -1663,14 +1683,17 @@ def train_one_epoch(
 
 
 def _safe_label_name(label: str) -> str:
+    """Return a label string safe for metric and probability column names."""
     return label.replace("-", "_").replace(" ", "_")
 
 
 def _probability_column(label: str) -> str:
+    """Return the prediction probability column name for a class label."""
     return f"prob_{_safe_label_name(label)}"
 
 
 def _sequence_aggregation_methods(config: TrainConfig | None) -> list[str]:
+    """Return unique epoch-probability aggregation methods for sequence outputs."""
     if config is None:
         return ["uniform"]
 
@@ -1685,6 +1708,7 @@ def _sequence_aggregation_methods(config: TrainConfig | None) -> list[str]:
 
 
 def _sequence_position_weights(sequence_length: int, method: str) -> np.ndarray:
+    """Return per-position weights for aggregating many-to-many predictions."""
     if method == "uniform":
         return np.ones(sequence_length, dtype=np.float64)
     if method == "center_weighted":
@@ -1699,6 +1723,7 @@ def _unwrap_dataset_indices(
     dataset: Any,
     indices: Sequence[int],
 ) -> tuple[Any, list[int]]:
+    """Resolve subset indices back to the root dataset."""
     if hasattr(dataset, "indices") and hasattr(dataset, "dataset"):
         parent_indices = [int(dataset.indices[int(index)]) for index in indices]
         return _unwrap_dataset_indices(dataset.dataset, parent_indices)
@@ -1709,6 +1734,7 @@ def _sequence_positions_for_dataset_indices(
     dataset: Any,
     indices: Sequence[int],
 ) -> tuple[Any, list[int], list[list[int]]]:
+    """Return root indices and epoch positions for sequence dataset items."""
     root_dataset, root_indices = _unwrap_dataset_indices(dataset, indices)
     if not hasattr(root_dataset, "sequence_positions"):
         raise TypeError("Expected a DreamtSequenceDataset-like object.")
@@ -1723,6 +1749,7 @@ def _epoch_prediction_identity(
     dataset: Any,
     epoch_index_position: int,
 ) -> tuple[tuple[Any, Any], dict[str, Any]]:
+    """Return stable epoch identity fields for prediction exports."""
     row = dataset.epoch_index.iloc[int(epoch_index_position)]
     participant_id = str(row.get("participant_id", ""))
     epoch_id = row.get("epoch_id", int(epoch_index_position))
@@ -1814,6 +1841,7 @@ def _sequence_position_prediction_frame(
     y_true_ids: np.ndarray,
     aggregation_method: str,
 ) -> pd.DataFrame:
+    """Build per-sequence-position predictions before epoch-level aggregation."""
     position_weights = _sequence_position_weights(
         int(probabilities.shape[1]),
         aggregation_method,
@@ -1853,6 +1881,7 @@ def _aggregate_sequence_probabilities(
     model_name: str,
     split: str,
 ) -> dict[str, Any]:
+    """Aggregate overlapping sequence-position probabilities to epoch rows."""
     position_weights = _sequence_position_weights(
         int(probabilities.shape[1]),
         aggregation_method,
@@ -1928,6 +1957,7 @@ def _prefix_metrics(
     prefix: str,
     skip_keys: Sequence[str] = ("model", "split", "aggregation_method"),
 ) -> dict[str, Any]:
+    """Prefix metric keys while preserving identity fields for summaries."""
     skip_key_set = set(skip_keys)
     return {
         f"{prefix}_{key}": value
@@ -2489,6 +2519,7 @@ def export_split_predictions_from_checkpoint(
 
 
 def _save_json(payload: Mapping[str, Any], path: Path) -> None:
+    """Write a deterministic JSON artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         json.dump(_json_safe(payload), file, indent=2, sort_keys=True)
@@ -2890,6 +2921,7 @@ def build_stage9_screening_configs(
 
 
 def _summary_sort_columns(summary: pd.DataFrame) -> tuple[list[str], list[bool]]:
+    """Return the standard validation-summary sort keys."""
     columns = ["macro_f1"]
     ascending = [False]
     if "balanced_accuracy" in summary.columns:
@@ -2966,6 +2998,7 @@ def run_stage9_experiments(
 
 
 def _stage10_pair_radius(config: TrainConfig) -> int:
+    """Return the paired context radius used for Stage 10 comparisons."""
     pair_radius = config.comparison_context_radius
     if pair_radius is None:
         pair_radius = config.context_radius
@@ -3514,6 +3547,7 @@ def build_stage12_many_to_many_configs(
 
 
 def _base_aggregation_metric_keys() -> set[str]:
+    """Return metric keys shared by all Stage 12 aggregation rows."""
     keys = {
         "accuracy",
         "balanced_accuracy",
@@ -3539,6 +3573,7 @@ def _stage12_metric_row_for_aggregation(
     method: str,
     primary_method: str,
 ) -> dict[str, Any]:
+    """Select primary or extra aggregation metrics for a Stage 12 summary row."""
     common_keys = {
         "epoch",
         "train_eval_ran",
@@ -3889,6 +3924,7 @@ def _frozen_tcn_experiment_id(
     *,
     stage_number: int,
 ) -> str:
+    """Return a stable short ID for frozen-embedding TCN stages."""
     config_dict = config_to_dict(config)
     stable_keys = [
         "model_name",
@@ -4177,6 +4213,7 @@ def _stage15_primary_prediction_path(
     run_dir: str | Path,
     aggregation_method: str,
 ) -> Path:
+    """Return the primary Stage 15/16 aggregated validation prediction path."""
     return (
         Path(run_dir)
         / f"validation_aggregated_epoch_predictions_{aggregation_method}.csv"
